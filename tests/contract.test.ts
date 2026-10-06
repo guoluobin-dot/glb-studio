@@ -29,13 +29,7 @@ const read = (p: string): string => readFileSync(join(ROOT, p), "utf8");
  * MISSING_SCRIPTS 里对应的名字删掉，用例会立即恢复成正常断言。
  */
 const MISSING_SCRIPTS = new Set([
-  "verify-compose-e2e.cjs",
-  "verify-results.cjs",
-  "verify-opening.cjs",
-  "verify-wrap.cjs",
-  "verify-variant-pick.cjs",
-  "verify-variant-opening-toggle.cjs",
-  "probe-ui-perf.cjs",
+  // 空：2026-10-06 已按断言重建 7 个验证脚本，见 scripts/README-verify.md
 ]);
 const scriptMissing = (name: string): boolean => MISSING_SCRIPTS.has(name);
 /** 缺失时返回空串而不是抛 ENOENT —— 配合 skipIf 用，避免整个文件崩掉 */
@@ -722,7 +716,7 @@ describe("出片产物可预览可打开", () => {
     expect(main).toMatch(/await\s+shell\.showItemInFolder\(abs\)/);
   });
 
-  it.skipIf(scriptMissing("verify-results.cjs"))("验证脚本不许真的弹播放器(必须支持干跑)", () => {
+  it("验证脚本不许真的弹播放器(必须支持干跑)", () => {
     // 真实事故:verify:results 调 openResultExternal 真去开系统默认播放器,
     // 打开的还�� output 目录里一个早期遗留的 21KB 测试彩条,
     // 用户满屏彩条,还以为程序坏了。验证脚本必须有副作用豁免开关。
@@ -1523,7 +1517,7 @@ describe("审片必须真的审", () => {
     expect(orch).toMatch(/WHERE id = \? AND analysis_status = 'analyzing'/);
   });
 
-  it.skipIf(scriptMissing("probe-ui-perf.cjs"))("UI 性能报告不能靠字面 grep,否则会退化成假阳性", () => {
+  it("UI 性能报告不能靠字面 grep,否则会退化成假阳性", () => {
     // 真实教训：报告脚本原来直接 grep "setTick"。修复之后那个词只存在于
     // 解释"以前怎么做的"注释里，脚本于是仍然报"每秒重渲染整个工作区" ——
     // 假阳性比漏报更糟：会让人以为修复没生效而反复排查。
@@ -1662,7 +1656,7 @@ describe("素材不能丢", () => {
     expect(store).toMatch(/await copyFile\(abs, dest\)/);
   });
 
-  it.skipIf(scriptMissing("verify-compose-e2e.cjs"))("验证脚本不能整个覆盖索引", () => {
+  it("验证脚本不能整个覆盖索引", () => {
     // 踩过的坑：e2e 脚本清理时写 index.json = []，
     // 把用户自己上传的素材索引一起抹掉了
     expect(e2e).not.toMatch(/writeFileSync\(path\.join\(ASSET_ROOT, a\.kind, "index\.json"\), "\[\]"/);
@@ -2579,7 +2573,7 @@ describe("验证脚本不许污染用户数据", () => {
     expect(h).toMatch(/\.filter\(/);
   });
 
-  it.skipIf(scriptMissing("verify-opening.cjs"))("走了真实出片链路的验证脚本必须收尾清理", () => {
+  it("走了真实出片链路的验证脚本必须收尾清理", () => {
     const dirty = [
       "verify-opening.cjs",
       "verify-wrap.cjs",
