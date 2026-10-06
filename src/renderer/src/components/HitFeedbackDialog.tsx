@@ -99,7 +99,7 @@ export function HitFeedbackDialog({ entry, ipName, onClose, onDone }: Props): Re
   const resolveHitId = useCallback(async (): Promise<number | null> => {
     const id = await call((api) => api.hitResolveHermesId(ipName, entry.sourcePath));
     if (id == null) {
-      setMsg({ tone: "warn", text: "这条素材还没同步到 Hermes，先点「从历史爆款库同步」再更正。" });
+      setMsg({ tone: "warn", text: "这条素材还没同步到 Hermes，先点「「把已分析结果写入记忆库」」再更正。" });
     }
     return id;
   }, [entry.sourcePath, ipName]);

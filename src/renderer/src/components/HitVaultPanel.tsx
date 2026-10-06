@@ -157,7 +157,7 @@ function hasRealPerformance(e: HitEntry): boolean {
           setMsg({
             tone: "warn",
             text: `「${name}」的文件夹建好了,但记忆库没建成功(${made.hermesError ?? "原因不明"})。`
-              + `这位老师的样本暂时存不下,稍后可在"从历史爆款库同步"里补上。`
+              + `这位老师的样本暂时存不下,稍后可在"「把已分析结果写入记忆库」"里补上。`
           });
         }
       } else if (draft === "rename") {
@@ -269,7 +269,7 @@ function hasRealPerformance(e: HitEntry): boolean {
         setMsg({
           tone: "ok",
           text: `已登记 ${r.attached.length} 个素材，其中 ${enq.queued} 个已进入 Hermes 分析队列${bad}。`
-            + `分析在空闲时自动跑，完成后点「从历史爆款库同步」入库，爆款感才会叠加更新。`
+            + `分析在空闲时自动跑，完成后点「「把已分析结果写入记忆库」」入库，爆款感才会叠加更新。`
         });
       }
       await refreshAll();
@@ -356,14 +356,24 @@ function hasRealPerformance(e: HitEntry): boolean {
               <LuUndo2 className="h-3.5 w-3.5" />
               恢复误删
             </button>
+            /*
+              文案为什么改成这样（2026-10-06）：
+              原来叫"「把已分析结果写入记忆库」"，和出片台的"按记忆重找爆款"撞在
+              "爆款"两个字上，方向却相反 —— 这个是**写入**记忆库，
+              那个是**读取**记忆。用户以为导入后没变化就是因为这个按钮，
+              实际上记忆库要等分析跑完才有东西可同步。
+
+              现在改成"把已分析结果写入记忆库"，动词（写入）把方向说死。
+            */
             <button
               type="button"
               onClick={() => void syncFromHermes()}
               disabled={busy !== null}
+              title="把 Hermes 里已分析完成的爆款搬进这个记忆库。分析在后台跑，跑完再点。分析没完成时同步过来的仍是旧数据。"
               className="flex items-center gap-1.5 rounded-lg border border-ember/50 bg-ember/10 px-3.5 py-2 text-[11.5px] font-bold text-ember transition-colors hover:bg-ember/20 disabled:opacity-40"
             >
               {busy === "sync" ? <LuLoaderCircle className="h-3.5 w-3.5 spin-slow" /> : <LuCloudDownload className="h-3.5 w-3.5" />}
-              从历史爆款库同步
+              把已分析结果写入记忆库
             </button>
           </div>
         </div>
@@ -380,7 +390,7 @@ function hasRealPerformance(e: HitEntry): boolean {
           <div className="flex flex-col gap-1 overflow-y-auto">
             {ips.length === 0 && (
               <p className="rounded-lg border border-line/70 px-2.5 py-3 text-[11px] leading-relaxed text-mut-2">
-                还没有 IP 档案。先新建一位,或直接「从历史爆款库同步」按集合自动建。
+                还没有 IP 档案。先新建一位,或直接「「把已分析结果写入记忆库」」按集合自动建。
               </p>
             )}
             {ips.map((x) => {
@@ -525,7 +535,7 @@ function hasRealPerformance(e: HitEntry): boolean {
             {entries.length === 0 ? (
               <Empty
                 title={ip ? `「${ip.name}」还没有爆款` : "先选一位老师"}
-                hint={ip ? "点右下「从历史爆款库同步」,或用「批量导入」登记本地素材。" : undefined}
+                hint={ip ? "点右下「「把已分析结果写入记忆库」」,或用「批量导入」登记本地素材。" : undefined}
                 icon={<LuBrain className="h-6 w-6" />}
               />
             ) : (
