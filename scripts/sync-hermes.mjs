@@ -79,8 +79,10 @@ const walk = (dir, acc = [], root = dir) => {
   for (const e of readdirSync(dir, { withFileTypes: true })) {
     const p = join(dir, e.name);
     if (e.isDirectory()) {
-      if (SKIP_DIRS.has(e.name)) continue;
-      // data/ 本身要进，但只走白名单文件（与 cpSync 的 filter 保持一致）
+      // 顺序要紧：data/ 的白名单必须先判。SKIP_DIRS 里含 'data'，
+      // 先判它的话 data/ 整个被跳过，下面的白名单分支永远走不到
+      // —— 结果是文件被拷进来了，但脱敏循环和差异检查都看不见它，
+      //    真实 IP 名就这么原样进了仓库。
       if (e.name === 'data') {
         for (const f of DATA_KEEP) {
           const fp = join(dir, e.name, f);
@@ -88,6 +90,7 @@ const walk = (dir, acc = [], root = dir) => {
         }
         continue;
       }
+      if (SKIP_DIRS.has(e.name)) continue;
       walk(p, acc, root);
     } else acc.push(p);
   }
