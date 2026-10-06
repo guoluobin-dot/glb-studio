@@ -878,6 +878,15 @@ export class LiveAnalyzer {
     return [];
   }
 
+  /** 预筛用的时间跨度（秒）：块内首句 start 到末句 end，最少 1 秒 */
+  _prescreenSpanSec(chunk) {
+    const first = chunk[0] || {};
+    const last = chunk[chunk.length - 1] || {};
+    const s = (first.start ?? first.start_ms ?? 0) / 1000;
+    const e = (last.end ?? last.end_ms ?? 0) / 1000;
+    return Math.max(1, e - s);
+  }
+
   /**
    * 零成本预筛：在送 LLM 之前，先用不需要模型的信号判断"这块值不值得分析"。
    *
@@ -899,6 +908,32 @@ export class LiveAnalyzer {
     const minChars = this.prescreenMinChars;
     const chars = chunkText.length;
 
+    /*
+     * 练声类教学不能按"废话"筛掉（2026-10-06 修）
+     * ─────────────────────────────────────────────
+     * 下面三条判据（密度过低 / 语速过缓 / 循环啰嗦）本意是滤掉寒暄和等待，
+     * 但练声教学天然踩中全部三条：
+     *   - 内容重复：老师带一个音节，学生跟唱，同一句重复几十遍
+     *   - 语速慢：练声必须慢唱，"语速过缓"必然命中
+     *   - 字数少：一个音节反复，信息密度算下来极低
+     *
+     * 结果就是**整类练声直播永远学不进记忆** —— 不是学得差，
+     * 是压根没被送去学。所以这里先看是不是练声，是就放行。
+     *
+     * 判据取"明确的练声信号"而不是"重复得像练声"：宁可放过一些
+     * 真的重复内容，也不能把一整类教学内容判死。
+     */
+    const vocal = detectVocalTraining(chunkText);
+    if (vocal) {
+      return {
+        keep: true,
+        reason: `练声教学内容（${vocal}），按教学内容放行，不按啰嗦/慢速筛掉`,
+        density: chars / this._prescreenSpanSec(chunk),
+        hits: 0,
+        vocal: true,
+      };
+    }
+
     // 记忆库主题关键词（没有主题就不做关键词判据）
     const kw = [];
     for (const t of mem?.themes || []) {
@@ -906,13 +941,7 @@ export class LiveAnalyzer {
     }
     const hits = kw.length ? kw.filter((k) => chunkText.includes(k)).length : 0;
 
-    const spanSec = (() => {
-      const first = chunk[0] || {};
-      const last = chunk[chunk.length - 1] || {};
-      const s = (first.start ?? first.start_ms ?? 0) / 1000;
-      const e = (last.end ?? last.end_ms ?? 0) / 1000;
-      return Math.max(1, e - s);
-    })();
+    const spanSec = this._prescreenSpanSec(chunk);
     const density = chars / spanSec; // 字/秒
 
     // 重复度：转写是一整行空格连接，没有换行——按标点切成句再算指纹。
@@ -1398,3 +1427,44 @@ Output the match result as specified JSON.`;
 }
 
 export default LiveAnalyzer;
+
+/*
+ * 练声教学内容识别（2026-10-06）
+ * ─────────────────────────────────────────────────
+ * 用途：让预筛别把练声类教学当"循环啰嗦 / 语速过缓"扔掉。
+ *
+ * 为什么需要它：练声直播的形态天然撞满三条筛除规则（重复、慢速、字数少），
+ * 而它恰恰是一整类有教学价值的内容 —— 老师带音节、学生跟唱，
+ * 同一个"啊"重复几十遍就是教学内容本身。
+ *
+ * 只认**明确指令词**，不靠"重复得像练声"去猜：
+ * 猜错的代价是放过一些真的废话（浪费一点 GPU），
+ * 而判错的代价是整类教学永远学不进记忆库。用户明确说过
+ * "答答答答属于练声类教学，要让记忆功能记起来"。
+ *
+ * 语音转写常把长音写成叠字（"啊啊啊"），所以单独看元音串。
+ */
+const VOCAL_TRAINING_SIGNALS = [
+  // 课程/环节名
+  { re: /(练声|开声|练音|练嗓|嗓子训练|声带|开腔|热身练习|发声练习|声音训练|嗓音训练)/, name: '练声/开声' },
+  { re: /(唇齿舌牙喉|口型练习|开唇|合拢|圆唇|舌位|齿音练习|喉音练习)/, name: '五音练习' },
+  // 教学指令（跟唱、慢唱、气息）
+  { re: /(跟我唱|跟着我唱|跟我念|一起唱|跟着唱|再来一遍|再唱一遍|再试一遍|慢一点|慢速|放慢|打拍子|数拍子)/, name: '跟唱指令' },
+  { re: /(气息支撑|腹式呼吸|横膈膜|下沉丹田|共鸣点|打开喉咙|放松喉咙|喉位|软腭|舌根)/, name: '发声要领' },
+  { re: /(音阶|上行|下行|半音|全音|阶歌|琶音|颤音|转音|滑音|强弱|力度|换气点|断连|连音)/, name: '技巧训练' },
+  // 长音/元音叠写（转写里 "啊啊啊" / "呜呜呜"）
+  // 阈值取 3 而不是 4：ASR 不会把一个长音写成十几个叠字，
+  // 实测样本就是 "啊啊啊"（3 个）。取 4 会漏掉最典型的形态。
+  { re: /([啊阿喔哦噢欧唿呜嗯诶唉哎噢噢]{3,})/, name: '元音长音' },
+];
+
+function detectVocalTraining(text) {
+  const s = String(text || '');
+  if (!s) return null;
+  for (const { re, name } of VOCAL_TRAINING_SIGNALS) {
+    if (re.test(s)) return name;
+  }
+  return null;
+}
+
+export { detectVocalTraining };
