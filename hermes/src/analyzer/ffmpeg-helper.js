@@ -113,7 +113,7 @@ export class FFmpegHelper {
       'C:/ffmpeg/bin/ffmpeg.exe',
       'C:/Program Files/ffmpeg/bin/ffmpeg.exe',
       'C:/ProgramData/chocolatey/bin/ffmpeg.exe',
-      'D:/GLB/GLB/resources/app.asar.unpacked/node_modules/ffmpeg-static/ffmpeg.exe',
+      '<GLB_ROOT>/GLB/resources/app.asar.unpacked/node_modules/ffmpeg-static/ffmpeg.exe',
     ];
 
     const ffprobeCandidates = [
@@ -122,7 +122,7 @@ export class FFmpegHelper {
       'C:/ffmpeg/bin/ffprobe.exe',
       'C:/Program Files/ffmpeg/bin/ffprobe.exe',
       'C:/ProgramData/chocolatey/bin/ffprobe.exe',
-      'D:/GLB/GLB/resources/app.asar.unpacked/node_modules/@ffprobe-installer/win32-x64/ffprobe.exe',
+      '<GLB_ROOT>/GLB/resources/app.asar.unpacked/node_modules/@ffprobe-installer/win32-x64/ffprobe.exe',
     ];
 
     for (const p of candidates) {

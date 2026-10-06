@@ -355,16 +355,16 @@ class IdleScheduler {
 ```json
 {
   "upload": {
-    "hitsDir": "D:/GLB/Hermes/upload/hits",
-    "liveDir": "D:/GLB/Hermes/upload/live",
-    "tempDir": "D:/GLB/Hermes/upload/temp"
+    "hitsDir": "<GLB_ROOT>/Hermes/upload/hits",
+    "liveDir": "<GLB_ROOT>/Hermes/upload/live",
+    "tempDir": "<GLB_ROOT>/Hermes/upload/temp"
   },
   "output": {
     "finishedDir": "<GLB_OUTPUT>/finished",
     "draftDir": "<GLB_OUTPUT>/draft"
   },
   "analyzer": {
-    "ffmpegPath": "D:/GLB/GLB/ffmpeg.dll",
+    "ffmpegPath": "<GLB_ROOT>/GLB/ffmpeg.dll",
     "asrMode": "glb_ipc",
     "keyframeThreshold": 0.3,
     "minSegmentDurationMs": 30000,

@@ -1,6 +1,6 @@
 import { loadTranscript, buildEditableText, charRangeToTime, normalizeRanges } from "../editable-text.js";
 
-const tr = loadTranscript("D:/GLB/Hermes/upload/temp/compressO-2026-06-17_103203_asr.json");
+const tr = loadTranscript("<GLB_ROOT>/Hermes/upload/temp/compressO-2026-06-17_103203_asr.json");
 const SEG_START = 1750000;
 const e = buildEditableText(tr, 1750, 1810);
 

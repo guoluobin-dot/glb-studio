@@ -38,7 +38,7 @@ describe('按路径反查直播 · 必须忽略分隔符与大小写', () => {
     const now = new Date().toISOString();
     store.db.prepare(`
       INSERT INTO live_videos (video_path, video_name, analysis_status, created_at, collection)
-      VALUES ('E:/直播/compressO-2026-06-17_103203.mp4', 'a.mp4', 'analyzed', ?, '某老师')
+      VALUES ('E:/直播/compressO-2026-06-17_103203.mp4', 'a.mp4', 'analyzed', ?, '案例老师')
     `).run(now);
   });
 
@@ -52,7 +52,7 @@ describe('按路径反查直播 · 必须忽略分隔符与大小写', () => {
   it('桌面端的反斜杠路径要能查到（这是串档的根因）', () => {
     const r = store._findLiveByPath('E:\\直播\\compressO-2026-06-17_103203.mp4');
     expect(r).toBeTruthy();
-    expect(r.collection).toBe('某老师');
+    expect(r.collection).toBe('案例老师');
   });
 
   it('正斜杠（库里的原样）也能查到', () => {

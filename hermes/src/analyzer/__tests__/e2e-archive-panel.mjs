@@ -18,7 +18,7 @@ import { join } from 'path';
 
 const base = process.env.HERMES_URL || 'http://127.0.0.1:17841';
 const db = new Database(join(process.cwd(), 'data', 'hermes.db'));
-const COL = '某老师';
+const COL = '案例老师';
 const TMP = join(process.cwd(), 'data', 'e2e-panel-tmp');
 
 let pass = 0, fail = 0;

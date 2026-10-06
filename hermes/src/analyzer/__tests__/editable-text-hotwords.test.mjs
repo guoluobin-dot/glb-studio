@@ -67,12 +67,12 @@ test('显式传的空数组要盖掉全局状态，而不是被忽略', () => {
 test('两条直播的规则互不干扰', () => {
   const ASR_B = makeAsr('b.transcript.json', [{ start_ms: 0, end_ms: 1000, text: '甲说猪老师' }]);
   const rulesA = [{ from: '猪老师', to: '朱老师' }];
-  const rulesB = [{ from: '猪老师', to: '某老师' }];
+  const rulesB = [{ from: '猪老师', to: '案例老师' }];
 
   const a = loadTranscript(ASR_B, rulesA);
   const b = loadTranscript(ASR_B, rulesB);
   assert.equal(a[0].text, '甲说朱老师');
-  assert.equal(b[0].text, '甲说某老师');
+  assert.equal(b[0].text, '甲说案例老师');
 });
 
 test('顺序颠倒也要得到同一个结果（长规则先替）', () => {

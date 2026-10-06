@@ -26,7 +26,7 @@ const TMP = join(process.cwd(), 'data', 'tmp-hotword-seam');
 const MARK = '热词接缝探针';
 const IP_A = `${MARK}-甲`;
 const IP_B = `${MARK}-乙`;
-const WRONG = '陈某老师';
+const WRONG = '陈案例老师';
 const RIGHT = '陈珠老师';
 
 mkdirSync(TMP, { recursive: true });

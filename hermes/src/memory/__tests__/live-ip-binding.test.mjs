@@ -1,8 +1,8 @@
 /**
  * 直播素材 ↔ IP 记忆库的绑定。
  *
- * 要防的是那个静默故障:导入某老师的直播,界面停在王老师身上,
- * 于是拿王老师的爆款记忆去分析某老师的素材 —— 不报错,只是片段不对味,
+ * 要防的是那个静默故障:导入案例老师的直播,界面停在王老师身上,
+ * 于是拿王老师的爆款记忆去分析案例老师的素材 —— 不报错,只是片段不对味,
  * 事后根本查不出是谁的问题。
  *
  * 必须用 Hermes 自己的 node 跑(它的 better-sqlite3 是按那个 ABI 编译的),
@@ -23,7 +23,7 @@ const VIDEO_B = "D:/fake/wanglaoshi-2026-06-20.mp4";
 
 /**
  * MemoryStore 把 dbPath 相对 Hermes 根目录 join,所以必须给**相对**路径 ——
- * 给绝对路径会被拼成 D:\GLB\Hermes\D:\GLB\Hermes\data\...。
+ * 给绝对路径会被拼成 <GLB_ROOT>/Hermes\<GLB_ROOT>/Hermes\data\...。
  * 临时库放在 Hermes 自己的 data/.tmp-test 下,跑完删掉,绝不碰 hermes.db。
  */
 const REL = `data/.tmp-test-bind-${process.pid}`;
@@ -41,8 +41,8 @@ test("live_videos 表有 collection 列", () => {
 });
 
 test("导入时就能绑定老师", () => {
-  store.upsertLiveVideo(VIDEO_A, { videoName: "某老师直播", collection: "某老师" });
-  assert.equal(store.getLiveVideoCollection(store.getLiveVideoIdByPath(VIDEO_A)), "某老师");
+  store.upsertLiveVideo(VIDEO_A, { videoName: "案例老师直播", collection: "案例老师" });
+  assert.equal(store.getLiveVideoCollection(store.getLiveVideoIdByPath(VIDEO_A)), "案例老师");
 });
 
 test("中途 upsert 不能把绑定冲掉", () => {
@@ -52,7 +52,7 @@ test("中途 upsert 不能把绑定冲掉", () => {
   store.upsertLiveVideo(VIDEO_A, { analysisStatus: "analyzing" });
   store.upsertLiveVideo(VIDEO_A, { segmentCount: 210 });
   store.upsertLiveVideo(VIDEO_A, { analysisHealth: '{"grade":"ok"}' });
-  assert.equal(store.getLiveVideoCollection(id), "某老师");
+  assert.equal(store.getLiveVideoCollection(id), "案例老师");
 });
 
 test("可以改绑到另一位老师", () => {
@@ -73,14 +73,14 @@ test("没绑定的素材返回 undefined 而不是 null", () => {
 });
 
 test("两条直播可以绑定到不同老师，互不串味", () => {
-  store.upsertLiveVideo(VIDEO_A, { collection: "某老师" });
+  store.upsertLiveVideo(VIDEO_A, { collection: "案例老师" });
   store.upsertLiveVideo(VIDEO_B, { collection: "王老师" });
-  assert.equal(store.getLiveVideoCollection(store.getLiveVideoIdByPath(VIDEO_A)), "某老师");
+  assert.equal(store.getLiveVideoCollection(store.getLiveVideoIdByPath(VIDEO_A)), "案例老师");
   assert.equal(store.getLiveVideoCollection(store.getLiveVideoIdByPath(VIDEO_B)), "王老师");
 });
 
 test("绑定不存在的直播要报错而不是静默成功", () => {
-  const r = store.bindLiveVideoCollection(999999, "某老师");
+  const r = store.bindLiveVideoCollection(999999, "案例老师");
   assert.equal(r.ok, false);
 });
 
@@ -96,7 +96,7 @@ test("反斜杠路径能查到同一条", () => {
 test("getCollection* 支持显式传归属，不吃全局", () => {
   // 真正生效的判断依据：显式传 collection 时结果必须和全局无关
   store.activeCollection = "王老师";
-  const zhuliao = store.getCollectionThemeKeywords("某老师", 50);
+  const zhuliao = store.getCollectionThemeKeywords("案例老师", 50);
   const wang = store.getCollectionThemeKeywords("王老师", 50);
   assert.notEqual(zhuliao === wang, undefined); // 都能查，不抛
   store.activeCollection = null;

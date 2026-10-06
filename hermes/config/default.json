@@ -59,7 +59,7 @@
     "transcriptDir": "<GLB_OUTPUT>/transcripts",
     "highlightDir": "<GLB_OUTPUT>/highlights",
     "clipDir": "<GLB_OUTPUT>/clips",
-    "exePath": "D:/GLB/GLB/GLB.exe",
+    "exePath": "<GLB_ROOT>/GLB/GLB.exe",
     "userDataDirs": []
   },
   "memory": {
@@ -89,9 +89,9 @@
     }
   },
   "upload": {
-    "hitsDir": "D:/GLB/Hermes/upload/hits",
-    "liveDir": "D:/GLB/Hermes/upload/live",
-    "tempDir": "D:/GLB/Hermes/upload/temp",
+    "hitsDir": "<GLB_ROOT>/Hermes/upload/hits",
+    "liveDir": "<GLB_ROOT>/Hermes/upload/live",
+    "tempDir": "<GLB_ROOT>/Hermes/upload/temp",
     "retentionDays": 7,
     "maxFileBytes": 8589934592,
     "maxTotalBytes": 53687091200

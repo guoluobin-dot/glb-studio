@@ -4,7 +4,7 @@
  * 守的是一条产品决定：**基准只看这位老师自己的数据，绝不混别人。**
  *
  * 以前 getPerformanceBaseline 只按 genre(题材) 过滤、完全不看 collection，
- * 于是某老师的爆款感标准会被其他老师的同题材数据稀释 ——
+ * 于是案例老师的爆款感标准会被其他老师的同题材数据稀释 ——
  * 而"这位老师自己的爆款感"正是这个功能存在的理由。
  * 更糟的是它不报错：样本少的时候掺进别人的数据，看起来有参照，
  * 其实参照的是别人的标准，会系统性地把预测带偏。
@@ -21,7 +21,7 @@ import { MemoryStore } from '../../memory/store.js';
 /*
  * dbPath 必须给**相对路径**（相对 Hermes 根目录）。
  * MemoryStore 内部是 join(root, dbPath)，传绝对路径会拼成
- * "D:\GLB\Hermes\C:\Users\...\xxx" 这种废路径，mkdir 直接 ENOENT。
+ * "<GLB_ROOT>/Hermes\C:\Users\...\xxx" 这种废路径，mkdir 直接 ENOENT。
  */
 const dbPath = 'data/hermes-test-baseline.db';
 const cfg = JSON.parse(readFileSync(join(process.cwd(), 'config', 'default.json'), 'utf8'));
@@ -48,11 +48,11 @@ function seed(collection, genre, views, platform = 'douyin') {
 }
 
 test('指定 IP 时只用这位老师自己的数据', () => {
-  seed('某老师', '唱歌', 50000);
+  seed('案例老师', '唱歌', 50000);
   seed('王老师', '唱歌', 900000);   // 同题材，但别人的数据，差 18 倍
-  const b = store.getPerformanceBaseline('唱歌', 'douyin', '某老师');
-  assert.equal(b?.views, 50000, '必须只取某老师自己的中位数');
-  assert.equal(b?.scopedTo, '某老师');
+  const b = store.getPerformanceBaseline('唱歌', 'douyin', '案例老师');
+  assert.equal(b?.views, 50000, '必须只取案例老师自己的中位数');
+  assert.equal(b?.scopedTo, '案例老师');
 });
 
 test('绝不混入其他老师的数据（这是本次改动的核心）', () => {
@@ -71,16 +71,16 @@ test('该 IP 没有任何真实数据时返回 null，而不是拿别人的凑',
 });
 
 test('指定 IP 时同平台优先，仍只在该 IP 内', () => {
-  seed('某老师', '唱歌', 111111, 'douyin');
-  seed('某老师', '唱歌', 222222, 'xiaohongshu');
+  seed('案例老师', '唱歌', 111111, 'douyin');
+  seed('案例老师', '唱歌', 222222, 'xiaohongshu');
   seed('王老师', '唱歌', 888888, 'douyin');
-  const b = store.getPerformanceBaseline('唱歌', 'douyin', '某老师');
+  const b = store.getPerformanceBaseline('唱歌', 'douyin', '案例老师');
   assert.equal(b.views, 111111);
   assert.equal(b.platform, 'douyin');
   // 平台没有就退回该 IP 的全平台，仍不越界
-  const b2 = store.getPerformanceBaseline('唱歌', 'kuaishou', '某老师');
+  const b2 = store.getPerformanceBaseline('唱歌', 'kuaishou', '案例老师');
   assert.equal(b2.platform, null);
-  assert.ok(b2.views === 111111 || b2.views === 222222, '只能取到某老师自己的数');
+  assert.ok(b2.views === 111111 || b2.views === 222222, '只能取到案例老师自己的数');
 });
 
 test('不指定 IP 时保持原来的题材口径（通用素材不能没有基准）', () => {

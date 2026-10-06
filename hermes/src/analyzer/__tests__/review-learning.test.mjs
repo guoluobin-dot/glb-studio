@@ -234,29 +234,29 @@ describe('记忆库 · review_edits 落库与读取', () => {
 
   it('写入三类样本', () => {
     const n = store.addReviewEdits([
-      { clipProjectId: null, liveVideoId: 1, collection: '某老师', kind: 'cut', text: '同学们欢迎大家', by: 'edited' },
-      { clipProjectId: null, liveVideoId: 1, collection: '某老师', kind: 'keep', text: '今天讲和弦的构成', by: 'edited' },
-      { clipProjectId: null, liveVideoId: 1, collection: '某老师', kind: 'segment', role: 'hook', themeName: '开场', text: '正文…', by: 'picked' }
+      { clipProjectId: null, liveVideoId: 1, collection: '案例老师', kind: 'cut', text: '同学们欢迎大家', by: 'edited' },
+      { clipProjectId: null, liveVideoId: 1, collection: '案例老师', kind: 'keep', text: '今天讲和弦的构成', by: 'edited' },
+      { clipProjectId: null, liveVideoId: 1, collection: '案例老师', kind: 'segment', role: 'hook', themeName: '开场', text: '正文…', by: 'picked' }
     ]);
     expect(n).toBe(3);
-    expect(store.getReviewEditsByKind('keep', '某老师').length).toBe(1);
-    expect(store.getReviewEditsByKind('segment', '某老师').length).toBe(1);
+    expect(store.getReviewEditsByKind('keep', '案例老师').length).toBe(1);
+    expect(store.getReviewEditsByKind('segment', '案例老师').length).toBe(1);
   });
 
   it('按 IP 老师隔离，且通用样本（collection=NULL）对所有人可见', () => {
     store.addReviewEdits([{ clipProjectId: null, liveVideoId: 1, collection: null, kind: 'cut', text: '欢迎新宝宝' }]);
-    // 某老师应能读到自己的 + 通用的
-    const zhu = store.getReviewEditsByKind('cut', '某老师');
+    // 案例老师应能读到自己的 + 通用的
+    const zhu = store.getReviewEditsByKind('cut', '案例老师');
     expect(zhu.length).toBe(2);
     // 别的老师只读到通用那条
     store.addReviewEdits([{ clipProjectId: null, liveVideoId: 1, collection: '李老师', kind: 'cut', text: '李老师的避雷' }]);
     expect(store.getReviewEditsByKind('cut', '李老师').length).toBe(2);
-    // 李老师不该看到某老师的
+    // 李老师不该看到案例老师的
     expect(store.getReviewEditsByKind('cut', '李老师').some((r) => r.text === '同学们欢迎大家')).toBe(false);
   });
 
   it('摘要同时统计删和留（这是"有没有学到正向逻辑"的唯一判据）', () => {
-    const sum = store.getEditStyleSummary('某老师');
+    const sum = store.getEditStyleSummary('案例老师');
     expect(sum.cuts).toBeGreaterThan(0);
     expect(sum.keeps).toBeGreaterThan(0);
     expect(sum.segments).toBeGreaterThan(0);
@@ -264,9 +264,9 @@ describe('记忆库 · review_edits 落库与读取', () => {
 
   it('统计最常被删的开头（避雷词要能聚类出模式）', () => {
     for (let i = 0; i < 3; i++) {
-      store.addReviewEdits([{ clipProjectId: null, liveVideoId: 1, collection: '某老师', kind: 'cut', text: '同学们欢迎大家来' }]);
+      store.addReviewEdits([{ clipProjectId: null, liveVideoId: 1, collection: '案例老师', kind: 'cut', text: '同学们欢迎大家来' }]);
     }
-const top = store.topCutOpenings('某老师', 5);
+const top = store.topCutOpenings('案例老师', 5);
     expect(top.length).toBeGreaterThan(0);
     // 开头 6 字，是用户最常删的"起手式"的共同前缀
     expect(top[0].opening).toBe('同学们欢迎大');
@@ -274,9 +274,9 @@ const top = store.topCutOpenings('某老师', 5);
   });
 
   it('空行不入库（text 和 themeName 都空的没有学习价值）', () => {
-    const before = store.getReviewEdits('某老师', 999).length;
+    const before = store.getReviewEdits('案例老师', 999).length;
     store.addReviewEdits([{ kind: 'cut', text: '', themeName: '' }, { kind: 'cut' }]);
-    expect(store.getReviewEdits('某老师', 999).length).toBe(before);
+    expect(store.getReviewEdits('案例老师', 999).length).toBe(before);
   });
 });
 
@@ -341,14 +341,14 @@ describe('IP 老师归档 · 每个老师的档案独立', () => {
 
   it('两位老师的样本互不串档', () => {
     for (let i = 0; i < 12; i++) {
-      seed('某老师', 'cut', '同学们欢迎大家');
-      seed('某老师', 'keep', '今天我们讲和弦的构成方法');
-seed('某老师', 'segment', '开场：直接抛出问题', 'hook', '直接抛出问题');
+      seed('案例老师', 'cut', '同学们欢迎大家');
+      seed('案例老师', 'keep', '今天我们讲和弦的构成方法');
+seed('案例老师', 'segment', '开场：直接抛出问题', 'hook', '直接抛出问题');
       seed('李老师', 'cut', '家人们双击666');
       seed('李老师', 'keep', '这首歌我教你唱');
       seed('李老师', 'segment', '开场：先讲背景故事', 'hook', '先讲背景故事');
     }
-    const zhu = store.getEditArchive('某老师');
+    const zhu = store.getEditArchive('案例老师');
     const li = store.getEditArchive('李老师');
     expect(zhu.totalSamples > 0).toBe(true);
     expect(li.totalSamples > 0).toBe(true);
@@ -360,7 +360,7 @@ seed('某老师', 'segment', '开场：直接抛出问题', 'hook', '直接抛�
   });
 
   it('档案给出可直接用的结构偏好（role 排序 + 避雷开头）', () => {
-    const a = store.getEditArchive('某老师');
+    const a = store.getEditArchive('案例老师');
     expect(Array.isArray(a.roleOrder)).toBe(true);
     expect(a.roleOrder.some((r) => r.role === 'hook')).toBe(true);
     expect(Array.isArray(a.promptHints.avoid)).toBe(true);
@@ -382,7 +382,7 @@ const a = store.getEditArchive('新人老师');
     store.createCollection('空文件夹老师');
     const list = store.listEditArchives();
     expect(list.some((r) => r.name === '空文件夹老师')).toBe(false);
-    expect(list.some((r) => r.name === '某老师')).toBe(true);
+    expect(list.some((r) => r.name === '案例老师')).toBe(true);
   });
 
   it('改名时所有归档表都要跟着改（否则记忆留在旧名下）', () => {
@@ -430,13 +430,13 @@ describe('IP 老师归属 · 用素材自己的 IP，不是当前选中的', () 
     const now = new Date().toISOString();
     store.db.prepare(`
       INSERT INTO live_videos (video_path, video_name, analysis_status, created_at, collection)
-      VALUES ('D:/x/a.mp4', 'a.mp4', 'analyzed', ?, '某老师')
+      VALUES ('D:/x/a.mp4', 'a.mp4', 'analyzed', ?, '案例老师')
     `).run(now);
     store.activeCollection = '李老师';
     const got = store._ownerOfLive(Number(store.db.prepare('SELECT id FROM live_videos WHERE video_path=?').get('D:/x/a.mp4').id));
     // 关键：不能记成李老师 —— 那是"审片那天用户正好选中的"，
     // 和这条直播属于谁没关系。错记会持续产出错误的避雷规则。
-    expect(got).toBe('某老师');
+    expect(got).toBe('案例老师');
   });
 
   it('素材没有 IP 时才回落到当前选中', () => {

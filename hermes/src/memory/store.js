@@ -731,7 +731,7 @@ export class MemoryStore {
    *
    * 为什么要单独一套：getStyleProfile() 返回的是 user_style_profile 全表，
    * 那些 hooks_<genre> 是**跨 IP 混在一起的**全局钩子池。而用户要的是
-   * "跟某老师学爆款感"，混进别的老师的钩子等于学错人。
+   * "跟案例老师学爆款感"，混进别的老师的钩子等于学错人。
    *
    * 这里只取 activeCollection 命中的爆款（hit_videos.collection），
    * 没有集合时返回空数组而不是回落到全局池 —— 回落会让"没设集合"看起来
@@ -975,7 +975,7 @@ export class MemoryStore {
     /*
      * 必须把所有带 collection 的表一起改。
      *
-     * 以前只改 hit_videos，结果"某老师"改名后：
+     * 以前只改 hit_videos，结果"案例老师"改名后：
      *   - 爆款素材跟着走了
      *   - review_feedback / review_edits 还挂在旧名下 → 归档断裂，
      *     用户以为学到的偏好跟着老师一起搬过去了，实际没有
@@ -1695,7 +1695,7 @@ export class MemoryStore {
    * 优先级：素材自己的 collection > 当前选中的集合 > null。
    * 素材自己的优先，是因为分析时就是"针对某位老师"做的；
    * 审片往往发生在几天之后，那时用户早就切到别的 IP 了。
-   * 用当前选中会把「某老师」的口播删减记到「李老师」名下，
+   * 用当前选中会把「案例老师」的口播删减记到「李老师」名下，
    * 而且不报错，错误规则会持续累积。
    */
   _ownerOfLive(liveVideoId) {
@@ -2154,7 +2154,7 @@ getEditStyleSummary(collection = undefined) {
  *
  * 【为什么必须按 collection 隔离】
  * 以前只按 genre(题材) 过滤、完全不看 collection。后果是：
- * 某老师的爆款感标准，会被其他老师的同题材数据稀释 ——
+ * 案例老师的爆款感标准，会被其他老师的同题材数据稀释 ——
  * 而"这位老师自己的爆款感"正是这个功能存在的理由。
  * 素材少的时候掺进别人的数据，比没有基准更糟：
  * 看起来有参照，其实参照的是别人的标准，会系统性地把预测带偏。

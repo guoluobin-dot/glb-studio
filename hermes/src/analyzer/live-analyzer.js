@@ -86,9 +86,9 @@ function renderStandardForSegmentation(st) {
 export function buildMemoryContext(store, collection = undefined) {
   const mem = { themes: [], lessons: [], feedback: [], avoid: [], opening: '', hooks: [], openers: [], viralPoints: [], standard: '', edits: null };
   // 选中集合后，下面三块记忆（主题 / 评审经验 / 打回意见）都必须按集合取。
-  // 以前全是全局池：混着所有老师的爆款和意见。后果是"我选了某老师，
+  // 以前全是全局池：混着所有老师的爆款和意见。后果是"我选了案例老师，
   // 结果模型学的是别人的主题和避雷点"，而且界面完全看不出来。
-  // 当前全局文件夹（只作为兜底）：比如界面停在"某老师"，但正在分析的这条直播
+  // 当前全局文件夹（只作为兜底）：比如界面停在"案例老师"，但正在分析的这条直播
   // 自己绑定了"王老师"，就该用王老师的记忆 —— 传进来的 collection 优先。
   // 不传（undefined）才回落到全局，所以老调用方行为不变。
   const active = collection !== undefined
@@ -202,7 +202,7 @@ export function buildMemoryContext(store, collection = undefined) {
   //
   // 优先取**当前选中的 IP 老师**的钩子；没选集合才回落 genre 全局池。
   // 顺序反了的话：全局池里混着所有老师的钩子，会覆盖掉本该学的那位，
-  // 表现为"我选了某老师，结果学的是别人的钩子"，而且界面不报错。
+  // 表现为"我选了案例老师，结果学的是别人的钩子"，而且界面不报错。
   try {
     let picked = false;
     if (active) {
@@ -578,7 +578,7 @@ export class LiveAnalyzer {
       // 随分段系统提示词一起喂给 Ollama，让"切哪里、怎么命名、钩子打几分"直接受记忆影响
       //
       // 用这条直播自己绑定的老师，而不是全局当前文件夹：
-      // 导入某老师的素材时界面可能正停在王老师身上，用错记忆不会报错，
+      // 导入案例老师的素材时界面可能正停在王老师身上，用错记忆不会报错，
       // 只是选出来的片段"不对味"，事后根本查不出是谁的问题。
       const ownCollection = this.store.getLiveVideoCollection?.(liveVideoId) ?? undefined;
       const mem = buildMemoryContext(this.store, ownCollection);

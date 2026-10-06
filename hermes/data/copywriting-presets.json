@@ -1,0 +1,47 @@
+[
+  {
+    "pattern_type": "hook",
+    "text_content": "停下来！这个改变了一切",
+    "effectiveness": 0.8,
+    "context_tags": [
+      "开头",
+      "吸引注意力"
+    ]
+  },
+  {
+    "pattern_type": "hook",
+    "text_content": "3秒告诉你为什么XX比XX好",
+    "effectiveness": 0.75,
+    "context_tags": [
+      "开头",
+      "对比"
+    ]
+  },
+  {
+    "pattern_type": "urgency",
+    "text_content": "限时只有今天，手慢无",
+    "effectiveness": 0.85,
+    "context_tags": [
+      "紧迫感",
+      "稀缺性"
+    ]
+  },
+  {
+    "pattern_type": "cta",
+    "text_content": "点击下方链接，马上带回家",
+    "effectiveness": 0.7,
+    "context_tags": [
+      "行动号召",
+      "购买引导"
+    ]
+  },
+  {
+    "pattern_type": "social_proof",
+    "text_content": "已经10万人入手了，好评率99%",
+    "effectiveness": 0.8,
+    "context_tags": [
+      "社会认同",
+      "信任"
+    ]
+  }
+]

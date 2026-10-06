@@ -11,7 +11,7 @@
 import { resolveProxy, applyProxyEnv, proxySource, describeHttpFailure } from "../proxy.js";
 import { readFileSync } from "node:fs";
 
-const cfg = JSON.parse(readFileSync("D:/GLB/Hermes/config/default.json", "utf8"));
+const cfg = JSON.parse(readFileSync("<GLB_ROOT>/Hermes/config/default.json", "utf8"));
 const g = cfg.gemini || {};
 const oai = (g.protocol || "gemini-native") === "openai-compatible";
 

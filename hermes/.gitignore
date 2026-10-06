@@ -11,6 +11,15 @@ data/
 upload/
 logs/
 
+# 例外：粗剪规则是**用户配置**，不是运行状态，必须跟着仓库走。
+# 没有它，别人 clone 下来 clipper 会退回内置默认词表，
+# clip-drop-rules 测试也直接红（测试断言的就是这个文件存在）。
+!data/
+data/*
+!data/clip-rules.json
+!data/clip-standard.json
+!data/copywriting-presets.json
+
 # ── 依赖与构建产物 ──
 node_modules/
 dist/

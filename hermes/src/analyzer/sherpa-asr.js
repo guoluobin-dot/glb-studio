@@ -23,7 +23,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 /**
  * sherpa-onnx 的加载位置。
  *
- * 2026-09-30 修：原来只写死一条 D:/GLB/GLB/resources/app.asar.unpacked/... ,
+ * 2026-09-30 修：原来只写死一条 <GLB_ROOT>/GLB/resources/app.asar.unpacked/... ,
  * 那是旧宿主应用里的路径。宿主一旦重装/换路径，这条链就断，
  * 表现为转写静默失败（"sherpa-onnx-node not found"），
  * 而模型文件其实一直好好躺在 %APPDATA%\GLB\models 里。
@@ -35,7 +35,7 @@ const SHERPA_PATHS = [
   // 1) Hermes 自己的依赖（推荐路径：npm i sherpa-onnx-node sherpa-onnx-win-x64）
   'sherpa-onnx-node/sherpa-onnx.js',
   // 2) 宿主应用解包目录（兼容旧部署）
-  'D:/GLB/GLB/resources/app.asar.unpacked/node_modules/sherpa-onnx-node/sherpa-onnx.js',
+  '<GLB_ROOT>/GLB/resources/app.asar.unpacked/node_modules/sherpa-onnx-node/sherpa-onnx.js',
 ];
 
 // 分块长度。三次下调，都是被实测打回来的：
@@ -175,7 +175,7 @@ export class SherpaASR {
     if (!durationSec || durationSec <= 0) throw new Error('无法读取视频时长');
 
     // 工作目录必须用纯 ASCII 路径：sherpa-onnx 的 C++ readWave 用 ANSI fopen，
-    // 中文路径（如 D:\GLB\...）Node 侧 existsSync 能过、C++ 侧打不开。
+    // 中文路径（如 <GLB_ROOT>/...）Node 侧 existsSync 能过、C++ 侧打不开。
     // 视频读取走 ffmpeg（Unicode 正常），只有切片 wav 需要绕行系统 TEMP。
     const safeBase = join(tmpdir(), 'hermes-asr');
     if (!existsSync(safeBase)) mkdirSync(safeBase, { recursive: true });

@@ -781,7 +781,7 @@ export class Orchestrator {
    * 为什么以素材自己的为准：分析时是"针对某位老师"做的，
    * 这条直播从头到尾就属于那位老师。审片发生在几天之后，
    * 那时用户早就切到别的 IP 了 —— 用 activeCollection 就会把
-   * "某老师"的口播删减记到"李老师"名下。
+   * "案例老师"的口播删减记到"李老师"名下。
    * 而且这种错记不报错，还会持续产出错误的避雷规则，污染越积越多。
    *
    * 查不到就返回 null（不猜）。宁可让这条意见暂时用不上，
@@ -2003,7 +2003,7 @@ this.app.delete('/memory/hotwords/:id', this.requireWriteAuth, (req, res) => {
       }
     });
     // 2026-09-24 补：以前只有 POST 没有 GET，调用方没法"先读当前值再改"。
-    // 实测踩过坑：读不到当前值 → 盲写把「某老师」清成了空，记忆隔离被静默关掉。
+    // 实测踩过坑：读不到当前值 → 盲写把「案例老师」清成了空，记忆隔离被静默关掉。
     this.app.get('/api/active-collection', this.requireReadAuth, (req, res) => {
       try {
         const name = this._activeCollection || '';
@@ -4822,7 +4822,7 @@ function pickCollection(name){
  if(name){api('/api/active-collection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})}).then(()=>{toast('已切换：剪片将用【'+name+'】的爆款记忆','ok');const a=document.getElementById('col-active');if(a)a.textContent='当前剪片用的记忆库：'+name;}).catch(e=>toast('切换失败：'+e.message,'err'));}
 }
 async function newCollection(){
- const name=await askInput('给这个文件夹起个名字（建议用 IP / 老师名）','','创建','例如：某老师 / 朱老师 / 轻语IP');
+ const name=await askInput('给这个文件夹起个名字（建议用 IP / 老师名）','','创建','例如：案例老师 / 朱老师 / 轻语IP');
  if(name===null)return;
  if(!String(name).trim())return;
  const n=String(name).trim().slice(0,40);
@@ -4845,7 +4845,7 @@ function colCell(h){
 }
 async function setCol(id,name){
  if(name==='__new__'){
-  name=await askInput('归入新文件夹（用 IP / 老师名命名）','','创建','例如：某老师');
+  name=await askInput('归入新文件夹（用 IP / 老师名命名）','','创建','例如：案例老师');
   if(name===null){loadUploads();return;}
   if(!String(name).trim()){loadUploads();return;}
   name=String(name).trim().slice(0,40);
@@ -4855,7 +4855,7 @@ async function setCol(id,name){
   .catch(e=>toast('设置失败：'+e.message,'err'));
 }
 async function moveOne(id){
- const name=await askInput('归入文件夹（填新名字就是新建文件夹，留空=移出）','','归入','例如：某老师');
+ const name=await askInput('归入文件夹（填新名字就是新建文件夹，留空=移出）','','归入','例如：案例老师');
  if(name===null)return;
  api('/hits/collection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,name})})
   .then((r)=>{toast('已归入【'+(name||'未归类')+'】','ok');markUndoable(r);loadUploads();})
@@ -4906,7 +4906,7 @@ function selAll(el){document.querySelectorAll('.hitpick').forEach(b=>{if(!b.disa
 function clearSel(){document.querySelectorAll('.hitpick').forEach(b=>b.checked=false);selChange();}
 async function batchMove(){
  const ids=pickedIds();if(!ids.length){toast('先勾选素材','err');return;}
- const name=await askInput('把这 '+ids.length+' 条归入文件夹（填新名字就是新建文件夹，留空=移出）','','归入','例如：某老师');
+ const name=await askInput('把这 '+ids.length+' 条归入文件夹（填新名字就是新建文件夹，留空=移出）','','归入','例如：案例老师');
  if(name===null)return;
  api('/hits/collection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids,name})})
   .then((r)=>{toast('已归入【'+(name||'未归类')+'】 '+ids.length+' 条','ok');markUndoable(r);clearSel();loadUploads();})
