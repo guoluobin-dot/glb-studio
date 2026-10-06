@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      media-src 必须显式放行 glb-media:。
+      协议特权(bypassCSP)只解决 Chromium 的 URL 安全检查,
+      这一行解决渲染进程的 CSP 校验,少任何一个 <video> 都是黑的。
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: glb-media:; connect-src 'self' glb-media: http://127.0.0.1:17841"
+    />
+    <title>GLB Studio</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

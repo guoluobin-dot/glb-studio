@@ -1,0 +1,28 @@
+# ── 依赖与构建产物 ──
+node_modules/
+dist/
+out/
+build/
+*.tsbuildinfo
+
+# ── 密钥：绝不能进版本库 ──
+.env
+.env.*
+config/secrets.local.json
+config/*.local.json
+
+# ── 运行数据 ──
+# 里面是逐句稿、抽帧、缓存
+data/
+logs/
+*.log
+
+# ── 上传的素材与成片（体积大，本机状态）──
+upload/
+
+# ── 编辑器 / 系统 ──
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

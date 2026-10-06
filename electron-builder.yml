@@ -1,0 +1,42 @@
+appId: com.glb.studio
+productName: GLB Studio
+copyright: Copyright © 2026 郭洛斌
+
+directories:
+  output: dist
+  buildResources: build
+
+files:
+  - out/**
+  - package.json
+  - '!**/*.map'
+  - '!**/*.bak-*'
+
+asar: true
+asarUnpack:
+  - node_modules/ffmpeg-static/**
+  - node_modules/@ffprobe-installer/**
+
+win:
+  target:
+    - target: dir
+      arch:
+        - x64
+  executableName: GLB Studio
+  artifactName: GLB-Studio-${version}-${arch}.${ext}
+  # 本机无公网证书且无签名需求。显式关掉签名,否则 electron-builder 会去
+  # 下载 winCodeSign 并在 600s 后超时,留下"打包失败但 dist 里有旧产物"的假象,
+  # 装出去的就是上一版程序(踩过一次)。
+  signAndEditExecutable: false
+
+# 目标只有 dir,不产出安装包,无需下载 nsis/winCodeSign 等工具链
+buildDependenciesFromSource: false
+
+extraResources:
+  # 字体目录当前不存在,保留 from 但容忍缺失,
+  # 否则每次打包都报 "file source doesn't exist" 干扰真正的问题。
+  - from: resources/fonts
+    to: fonts
+    filter: ["**/*"]
+
+npmRebuild: false

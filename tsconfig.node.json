@@ -1,0 +1,44 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    // 带 DOM 是因为 tests/ 会 import 渲染层组件（WindowedList 等）。
+    // 这个配置本来就包含 src/renderer/src/lib/format.ts 和 stores/session-store.ts，
+    // 引入渲染层只是把这条既有做法扩大了一步。
+    // 代价是主进程代码理论上能用 DOM 类型，真实风险低 —— 运行时 Node 里没有 document，
+    // 真写了会立刻报错，不会静默出错。
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": ["node", "electron-vite/node"],
+    // tests/ 里会直接 import 渲染层组件做渲染测试（比如 WindowedList 的白屏回归），
+    // 所以这里必须开 jsx —— 否则 tsc 报"'--jsx' is not set"，
+    // 组件根本解析不了，那条测试就只能靠人肉点。
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "composite": true,
+    "ignoreDeprecations": "6.0",
+    "paths": {
+      "@shared/*": ["./src/shared/*"],
+      "@main/*": ["./src/main/*"]
+    }
+  },
+  "include": [
+    "electron.vite.config.ts",
+    "src/main/**/*",
+    "src/preload/**/*",
+    "src/shared/**/*",
+    "tests/**/*",
+    "src/renderer/src/lib/format.ts",
+    "src/renderer/src/stores/session-store.ts",
+    // 只有真正被测试 import 的组件才列进来，列整个 components/ 会把整个渲染层
+    // 拖进主进程项目，得不偿失。
+    "src/renderer/src/components/WindowedList.tsx"
+  ]
+}
