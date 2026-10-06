@@ -9,8 +9,12 @@
  */
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
-const css = readFileSync("<GLB_NEW>/src/renderer/src/styles.css", "utf8");
+// 用 __dirname 定位，不写死绝对路径：
+// 写死的话换机器/换目录就找不到文件，测试会以 ENOENT 失败，
+// 而报错信息（找不到 "<GLB_NEW>/..."）完全指不到真正的原因。
+const css = readFileSync(join(__dirname, "..", "src", "renderer", "src", "styles.css"), "utf8");
 
 /** 取浅色主题块里的变量值 */
 function lightVar(name: string): string {

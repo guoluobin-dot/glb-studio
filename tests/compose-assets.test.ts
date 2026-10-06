@@ -53,10 +53,16 @@ beforeAll(() => {
   // ffprobe 必须用真的二进制。之前"把 ffmpeg 复制成 ffprobe"是错的 ——
   // ffmpeg 收到 ffprobe 的参数会报 "Option not found"，而且报错发生在
   // 探测阶段，看起来像产物有问题，其实是探测工具不对。
-  // @ffprobe-installer 的包名里带平台后缀，所以直接在 pnpm store 里找实际文件。
-  const ffprobePkg = require.resolve("@ffprobe-installer/win32-x64/package.json");
-  ffprobePath = join(dirname(ffprobePkg), "ffprobe.exe");
-  if (!existsSync(ffprobePath)) throw new Error(`找不到 ffprobe：${ffprobePath}`);
+  // @ffprobe-installer 的平台包（@ffprobe-installer/win32-x64）在 pnpm 下
+  // **不会**被软链到顶层 node_modules —— pnpm 只暴露直接声明的依赖。
+  // 所以 require.resolve("@ffprobe-installer/win32-x64/...") 必然 MODULE_NOT_FOUND，
+  // 而包本体其实好好地躺在 .pnpm 里（之前误判成"依赖没装"就是这个原因）。
+  //
+  // 主包 @ffprobe-installer/ffprobe 自己知道平台包在哪，直接问它要路径。
+  ffprobePath = require("@ffprobe-installer/ffprobe").path;
+  if (!ffprobePath || !existsSync(ffprobePath)) {
+    throw new Error(`找不到 ffprobe 二进制：${ffprobePath}`);
+  }
   for (const n of ["simhei.ttf", "msyhbd.ttc", "arial.ttf"]) {
     const p = `C:/Windows/Fonts/${n}`;
     if (existsSync(p)) { FONT = p; break; }
