@@ -142,7 +142,7 @@ export function IpPicker({
                 if (e.key === "Enter") void create();
                 if (e.key === "Escape") setCreating(false);
               }}
-              placeholder="IP 名字（例：案例老师）"
+              placeholder="IP 名字（例：王老师）"
               className="min-w-0 flex-1 rounded border border-line bg-panel px-2 py-1 text-[11.5px] text-fg outline-none focus:border-ember/60"
             />
             <button

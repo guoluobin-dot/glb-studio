@@ -83,7 +83,7 @@ describe("IP 档案:一个老师一个独立文件夹", () => {
 
   it("能重命名", async () => {
     const a = await ipOf();
-    expect((await renameIp(root, a.id, "案例老师声乐"))?.name).toBe("案例老师声乐");
+    expect((await renameIp(root, a.id, "某某老师"))?.name).toBe("某某老师");
   });
 
   it("IP 之间数据不串", async () => {

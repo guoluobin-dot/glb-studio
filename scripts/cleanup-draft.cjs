@@ -6,7 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const APPLY = process.argv.includes("--apply");
-const DRAFT = "D:/GLB/output/draft";
+const DRAFT = "<GLB_OUTPUT>/draft";
 const TEST_RE = /test-live-01|_vo_test|_mv_test|probe_fresh|_verify_slice/i;
 
 if (!fs.existsSync(DRAFT)) {

@@ -288,7 +288,7 @@ export function RenderOptionsPanel({
                 <input
                   value={options.watermark ?? ""}
                   onChange={(e) => set("watermark", e.target.value)}
-                  placeholder="留空不加水印；例：@案例老师声乐"
+                  placeholder="留空不加水印；例：@某某老师"
                   className="rounded-lg border border-line bg-panel-2 px-3 py-2.5 text-[12.5px] outline-none focus:border-ember/60"
                 />
               </label>

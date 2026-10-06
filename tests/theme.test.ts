@@ -10,7 +10,7 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 
-const css = readFileSync("D:/GLB-NEW/src/renderer/src/styles.css", "utf8");
+const css = readFileSync("<GLB_NEW>/src/renderer/src/styles.css", "utf8");
 
 /** 取浅色主题块里的变量值 */
 function lightVar(name: string): string {

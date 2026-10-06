@@ -14,7 +14,7 @@ const path = require("node:path");
 
 const APPLY = process.argv.includes("--apply");
 const db = new DatabaseSync("D:/GLB/Hermes/data/hermes.db", { readOnly: !APPLY });
-const OUT = "D:/GLB/output/draft";
+const OUT = "<GLB_OUTPUT>/draft";
 
 // 用户真实工程：以这条线以下为准（#91 是 09-30 之前用户自己粗剪的）
 const REAL_MAX = 95;

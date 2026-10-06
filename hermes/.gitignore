@@ -1,0 +1,32 @@
+# ── 密钥：绝不能进版本库 ──
+# config/default.json 里只留 {env:NAME} 占位符，真实值放这个被忽略的文件
+config/secrets.local.json
+
+# ── 运行时生成的密钥（webhook 密钥在首次启动时自动生成到 data/.hermes-secret）──
+data/.hermes-secret
+
+# ── 运行数据：库、逐句稿缓存、抽帧、日志、上传的素材 ──
+# 这些都是本机状态、体积大（几个 GB），换机器应该重新生成而不是拷过去
+data/
+upload/
+logs/
+
+# ── 依赖与构建产物 ──
+node_modules/
+dist/
+build/
+*.log
+
+# ── 本地覆盖配置 ──
+.env
+.env.*
+config/default.local.json
+config/*.local.json
+
+# ── 编辑器与系统 ──
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store

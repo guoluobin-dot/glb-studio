@@ -1,0 +1,31 @@
+{
+  "name": "glb-hermes",
+  "version": "1.0.0",
+  "description": "Hermes — GLB Studio 的本地算法层（转写、爆点分析、成片渲染、爆款记忆）",
+  "author": "郭洛斌",
+  "license": "AGPL-3.0",
+  "private": true,
+  "type": "module",
+  "main": "src/hermes.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node src/hermes.js",
+    "dev": "node --watch src/hermes.js",
+    "init-db": "node src/memory/store.js --init",
+    "status": "node src/hermes.js --status",
+    "test": "\"D:\\GLB\\node\\node.exe\" --test src/analyzer/__tests__/prescreen.test.mjs src/llm/__tests__/engine-selector.test.mjs src/llm/__tests__/cloud-protocol.test.mjs src/memory/__tests__/live-ip-binding.test.mjs",
+    "test:watch": "\"D:\\GLB\\node\\node.exe\" --test --watch src/analyzer/__tests__/prescreen.test.mjs src/llm/__tests__/engine-selector.test.mjs src/llm/__tests__/cloud-protocol.test.mjs src/memory/__tests__/live-ip-binding.test.mjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "chokidar": "^3.6.0",
+    "express": "^4.21.0",
+    "sherpa-onnx-node": "^1.13.8",
+    "sherpa-onnx-win-x64": "^1.13.8"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.9"
+  }
+}

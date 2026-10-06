@@ -26,3 +26,10 @@ upload/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ── 算法层副本里的本机状态 ──
+hermes/data/
+hermes/upload/
+hermes/logs/
+hermes/node_modules/
+hermes/config/secrets.local.json
