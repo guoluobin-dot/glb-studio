@@ -9,9 +9,43 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import ts from "typescript";
 
 const ROOT = join(__dirname, "..");
 const read = (p: string): string => readFileSync(join(ROOT, p), "utf8");
+
+/**
+ * 去掉源码里的注释，只留代码。
+ *
+ * 断言"某个按钮在哪个位置""某段 className 还剩不存在"时，
+ * 必须先剥注释 —— 否则自己写的说明文字会把断言匹配上：
+ * 「这个按钮原来在底部（mt-auto 推下去）」这句注释，
+ * 正好能让"不该再有 mt-auto"的断言失败。踩过两次，都栽在自己注释上。
+ *
+ * 两层：
+ *   1. TS scanner 剥普通注释
+ *   2. 再剥花括号包起来的 JSX 注释 —— 这层 scanner 不管，
+ *      因为在 JSX children 里 TS 按文本来处理，只有 AST 知道它是注释
+ *
+ * 注意别在这个注释里写出「注释的注释」的字面样例 ——
+ * 那串标记会当场把这段注释闭合掉，文件直接解析失败。
+ * （这坑我自己踩了两次，第二次是在别的文件的注释里。）
+ */
+const stripComments = (src: string): string => {
+  const scanner = ts.createScanner(ts.ScriptTarget.Latest, false, ts.LanguageVariant.JSX, src);
+  let out = "";
+  let last = 0;
+  for (;;) {
+    const kind = scanner.scan();
+    if (kind === ts.SyntaxKind.EndOfFileToken) break;
+    if (kind === ts.SyntaxKind.SingleLineCommentTrivia || kind === ts.SyntaxKind.MultiLineCommentTrivia) {
+      out += src.slice(last, scanner.getTokenPos());
+      last = scanner.getTextPos();
+    }
+  }
+  // 剥 JSX 注释 {/* ... */}，保留花括号免得把表达式结构弄坏
+  return (out + src.slice(last)).replace(/\{\s*\/\*[\s\S]*?\*\/\s*\}/g, "{/* */}");
+};
 
 /*
  * 待恢复的验证脚本（2026-10-06 清理误删）
@@ -2552,28 +2586,53 @@ it("UI 要能完成全流程:新建/重命名/删除/恢复/写入记忆/批量�
     expect(panel).toMatch(/hitDeleteEntry/);
   });
 
-  it("「用这套记忆」必须贴在 IP 卡片旁边，不能再埋在画像栏底部", () => {
+it("「用这套记忆」必须贴在 IP 卡片旁边，不能再埋在画像栏底部", () => {
     /*
      * 回归：原来这个按钮放在右侧画像栏最底部（mt-auto 推下去）。
      * 画像一长它就被埋到看不见的地方，用户反馈"藏得太深"。
      * 选哪位老师和应用哪位老师的记忆本来就是同一个动作的两步，
-     * 按钮就该贴在对应卡片右边。
+     * 所以按钮就该贴在对应卡片右边。
+     *
+     * 断言跑在剥掉注释的代码上：注释里提到「用这套记忆」和 mt-auto，
+     * 直接在原文里搜会被自己的说明文字匹配上。
+     * 锚点用 onPickIp?.(x)，只有卡片上那个按钮会用。
      */
-    expect(panel).toContain("用这套");
-
-    // 按钮必须在 IP 卡片那一段里：卡片容器是 flex，按钮是它的兄弟节点
-    const cardIdx = panel.indexOf("用这套");
-    const ipMapIdx = panel.indexOf("ips.map");
-    const pickIpIdx = panel.indexOf("onPickIp?.(x)");
-    expect(ipMapIdx).toBeGreaterThan(-1);
-    expect(pickIpIdx).toBeGreaterThan(ipMapIdx);
-    expect(cardIdx).toBeGreaterThan(ipMapIdx);
+    const code = stripComments(panel);
+    const ipMapIdx = code.indexOf("ips.map");
+    const cardBtnIdx = code.indexOf("onPickIp?.(x)");
+    expect(ipMapIdx, "没找到 IP 列表").toBeGreaterThan(-1);
+    expect(cardBtnIdx, "IP 卡片上应该有一个直接应用记忆的按钮").toBeGreaterThan(ipMapIdx);
 
     // 画像栏底部那个 mt-auto 版本必须已经拿掉，否则同一个动作有两个入口
-    expect(panel).not.toMatch(/mt-auto[^"]*"[\s\S]{0,200}用这套记忆/);
+    expect(code).not.toMatch(/mt-auto[^"]*"[\s\S]{0,200}用这套记忆/);
 
     // 不能出现「外层 button 里再套 button」—— 无效 HTML，点击会被报给外层
-    expect(panel).not.toMatch(/<button[^>]*>\s*(?:(?!\/button)[\s\S])*?<button/);
+    expect(code).not.toMatch(/<button[^>]*>\s*(?:(?!\/button)[\s\S])*?<button/);
+  });
+
+  it("IP 的新建/重命名/删除要贴在「IP 老师」标题下面，不能沉到栏底", () => {
+    /*
+     * 回归：这组三个原来在左栏最底部（mt-auto 推下去），
+     * 列表一长就看不见 —— 和「用这套记忆」当初埋在画像栏底部一个毛病。
+     * 挪上去还有个理由：它们作用的对象就是下面那张卡片列表，
+     * 紧挨着才说得清对谁生效。
+     */
+    const code = stripComments(panel);
+    const headerIdx = code.indexOf("IP 老师");
+    expect(headerIdx, "没找到 IP 老师标题").toBeGreaterThan(-1);
+
+    for (const name of ["新建", "重命名", "删除"]) {
+      // 容许换行缩进：源码里 `>` 和文字往往不在同一行
+      const re = new RegExp(`>\\s*${name}\\s*</button>`);
+      const m = re.exec(code);
+      expect(m, `没找到「${name}」按钮`).not.toBeNull();
+      expect(m!.index, `「${name}」应该在「IP 老师」标题之后`).toBeGreaterThan(headerIdx);
+    }
+
+    // mt-auto 是「推到容器最底」的类名，这三个按钮身上不该再有
+    const start = code.search(/>\s*新建\s*<\/button>/);
+    const end = code.search(/>\s*删除\s*<\/button>/);
+    expect(code.slice(start - 500, end + 200), "IP 操作按钮不该再用 mt-auto 沉底").not.toContain("mt-auto");
   });
 
   it("左导航要有爆款库入口,并显示当前用的老师", () => {

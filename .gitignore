@@ -5,6 +5,11 @@ out/
 build/
 *.tsbuildinfo
 
+# 打包输出目录可能临时换名（比如原目录被杀毒软件锁住时用 --config.directories.output=dist-new）。
+# 这些是几百 MB 的 Chromium 二进制，绝不能进版本库。
+# 别只写 dist/ —— 换个名字就绕过了，踩过一次（git add -A 把 win-unpacked 全暂存了）。
+dist*/
+
 # ── 密钥：绝不能进版本库 ──
 .env
 .env.*

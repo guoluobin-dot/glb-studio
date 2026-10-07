@@ -389,6 +389,49 @@ function hasRealPerformance(e: HitEntry): boolean {
             IP 老师
           </div>
 
+          {/*
+            * IP 操作原来在左栏最底部（mt-auto 推下去）。
+            * 列表一长就被顶到视线之外，用户反馈"藏得太深"——
+            * 和「用这套记忆」当初埋在画像栏底部是同一个毛病。
+            *
+            * 放标题下面还有个好处：新建/重命名/删除作用的对象
+            * 就是下面这张卡片列表，紧挨着才说得清对谁生效。
+            * shrink-0 保证列表滚动时它不会被挤走。
+            */}
+          <div className="flex shrink-0 flex-wrap gap-1.5">
+            <button
+              type="button"
+              onClick={() => {
+                setDraft("create");
+                setDraftName("");
+              }}
+              className="flex items-center gap-1 rounded border border-line px-2 py-1 text-[10.5px] font-semibold text-mut transition-colors hover:text-fg"
+            >
+              <LuFilePlus2 className="h-3 w-3" />
+              新建
+            </button>
+            <button
+              type="button"
+              disabled={!ip}
+              onClick={() => {
+                setDraft("rename");
+                setDraftName(ip?.name ?? "");
+              }}
+              className="flex items-center gap-1 rounded border border-line px-2 py-1 text-[10.5px] font-semibold text-mut transition-colors hover:text-fg disabled:opacity-35"
+            >
+              重命名
+            </button>
+            <button
+              type="button"
+              disabled={!ip || busy !== null}
+              onClick={() => void removeIp()}
+              className="flex items-center gap-1 rounded border border-line px-2 py-1 text-[10.5px] font-semibold text-mut transition-colors hover:border-bad/50 hover:text-bad disabled:opacity-35"
+            >
+              <LuTrash2 className="h-3 w-3" />
+              删除
+            </button>
+          </div>
+
           <div className="flex flex-col gap-1 overflow-y-auto">
             {ips.length === 0 && (
               <p className="rounded-lg border border-line/70 px-2.5 py-3 text-[11px] leading-relaxed text-mut-2">
@@ -444,41 +487,6 @@ function hasRealPerformance(e: HitEntry): boolean {
                 </div>
               );
             })}
-          </div>
-
-          {/* IP 操作 */}
-          <div className="mt-auto flex flex-wrap gap-1.5 border-t border-line/60 pt-2">
-            <button
-              type="button"
-              onClick={() => {
-                setDraft("create");
-                setDraftName("");
-              }}
-              className="flex items-center gap-1 rounded border border-line px-2 py-1 text-[10.5px] font-semibold text-mut transition-colors hover:text-fg"
-            >
-              <LuFilePlus2 className="h-3 w-3" />
-              新建
-            </button>
-            <button
-              type="button"
-              disabled={!ip}
-              onClick={() => {
-                setDraft("rename");
-                setDraftName(ip?.name ?? "");
-              }}
-              className="flex items-center gap-1 rounded border border-line px-2 py-1 text-[10.5px] font-semibold text-mut transition-colors hover:text-fg disabled:opacity-35"
-            >
-              重命名
-            </button>
-            <button
-              type="button"
-              disabled={!ip || busy !== null}
-              onClick={() => void removeIp()}
-              className="flex items-center gap-1 rounded border border-line px-2 py-1 text-[10.5px] font-semibold text-mut transition-colors hover:border-bad/50 hover:text-bad disabled:opacity-35"
-            >
-              <LuTrash2 className="h-3 w-3" />
-              删除
-            </button>
           </div>
         </div>
 

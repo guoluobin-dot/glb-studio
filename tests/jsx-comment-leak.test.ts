@@ -110,3 +110,44 @@ describe("JSX 注释不能泄漏成界面文字", () => {
     expect(leaksIn(good, "demo.tsx")).toEqual([]);
   });
 });
+
+describe("JSX 开闭标签必须配平", () => {
+  // 挪按钮位置时漏掉一个 </div> 就是这么发生的。
+  // 漏了以后编译直接报错还算好；真正难查的是「多删了一个闭合标签，
+  // 结果把后面的兄弟节点一起吞进上一个 div」—— 界面不报错，
+  // 只是某个区域莫名其妙变高或者点不动。
+  //
+  // 数 JsxOpeningElement 对 JsxClosingElement，不能数 JsxElement：
+  // 自闭合元素（<X />）没有闭合标签，混进来必然对不上。
+  const files = tsxFiles();
+
+  const balance = (file: string): { open: number; close: number; errors: number } => {
+    const sf = ts.createSourceFile(
+      file,
+      readFileSync(file, "utf8"),
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.TSX
+    );
+    let open = 0;
+    let close = 0;
+    const visit = (node: ts.Node): void => {
+      if (ts.isJsxOpeningElement(node)) open++;
+      if (ts.isJsxClosingElement(node)) close++;
+      ts.forEachChild(node, visit);
+    };
+    visit(sf);
+    return { open, close, errors: sf.parseDiagnostics?.length ?? 0 };
+  };
+
+  it("renderer 里每个 tsx 都配平且没有语法错误", () => {
+    const bad: string[] = [];
+    for (const f of files) {
+      const r = balance(f);
+      if (r.open !== r.close || r.errors > 0) {
+        bad.push(`${f}  开 ${r.open} / 闭 ${r.close} / 语法错 ${r.errors}`);
+      }
+    }
+    expect(bad, "这些文件的 JSX 开闭不配平").toEqual([]);
+  });
+});
