@@ -148,10 +148,12 @@ function hasRealPerformance(e: HitEntry): boolean {
     const scope =
       "只恢复被删除的「IP 老师」文件夹和它的记忆库；" +
       "单条爆款被删除后不进这里，要用列表里的「撤回」按导入批次找回。";
-    if (trash.length === 0) {
+    const [top] = trash;
+    // noUncheckedIndexedAccess 下 trash[0] 是 T | undefined，
+    // 上面 length === 0 的早返回并不能让 TS 收窄索引访问，所以这里显式判空。
+    if (!top) {
       return `回收站是空的。${scope}`;
     }
-    const top = trash[0];
     const head = `恢复最近删除的「${top.name}」` +
       (top.entryCount > 0 ? `（原 ${top.entryCount} 条爆款）` : "（当时是空的）");
     const more = trash.length > 1

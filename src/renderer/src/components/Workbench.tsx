@@ -1197,7 +1197,8 @@ const runDetect = useCallback(async (): Promise<void> => {
               <div className="flex shrink-0 items-center gap-3 rounded-xl border border-ember/25 bg-ember/8 px-3.5 py-2.5">
                 <LuLoaderCircle className="h-4 w-4 shrink-0 spin-slow text-ember" />
                 <div className="min-w-0 flex-1">
-                  <p className="text-[12.5px] font-bold text-fg">
+                  {/* whitespace-nowrap：文案不该被压成竖排，宁可 truncate */}
+                  <p className="whitespace-nowrap text-[12.5px] font-bold text-fg">
                     {transcribing ? "正在转写并分析…" : "正在找爆点…"}
                   </p>
                   <p className="mt-0.5 truncate text-[11px] text-mut-2">
@@ -1205,12 +1206,21 @@ const runDetect = useCallback(async (): Promise<void> => {
                     {transcribing ? TRANSCIBE_STEPS[0] : DETECT_STEPS[0]}
                   </p>
                 </div>
-                <Progress percent={null} />
+                {/*
+                  进度条要固定宽度 + shrink-0。
+                  Progress 组件本身是 w-full，放在 flex 行里会被压到接近 0 宽 ——
+                  而旁边的文案容器有 flex-1，会先把宽度吃光。
+                  结果进度条只剩一条缝，"正在找爆点…"那几个字被挤成竖排一列，
+                  和之前底部栏"返回主界面"竖排是同一个病：缺 shrink-0/whitespace-nowrap。
+                */}
+                <div className="w-[180px] shrink-0">
+                  <Progress percent={null} />
+                </div>
                 <button
                   type="button"
                   onClick={() => void cancelDetect()}
                   title="中断当前分析（3 小时直播可能要跑很久）"
-                  className="shrink-0 rounded-lg border border-line px-3 py-1.5 text-[11.5px] font-semibold text-mut transition-colors hover:text-ember"
+                  className="shrink-0 whitespace-nowrap rounded-lg border border-line px-3 py-1.5 text-[11.5px] font-semibold text-mut transition-colors hover:text-ember"
                 >
                   取消
                 </button>

@@ -62,7 +62,10 @@ const stripComments = (src: string): string => {
  * 恢复方式：按用例里的断言反推脚本内容写回 scripts/，然后把
  * MISSING_SCRIPTS 里对应的名字删掉，用例会立即恢复成正常断言。
  */
-const MISSING_SCRIPTS = new Set([
+/* 显式标注 <string>：`new Set([])` 会被推成 Set<never>，
+   下面 scriptMissing(name: string) 调 .has(name) 就报 TS2345。
+   集合空着不代表这个机制该删 —— 以后再有脚本进 git 历史前丢了，直接往里加名字。 */
+const MISSING_SCRIPTS = new Set<string>([
   // 空：2026-10-06 已按断言重建 7 个验证脚本，见 scripts/README-verify.md
 ]);
 const scriptMissing = (name: string): boolean => MISSING_SCRIPTS.has(name);

@@ -7,7 +7,7 @@
  * 记忆深找(让引擎按学过的爆款规律重排)放在这里,因为它同样是"决定选什么"的动作。
  */
 import { useState } from "react";
-import { LuBrain, LuCheck, LuEye, LuFolderOpen, LuLayers, LuScissors, LuSlidersHorizontal, LuSparkles } from "react-icons/lu";
+import { LuBrain, LuCheck, LuEye, LuFolderOpen, LuLayers, LuScissors, LuSlidersHorizontal } from "react-icons/lu";
 import type { ClipCandidate, EngineSettings } from "@shared/api-types";
 import { useSession } from "../stores/session-store";
 import { call } from "../lib/bridge";
@@ -94,17 +94,21 @@ export function ExportDock({
       </div>
 
       <div className="scroll-thin min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
-        {/* 已选统计 */}
+        {/* 已选统计。
+            这是整栏唯一的"当前状态"，所以给它最大字号、最强对比；
+            时长作为次级读数靠右，进度条只用极细一条，避免和主数字抢注意力。 */}
         <div className="rounded-xl border border-line/70 bg-panel-2/60 p-3">
-          <div className="flex items-end gap-2">
-            <span className="tabular text-[26px] leading-none font-extrabold text-ember">{picked.length}</span>
-            <span className="pb-0.5 text-[11px] text-mut">条已选</span>
+          <div className="flex items-baseline gap-1.5">
+            <span className="tabular text-[30px] leading-none font-extrabold tracking-tight text-ember">
+              {picked.length}
+            </span>
+            <span className="text-[11.5px] text-mut">条已选</span>
             <span className="flex-1" />
-            <span className="tabular pb-0.5 font-mono text-[12px] font-bold text-fg/90">
+            <span className="tabular font-mono text-[12.5px] font-semibold text-mut">
               {formatClock(totalSec)}
             </span>
           </div>
-          <div className="mt-2 h-1 overflow-hidden rounded-full bg-line">
+          <div className="mt-2.5 h-[3px] overflow-hidden rounded-full bg-line/70">
             <div
               className="flame-gradient h-full rounded-full transition-[width] duration-500"
               style={{ width: `${Math.min(100, (picked.length / Math.max(1, keptCount)) * 100)}%` }}
@@ -157,79 +161,71 @@ export function ExportDock({
         {/* 产物清单:能直接看/开/定位,不用再去资源管理器翻 */}
         <ResultList artifacts={artifacts ?? null} onClose={onCloseArtifacts ?? ((): void => undefined)} />
 
-        {/* 引擎状态 */}
-        <div className="rounded-xl border border-line/70 bg-panel/2 p-2.5">
-          <div className="flex items-center gap-1.5 text-[10px] font-bold tracking-[1.2px] text-mut-2">
-            <LuSparkles className="h-3 w-3" />
-            分析引擎
-          </div>
-          <div className="mt-1.5 flex flex-col gap-1 text-[11px]">
-            <div className="flex items-center gap-1.5">
-              <Dot tone="ok" />
-              <span className="text-mut">本地</span>
-              <span className="tabular ml-auto font-mono text-[10px] text-mut-2">
-                {engine?.local.model ?? "qwen3:8b-chat"}
-              </span>
-            </div>
-            <div className="flex items-center gap-1.5">
-              <Dot tone={engine?.cloud.apiKey ? "ok" : "idle"} />
-              <span className="text-mut">长上下文</span>
-              <span className="tabular ml-auto font-mono text-[10px] text-mut-2">
-                {engine?.cloud.model ?? "gemini"}
-              </span>
-            </div>
-          </div>
-          <p className="mt-1.5 text-[10px] leading-relaxed text-mut-2">
-            引擎按素材形态自动分派:短片段走本地,长直播走长上下文。
-          </p>
-        </div>
-
-        {/* 输出目录 */}
-        <div className="flex flex-col gap-1.5">
-          <span className="text-[10px] font-bold tracking-[1.2px] text-mut-2">输出目录</span>
-          <div className="flex items-center gap-1.5 rounded-lg border border-line bg-panel-2 px-2.5 py-2">
-            <LuFolderOpen className="h-3.5 w-3.5 shrink-0 text-mut" />
-            <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-mut" title={outDir || undefined}>
-              {outDir ? outDir.split(/[\\/]/).slice(-2).join("/") : "未设置"}
-            </span>
-            <button
-              type="button"
-              onClick={() => void pickDir()}
-              className="shrink-0 text-[10.5px] font-semibold text-ember/90 underline-offset-2 hover:underline"
-            >
-              更改
-            </button>
-          </div>
-        </div>
-
-        {/* 全部选项 */}
-        <button
-          type="button"
-          onClick={onOpenOptions}
-          className="flex w-full items-center justify-center gap-2 rounded-xl border border-line px-3 py-2.5 text-[12px] font-semibold text-mut transition-all duration-200 hover:border-mut hover:text-fg"
+        {/* 引擎状态。
+            原来是一整张带边框+说明文的卡片，在 288px 宽的栏里占了将近 100px，
+            却是几乎不变的信息 —— 主体节奏被它打断，下面就空出一大片。
+            改成一行状态：主次分明，不占地方，鼠标悬停才给完整说明。 */}
+        <div
+          className="group flex items-center gap-1.5 px-0.5 text-[10.5px] text-mut-2"
+          title={`本地 ${engine?.local.model ?? "qwen3:8b-chat"} · 长上下文 ${engine?.cloud.model ?? "gemini"}
+引擎按素材形态自动分派:短片段走本地,长直播走长上下文。`}
         >
-          <LuSlidersHorizontal className="h-4 w-4" />
-          全部出片选项
-        </button>
-        {/* 审片入口。出过片才有粗剪可审，所以按 projectId 是否存在来显示。
-            没有它的话用户只能去输出目录里手动找粗剪文件，
-            审片意见也就没法回流到记忆里。 */}
-        {clipProjectId && (
-          <button
-            type="button"
-            onClick={onOpenReview}
-            title="看粗剪本体、逐段给意见、通过或打回"
-            className="mt-1.5 flex w-full items-center justify-center gap-2 rounded-xl border border-line px-4 py-2.5 text-[12.5px] font-bold text-mut transition-colors hover:border-ember/60 hover:text-ember"
-          >
-            <LuEye className="h-4 w-4" />
-            审片
-            {reviewHint && <span className="text-[10.5px] font-normal opacity-75">{reviewHint}</span>}
-          </button>
-        )}
+          <Dot tone={engine?.cloud.apiKey ? "ok" : "idle"} />
+          <span className="font-bold tracking-[1.2px] group-hover:text-mut">引擎</span>
+          <span className="truncate">按素材自动分派</span>
+        </div>
       </div>
 
-      {/* 吸底主按钮 */}
+      {/* 吸底操作区。
+          设置项（输出目录 / 全部选项 / 审片）和主按钮放在一起：
+          它们都是"出片前最后一步要碰的东西"，而主按钮永远在同一个位置、吸底可见。 */}
       <div className="export-dock shrink-0 p-3 pt-2">
+        {/* 输出目录 */}
+        <div className="mb-2 flex items-center gap-1.5 rounded-lg border border-line bg-panel-2 px-2.5 py-2">
+          <LuFolderOpen className="h-3.5 w-3.5 shrink-0 text-mut" />
+          <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-mut" title={outDir || undefined}>
+            {outDir ? outDir.split(/[\\/]/).slice(-2).join("/") : "未设置输出目录"}
+          </span>
+          <button
+            type="button"
+            onClick={() => void pickDir()}
+            className="shrink-0 text-[10.5px] font-semibold text-ember/90 underline-offset-2 hover:underline"
+          >
+            更改
+          </button>
+        </div>
+
+        {/* 次级操作：两个并排，避免竖着堆两条同样的按钮 */}
+        <div className="mb-2 grid grid-cols-2 gap-2">
+          <button
+            type="button"
+            onClick={onOpenOptions}
+            className="flex items-center justify-center gap-1.5 rounded-lg border border-line px-2 py-2 text-[11.5px] font-semibold text-mut transition-colors hover:border-mut/50 hover:text-fg"
+          >
+            <LuSlidersHorizontal className="h-3.5 w-3.5 shrink-0" />
+            全部选项
+          </button>
+          {/* 审片入口。出过片才有粗剪可审，所以按 projectId 是否存在来显示。
+              没有它的话用户只能去输出目录里手动找粗剪文件，
+              审片意见也就没法回流到记忆里。 */}
+          {clipProjectId ? (
+            <button
+              type="button"
+              onClick={onOpenReview}
+              title="看粗剪本体、逐段给意见、通过或打回"
+              className="flex items-center justify-center gap-1.5 rounded-lg border border-line px-2 py-2 text-[11.5px] font-semibold text-mut transition-colors hover:border-ember/60 hover:text-ember"
+            >
+              <LuEye className="h-3.5 w-3.5 shrink-0" />
+              审片
+              {reviewHint && <span className="truncate text-[10px] font-normal opacity-75">{reviewHint}</span>}
+            </button>
+          ) : (
+            <span className="flex items-center justify-center gap-1.5 rounded-lg border border-line/40 px-2 py-2 text-[11.5px] text-mut-2/60">
+              <LuEye className="h-3.5 w-3.5 shrink-0" />
+              审片
+            </span>
+          )}
+        </div>
         {stage === "exporting" ? (
           <Progress percent={null} label="正在出片…" />
         ) : (

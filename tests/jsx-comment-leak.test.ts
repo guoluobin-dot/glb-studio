@@ -122,13 +122,8 @@ describe("JSX 开闭标签必须配平", () => {
   const files = tsxFiles();
 
   const balance = (file: string): { open: number; close: number; errors: number } => {
-    const sf = ts.createSourceFile(
-      file,
-      readFileSync(file, "utf8"),
-      ts.ScriptTarget.Latest,
-      true,
-      ts.ScriptKind.TSX
-    );
+    const src = readFileSync(file, "utf8");
+    const sf = ts.createSourceFile(file, src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
     let open = 0;
     let close = 0;
     const visit = (node: ts.Node): void => {
@@ -137,7 +132,21 @@ describe("JSX 开闭标签必须配平", () => {
       ts.forEachChild(node, visit);
     };
     visit(sf);
-    return { open, close, errors: sf.parseDiagnostics?.length ?? 0 };
+    /* 语法错误走公开 API。
+       原来读的是 sf.parseDiagnostics —— 那是 TS 的内部字段，压根没进 .d.ts，
+       所以类型检查必报 TS2339；而且它是内部实现，改版就可能改名或挪走。
+       transpileModule 的 reportDiagnostics 返回的正是纯语法诊断，语义等价且是公开契约。 */
+    const errors =
+      ts.transpileModule(src, {
+        fileName: file,
+        reportDiagnostics: true,
+        compilerOptions: {
+          jsx: ts.JsxEmit.Preserve,
+          target: ts.ScriptTarget.Latest,
+          module: ts.ModuleKind.ESNext
+        }
+      }).diagnostics?.length ?? 0;
+    return { open, close, errors };
   };
 
   it("renderer 里每个 tsx 都配平且没有语法错误", () => {
