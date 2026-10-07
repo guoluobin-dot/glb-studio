@@ -1419,7 +1419,14 @@ const runDetect = useCallback(async (): Promise<void> => {
       {showHelp && <ShortcutHelp onClose={() => setShowHelp(false)} />}
 
       {showOptions && (
-        <RenderOptionsPanel options={renderOptions} onChange={setRenderOptions} onClose={() => setShowOptions(false)} />
+        <RenderOptionsPanel
+          options={renderOptions}
+          onChange={setRenderOptions}
+          onClose={() => setShowOptions(false)}
+          // 素材真实画面高度：字幕/标题的 px 位置要按它缩放，
+          // 不传的话预览只能按竖屏 1920 示意，和实际成片对不上
+          frameHeight={file?.height}
+        />
       )}
 
       {reviewId !== null && candidates && (

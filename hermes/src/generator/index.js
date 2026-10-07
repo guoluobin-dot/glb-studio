@@ -1152,12 +1152,17 @@ Output design JSON.`;
     const titleY = (() => {
       const pos = String(ts.position || 'top');
       const off = Number.isFinite(Number(ts.offsetY)) ? Number(ts.offsetY) : 0;
-      // 参照高度用 1080（竖屏 1920 高，横屏 1080 高），再按实际画面高等比缩放
+      // 参照高度就是画面真实高度
       const hRef = h0;
+      // 距离（20/40/140）要按画面高度缩放，但 hRef 本身已经是真实像素，
+      // 不能再乘一遍 —— 早先写成 (hRef - 140) * scale，等于把整个画面高度
+      // 又缩了一次。720x1280 的素材算出来 760，看起来在画面中间而不是底部，
+      // 而界面上写着"底部"，用户根本猜不出差在哪。
       const scale = hRef / 1920 || 1;
-      if (pos === 'bottom') return Math.round((hRef - 140) * scale) + Math.round(off * scale);
-      if (pos === 'middle') return Math.round((hRef / 2 - 40) * scale) + Math.round(off * scale);
-      return 20 + Math.round(off * scale); // top
+      const offPx = Math.round(off * scale);
+      if (pos === 'bottom') return Math.round(hRef - 140 * scale) + offPx;
+      if (pos === 'middle') return Math.round(hRef / 2 - 40 * scale) + offPx;
+      return Math.round(20 * scale) + offPx;
     })();
 
     const cardSec = Number(opts.titleCardSeconds) || 1.8;

@@ -125,11 +125,14 @@ function Toggle({ label, hint, checked, onChange }: ToggleProps): React.JSX.Elem
 export function RenderOptionsPanel({
   options,
   onChange,
-  onClose
+  onClose,
+  frameHeight
 }: {
   options: RenderOptions;
   onChange: (next: RenderOptions) => void;
   onClose: () => void;
+  /** 素材画面高度（px），用于字幕/标题位置示意 */
+  frameHeight?: number;
 }): React.JSX.Element {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const set = <K extends keyof RenderOptions>(key: K, value: RenderOptions[K]): void =>
@@ -551,6 +554,7 @@ export function RenderOptionsPanel({
               title={options.titleFontStyle}
               onCaptionChange={(next) => onChange({ ...options, captionFontStyle: next })}
               onTitleChange={(next) => onChange({ ...options, titleFontStyle: next })}
+              previewHeight={frameHeight}
               onReset={() =>
                 onChange({ ...options, captionFontStyle: undefined, titleFontStyle: undefined })
               }

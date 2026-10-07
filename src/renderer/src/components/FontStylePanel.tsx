@@ -1,6 +1,125 @@
-import { LuCaptions, LuHeading, LuRotateCcw } from "react-icons/lu";
+import { LuCaptions, LuEye, LuHeading, LuRotateCcw } from "react-icons/lu";
 import { cx } from "./ui";
+import { REF_HEIGHT, layoutFor } from "../lib/text-layout";
 import type { CaptionStyle, TitleStyle } from "@shared/api-types";
+
+/**
+ * 字幕 / 标题落在画面哪儿的实时预览。
+ *
+ * 为什么必须有：这一块原来只有滑块和色板，全是抽象值。
+ * "位置 60px"到底是离底 60 还是离顶 60？"底部"到底在多下面？
+ * 用户调完只能出一次片才知道 —— 而出一次片要几分钟。
+ *
+ * 关键是这个预览的位置**必须和成片一致**，所以几何公式不在这里写，
+ * 而是共用 lib/text-layout.ts，那边和服务端烧字公式是一套。
+ * 各写一份的话，预览和成片就会不一致，而这种不一致用户根本查不出来。
+ */
+function TextLayoutPreview({
+  caption,
+  title,
+  frameHeight
+}: {
+  caption: CaptionStyle;
+  title: TitleStyle;
+  /** 素材画面高度，用来把 1920 基准的 px 值缩到真实比例 */
+  frameHeight: number;
+}): React.JSX.Element {
+  // 预览本身固定 360 高，位置按百分比下，和实际尺寸无关
+  const H = 360;
+  const geo = layoutFor(H, caption, title);
+
+  const capColor = caption.color ?? "#FFFFFF";
+  const ttlColor = title.color ?? "#FFFFFF";
+  const capText = "同学们看这里，字会出现在这个位置";
+  const ttlText = "标题出现在这里";
+
+  return (
+    <div className="mb-2.5">
+      <div className="mb-1.5 flex items-center gap-2">
+        <LuEye className="h-3.5 w-3.5 text-mut-2" />
+        <span className="text-[12px] font-bold text-fg">位置示意</span>
+        <span className="text-[10px] text-mut-2">
+          按素材画面 {Math.round(frameHeight)}p 等比缩放 · 与成片一致
+        </span>
+      </div>
+
+      <div
+        className="relative mx-auto overflow-hidden rounded-lg border border-line bg-gradient-to-b from-panel-2 to-panel"
+        style={{ height: H, maxWidth: H * 0.5625 }}
+        aria-label="字幕与标题位置示意"
+      >
+        {/* 三条参考线：顶部/中间/底部，方便判断"居中"到底偏不偏 */}
+        <div className="pointer-events-none absolute inset-x-0 top-0 border-t border-dashed border-line/60" />
+        <div className="pointer-events-none absolute inset-x-0 top-1/2 border-t border-dashed border-line/40" />
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 border-t border-dashed border-line/60" />
+
+        {/* 标题 */}
+        <div
+          className="absolute inset-x-0 flex justify-center px-3"
+          style={{ top: geo.title.topPct }}
+        >
+          <span
+            className="text-center font-bold leading-tight"
+            style={{
+              fontSize: Math.max(8, geo.title.fontPx),
+              color: ttlColor,
+              textShadow: geo.title.shadowPx > 0
+                ? `${geo.title.shadowPx}px ${geo.title.shadowPx}px 0 rgba(0,0,0,0.85)`
+                : "none",
+              background: title.boxOpacity !== undefined && title.boxOpacity > 0
+                ? `rgba(0,0,0,${title.boxOpacity})`
+                : undefined,
+              padding: title.boxOpacity !== undefined && title.boxOpacity > 0 ? "1px 6px" : undefined,
+              borderRadius: title.boxOpacity !== undefined && title.boxOpacity > 0 ? 3 : undefined
+            }}
+          >
+            {ttlText}
+          </span>
+        </div>
+
+        {/* 字幕：ASS 的 MarginV 量到文字底缘，所以按 bottom 定位 */}
+        <div
+          className="absolute inset-x-0 flex justify-center px-3"
+          style={{ bottom: geo.caption.bottomPct }}
+        >
+          <span
+            className="text-center font-bold leading-tight"
+            style={{
+              fontSize: Math.max(8, geo.caption.fontPx),
+              color: capColor,
+              fontWeight: caption.bold ? 800 : 500,
+              // 描边用 text-shadow 近似（四边），服务端是 ASS Outline
+              textShadow: caption.outline !== undefined || caption.shadow !== undefined
+                ? [
+                    ...(Number(caption.outline) > 0
+                      ? [
+                          `${geo.caption.outlinePx}px 0 #000`,
+                          `-${geo.caption.outlinePx}px 0 #000`,
+                          `0 ${geo.caption.outlinePx}px #000`,
+                          `0 -${geo.caption.outlinePx}px #000`
+                        ]
+                      : []),
+                    ...(Number(caption.shadow) > 0 ? [`${geo.caption.shadowPx * 2}px ${geo.caption.shadowPx * 2}px 0 rgba(0,0,0,0.6)`] : [])
+                  ].join(", ")
+                : undefined,
+              background: caption.box
+                ? `rgba(0,0,0,${caption.boxOpacity ?? 0.5})`
+                : undefined,
+              padding: caption.box ? "1px 8px" : undefined,
+              borderRadius: caption.box ? 3 : undefined
+            }}
+          >
+            {capText}
+          </span>
+        </div>
+      </div>
+
+      <p className="mt-1 text-center text-[9.5px] text-mut-2/80">
+        虚线是画面顶部 / 中间 / 底部。示意只反映位置与样式，最终以成片为准。
+      </p>
+    </div>
+  );
+}
 
 /**
  * 字幕 / 标题样式。
@@ -111,13 +230,16 @@ export function FontStylePanel({
   title,
   onCaptionChange,
   onTitleChange,
-  onReset
+  onReset,
+  previewHeight
 }: {
   caption?: CaptionStyle;
   title?: TitleStyle;
   onCaptionChange: (next: CaptionStyle) => void;
   onTitleChange: (next: TitleStyle) => void;
   onReset: () => void;
+  /** 素材画面高度（px）。标题/字幕的位置都按它缩放，不传就按竖屏 1920 示意 */
+  previewHeight?: number;
 }): React.JSX.Element {
   const c = caption ?? {};
   const t = title ?? {};
@@ -125,7 +247,10 @@ export function FontStylePanel({
   const setT = (patch: Partial<TitleStyle>): void => onTitleChange({ ...t, ...patch });
 
   return (
-    <div className="grid gap-2.5 sm:grid-cols-2">
+    <>
+      <TextLayoutPreview caption={c} title={t} frameHeight={previewHeight ?? REF_HEIGHT} />
+
+      <div className="grid gap-2.5 sm:grid-cols-2">
       {/* ---------- 字幕 ---------- */}
       <section className="rounded-xl border border-line bg-panel-2/40 p-3">
         <div className="mb-2.5 flex items-center gap-2">
@@ -306,6 +431,7 @@ export function FontStylePanel({
           </Row>
         </div>
       </section>
-    </div>
+      </div>
+    </>
   );
 }
