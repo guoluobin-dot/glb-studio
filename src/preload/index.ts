@@ -25,7 +25,6 @@ import type {
   MediaFile,
   MediaProbe,
   ProjectSummary,
-  VariantResult,
   ProjectWorkspace,
   ReviewPacket,
   SessionCheckpoint,
@@ -134,7 +133,6 @@ const api: StudioApi = {
   memoryLearn: (filePath) => ipcRenderer.invoke("memory:learn", filePath) as Promise<{ id: string; title: string; items: number }>,
 
   /** 多版本粗剪:一次出多条不同长度/开头的版本,供用户挑 */
-  clipVariants: (request_) => ipcRenderer.invoke("algo:clipVariants", request_) as Promise<VariantResult[]>,
 
   /** 读取已生成的逐句稿(点句子跳画面要用) */
   readTranscript: (filePath) => ipcRenderer.invoke("algo:readTranscript", filePath) as Promise<Transcript>,

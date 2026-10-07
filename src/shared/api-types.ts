@@ -563,29 +563,6 @@ export interface ReviewRecord {
   collection: string | null;
 }
 
-/** ---------- 多版本粗剪 ---------- */
-
-/**
- * 一版粗剪结果。
- * 不同版本之间必须有真实差异(时长档位/开头策略),否则用户挑不出任何东西。
- */
-export interface VariantResult {
-  id: string;
-  label: string;
-  hint: string;
-  /** 目标时长(秒) */
-  targetSec: number | null;
-  ok: boolean;
-  projectId?: number;
-  /** 产出的 mp4 列表 */
-  files: string[];
-  viralOpening?: string | null;
-  /** 实际总时长(秒) */
-  totalSec?: number;
-  elapsedSec?: number;
-  error?: string;
-}
-
 /** ---------- 项目持久化 ---------- */
 
 export interface ProjectSummary {
@@ -928,14 +905,6 @@ export interface StudioApi {
   transcribe(filePath: string): Promise<Transcript>;
   /** 读取分析时已生成的逐句稿(点句子跳画面靠它) */
   readTranscript(filePath: string): Promise<Transcript>;
-  /** 多版本粗剪:一次出多条不同长度/开头的版本,供用户挑 */
-  clipVariants(request: {
-    liveVideoId: number;
-    clipSegmentIds: number[];
-    clips?: ClipCandidate[];
-    variants?: string[];
-    openingText?: string;
-  }): Promise<VariantResult[]>;
   /**
    * 转写 + 爆点检测(Hermes /pipeline/analyze-live 一条链路)。
    * liveVideoId 必须回传:出片工程靠它建,没有它就出不了片。

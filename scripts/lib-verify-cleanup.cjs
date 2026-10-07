@@ -1,11 +1,13 @@
 /**
  * 验证脚本的收尾清理（2026-10-06 重建）
  *
- * 为什么要这个模块：verify-opening / verify-wrap / verify-variant-pick /
- * verify-variant-opening-toggle 四个都走真实出片链路，会在生产库里留下
- * clip_project 记录和 output 目录里的文件。成片列表按 id 倒序，
+ * 为什么要这个模块：verify-opening / verify-wrap 等走真实出片链路，
+ * 会在生产库里留下 clip_project 记录和 output 目录里的文件。成片列表按 id 倒序，
  * 测试记录正好排在最前面 —— 用户打开界面第一批看到的全是测试视频，
  * 其中一个还是 21KB 的彩条，看起来像程序坏了。
+ *
+ * （原先还有 verify-variant-pick / verify-variant-opening-toggle，
+ *  随「出多版对比」一起删掉了。）
  *
  * 所以每个走真实链路的脚本都必须在退出前调用 cleanupAfterVerify()，
  * 把自己的测试产物从库里和磁盘上收干净。

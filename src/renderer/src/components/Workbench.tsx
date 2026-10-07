@@ -35,8 +35,7 @@ import type {
   EditRecordInput,
   EngineSettings,
   Transcript,
-  TranscriptSegment,
-  VariantResult
+  TranscriptSegment
 } from "@shared/api-types";
 import { CandidateList } from "./CandidateList";
 import { ExportDock } from "./ExportDock";
@@ -47,7 +46,6 @@ import { ReviewTextCutter as TextCutter } from "./ReviewTextCutter";
 import { Timeline } from "./Timeline";
 import { HotwordPanel } from "./HotwordPanel";
 import { TranscriptPanel } from "./TranscriptPanel";
-import { VariantPanel } from "./VariantPanel";
 import { ReviewPanel as RoughcutReviewPanel } from "./ReviewPanel";
 import { HitVaultPanel } from "./HitVaultPanel";
 import type { ExportArtifacts } from "./ResultList";
@@ -415,22 +413,12 @@ const [leaveAskOpen, setLeaveAskOpen] = useState(false);
   // 名字要从库里查,不能只存 id —— 按钮上要直接显示"用的是谁的记忆"
   const [memoryIpName, setMemoryIpName] = useState<string | null>(null);
   const [showWatch, setShowWatch] = useState(false);
-  const [showVariants, setShowVariants] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   // 面板宽度:写死 42% 时小屏播放器被挤没,大屏又浪费。用户应能自己调。
   const [leftRatio, setLeftRatio] = useState(0.42);
   // 逐句稿面板高度同理
   const [trRatio, setTrRatio] = useState(0.38);
   const searchRef = useRef<HTMLInputElement>(null);
-  const [variantBusy, setVariantBusy] = useState(false);
-  const [variants, setVariants] = useState<VariantResult[]>([]);
-  /**
-   * 多版本里用户"选这版"选中的工程。
-   *
-   * 不存它,"选这版"就只是个提示:出片会拿原始勾选重新建工程,
-   * 拿到的还是原来那版 —— 界面不报错,用户白等一场渲染。
-   */
-  const [pickedVariant, setPickedVariant] = useState<VariantResult | null>(null);
   /** 用户是否点了取消。用于防止取消后迟到的结果覆盖界面 */
   const cancelledRef = useRef(false);
 
@@ -545,51 +533,11 @@ const [leaveAskOpen, setLeaveAskOpen] = useState(false);
       if (showHelp) setShowHelp(false);
       else if (leaveAskOpen) setLeaveAskOpen(false);
       else if (showVault) setShowVault(false);
-      else if (showVariants) setShowVariants(false);
       else if (showOptions) setShowOptions(false);
       else if (showProjects) setShowProjects(false);
       else if (reviewId !== null) setReviewId(null);
     }
   });
-
-  /* ---------- 多版本粗剪 ---------- */
-
-  /** 生成多版粗剪 */
-  const runVariants = useCallback(
-    async (variantIds: string[]): Promise<void> => {
-      if (!file || !candidates || session.liveVideoId === null) return;
-      const picked = candidates.filter((c) => session.selected.has(c.id));
-      if (picked.length === 0) {
-        setPanelMsg({ tone: "warn", text: "先勾选要用的片段" });
-        return;
-      }
-      setVariantBusy(true);
-      setVariants([]);
-      try {
-        const results = await call((api) =>
-          api.clipVariants({
-            liveVideoId: session.liveVideoId as number,
-            clipSegmentIds: picked.map((c) => c.id),
-            clips: picked,
-            variants: variantIds,
-            openingText: renderOptions.openingText
-          })
-        );
-        setVariants(results);
-        const okCount = results.filter((v) => v.ok).length;
-        setPanelMsg(
-          okCount > 0
-            ? { tone: "ok", text: `已生成 ${okCount}/${results.length} 版粗剪,点「选这版」挑一版继续包装。` }
-            : { tone: "warn", text: "所有版本都没成功,展开看每版的具体原因。" }
-        );
-      } catch (err) {
-        setPanelMsg({ tone: "warn", text: err instanceof Error ? err.message : String(err) });
-      } finally {
-        setVariantBusy(false);
-      }
-    },
-    [candidates, file, renderOptions.openingText, session]
-  );
 
   /* ---------- 侧栏入口 ---------- */
 
@@ -867,8 +815,7 @@ const runDetect = useCallback(async (): Promise<void> => {
   const runExport = useCallback(async (): Promise<void> => {
     if (!file || !candidates) return;
     const picked = candidates.filter((c) => session.selected.has(c.id));
-    // 选了多版本时,那一版自己就是工程,勾选可以为空
-    if (picked.length === 0 && !pickedVariant?.projectId) return;
+    if (picked.length === 0) return;
     if (session.liveVideoId === null) {
       setExportMsg({ tone: "warn", text: "这条素材还没有分析记录(缺少 liveVideoId),请先跑一次「找爆点」" });
       return;
@@ -920,8 +867,6 @@ const runDetect = useCallback(async (): Promise<void> => {
 
       const result = await call((api) =>
         api.export({
-          // 多版本选了"这版"就包装那个工程,不再按当前勾选重出
-          ...(pickedVariant?.projectId ? { projectId: pickedVariant.projectId } : {}),
           liveVideoId: session.liveVideoId as number,
           // Hermes 的 selected_segments 用 segment_index,这里的候选 id 就是它
           clipSegmentIds: picked.map((c) => c.id),
@@ -1451,7 +1396,6 @@ const runDetect = useCallback(async (): Promise<void> => {
         onOpenOptions={() => setShowOptions(true)}
         onRunExport={runExport}
         onRerank={runRerank}
-        onOpenVariants={() => setShowVariants(true)}
         clipProjectId={clipProjectId}
         onOpenReview={() => setShowReview(true)}
         reviewHint={reviewMsg?.tone === "ok" ? "已提交" : null}
@@ -1469,31 +1413,6 @@ const runDetect = useCallback(async (): Promise<void> => {
             // 下次点开审片就会"审新工程、播旧粗剪"，点名也对不上画面。
             setRoughcutPath(newRoughcutPath ?? null);
           }}
-        />
-      )}
-
-      {showVariants && (
-        <VariantPanel          liveVideoId={session.liveVideoId}
-          picked={(candidates ?? []).filter((c) => session.selected.has(c.id))}
-          variants={variants}
-          running={variantBusy}
-          onClose={() => setShowVariants(false)}
-          onRun={runVariants}
-          pickedVariant={pickedVariant}
-          onPick={(v) => {
-            // 记下这一版的工程 id,出片时直接包装它,不再重新选段
-            setPickedVariant(v);
-            setRenderOptions((prev) => ({
-              ...prev,
-              viralOpening: v.viralOpening !== null
-            }));
-            setShowVariants(false);
-            setPanelMsg({
-              tone: "ok",
-              text: `已选「${v.label}」${v.totalSec ? `（${v.totalSec}s）` : ""}。点右下「出片」做字幕/封面/标题包装。`
-            });
-          }}
-          onClearPick={() => setPickedVariant(null)}
         />
       )}
 

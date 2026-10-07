@@ -658,62 +658,6 @@ describe("界面稳定性", () => {
   });
 });
 
-describe("多版本粗剪", () => {
-  const clipper = readFileSync("D:/GLB/Hermes/src/clipper/index.js", "utf8");
-  const orch = readFileSync("D:/GLB/Hermes/src/orchestrator/index.js", "utf8");
-  const panel = read("src/renderer/src/components/VariantPanel.tsx");
-
-  it("必须有端点,否则界面调不到", () => {
-    expect(orch).toMatch(/'\/pipeline\/clip-variants'/);
-    expect(clipper).toMatch(/clipVariants/);
-  });
-
-  it("每版必须建独立工程(共用工程会互相覆盖选段)", () => {
-    // _trimToTargetDuration 会增删段,共用工程第 2 版就把第 1 版改了
-    expect(clipper).toMatch(/createProject\(liveVideoId,\s*\{[\s\S]{0,200}presetSegments: picked/);
-    // 每版结果要带上自己的 projectId,才能追溯是哪一版
-    expect(clipper).toMatch(/projectId: built\.projectId/);
-  });
-
-  it("补段池不能传空数组(否则'时长不足自动补足'永远失效)", () => {
-    // 传 [] 时 8 分钟档只出 4 分钟内容,多版本退化成"其实没区别"
-    expect(clipper).not.toMatch(/pool:\s*\[\]/);
-    expect(clipper).toMatch(/pool/);
-  });
-
-  it("补进来的段必须归一化字段名,否则那一片是空的", () => {
-    // live_segments 是 start_ms/theme_name,Clipper 读 startMs/themeName
-    expect(clipper).toMatch(/startMs:\s*Number\(s\.startMs\s*\?\?\s*s\.start_ms/);
-    expect(clipper).toMatch(/themeName:\s*s\.theme_name\s*\?\?\s*s\.themeName/);
-  });
-
-  it("时长字段名必须带 Ms,否则界面显示 68000 秒", () => {
-    // 在多处调用的场景里,字段名没有单位区分度
-    expect(clipper).toMatch(/totalDurationMs/);
-    // 2026-10-05：clip() 的返回值扩成了对象字面量（多了 roughcutFailed / error），
-    // 这条断言原来锁的是 `return { clipPaths, roughcutPath, totalDurationMs }` 这一行文本，
-    // 于是自己把自己判成了失败。改成锁真正的契约：字段名 + 不得出现无单位的别名。
-    expect(clipper).not.toMatch(/totalDuration: totalDuration/);
-    // 拼接失败必须能被调用方看见
-    expect(clipper).toMatch(/roughcutFailed/);
-  });
-
-  it("指定开头版没有原文时必须跳过(否则和标准版无区别)", () => {
-    expect(clipper).toMatch(/没有指定开头原文,已跳过该版本/);
-  });
-
-  it("单个版本失败不能让整批失败", () => {
-    expect(clipper).toMatch(/ok:\s*false,\s*\n\s*files:\s*\[\],\s*\n\s*error: err\.message/);
-    expect(clipper).toMatch(/多版本粗剪完成/);
-  });
-
-  it("界面要显示各版实际时长,否则用户无法判断有没有区别", () => {
-    expect(panel).toMatch(/totalSec/);
-    expect(panel).toMatch(/选这版/);
-    // 未勾选原文时禁用该版本
-    expect(panel).toMatch(/needOpening/);
-  });
-});
 
 describe("出片产物可预览可打开", () => {
   const main = read("src/main/index.ts");
@@ -1072,10 +1016,15 @@ describe("封面图 / 藏带货 / 字幕标题样式", () => {
     expect(client).toMatch(/function wantsPackaging/);
     expect(client).toMatch(/opts\.coverImage\?\.usePath/);
     expect(client).toMatch(/opts\.tailVideo\?\.usePath/);
-    // 两处调用必须共用同一个函数，不能各写一份（原来两份都漏过东西）
-    const uses = client.match(/wantsPackaging\(opts\)/g) ?? [];
-    expect(uses.length, "export 与 wrapExistingProject 两处都要用它").toBeGreaterThanOrEqual(2);
-    expect(client).not.toMatch(/const wantsWrap = Boolean\(\s*opts && \(opts\??\.subtitles/);
+    // 调用点只能有一处内联的判定，逻辑必须走这一个函数。
+// （原来有两处：export 和 wrapExistingProject。多版本删除后只剩 export，
+//  但"别再写第二份"这条约束依然要留着 —— 一旦有人再复制一遍，
+//  两边就会各自漏掉新加的选项。）
+const defs = client.match(/function wantsPackaging\(/g) ?? [];
+expect(defs.length, "wantsPackaging 只能定义一次").toBe(1);
+const uses = client.match(/wantsPackaging\(opts\)/g) ?? [];
+expect(uses.length, "调用点必须用这个函数").toBeGreaterThanOrEqual(1);
+expect(client).not.toMatch(/const wantsWrap = Boolean\(\s*opts && \(opts\??\.subtitles/);
   });
 
   it("封面和藏带货必须走 filter_complex，不能只用 -vf", () => {
@@ -1278,15 +1227,22 @@ describe("审片必须真的审", () => {
     // 而 segment_index 是每场从 0 重计（0..248），两者永不相等 ->
     // 所有段静默丢失 -> 报"逐句剔除后没有可用内容"，把排查方向带偏到素材内容上。
     // 实测 174 的 249/249 段全部匹配失败，打回功能等于不可用。
-    for (const f of [orch, clipper]) {
-      expect(f).toMatch(/const byId = new Map\(\)/);
-      expect(f).toMatch(/byId\.get\(key\) \|\| byIndex\.get\(key\)/);
-    }
+    //
+    // 只钉 orchestrator 的 _segmentsByIndex —— 审片、回填、打回走的是它。
+    // clipper 里曾有一份 _resolveVariantSegments 等价实现，那是「出多版对比」专用的
+    // （2026-10-07 随该功能一起删除）；它和 orchestrator 那份曾各写一遍，
+    // 正是"两处实现漂移"的典型风险，所以现在只剩一份，也就只需要钉一份。
+    expect(orch).toMatch(/const byId = new Map\(\)/);
+    expect(orch).toMatch(/byId\.get\(key\) \|\| byIndex\.get\(key\)/);
   });
 
   it("找不到段时要说真话，不要甩锅给逐句剔除", () => {
-    expect(clipper).toMatch(/点名的 \$\{missing\.length\} 个分段在这场直播里都找不到/);
-    expect(clipper).toMatch(/多半是重分析之后分段被换掉了/);
+    // 报"勾选的分段一个都没匹配上"或"分段在库里都找不到了"，
+    // 而不是"逐句剔除后没有可用内容" —— 后者会把排查方向带到素材内容上，
+    // 而真实原因往往是 id 对不上（重分析换过段）。
+    expect(orch).toMatch(/勾选的分段 id 一个都没匹配上/);
+    expect(orch).toMatch(/个分段在库里都找不到了/);
+    expect(orch).toMatch(/多半是重分析之后分段被换掉了/);
   });
 
   it("打回要能按 id 回捞已作废的段", () => {
@@ -1297,10 +1253,8 @@ describe("审片必须真的审", () => {
     const store = readFileSync("D:/GLB/Hermes/src/memory/store.js", "utf8");
     expect(store).toMatch(/getLiveSegmentsByIds\(ids\)/);
     expect(store).not.toMatch(/getLiveSegmentsByIds[\s\S]{0,400}status = 'draft'/);
-    for (const f of [orch, clipper]) {
-      expect(f).toMatch(/getLiveSegmentsByIds\?\.\(absent\)/);
-      expect(f).toMatch(/只补 draft 里没有的/);
-    }
+    expect(orch).toMatch(/getLiveSegmentsByIds\?\.\(absent\)/);
+    expect(orch).toMatch(/只补 draft 里没有的/);
   });
 
   it("审片包要用真实段序号，不能拿 segmentId 顶替", () => {
@@ -2724,7 +2678,7 @@ describe("验证脚本不许污染用户数据", () => {
   const scriptsDir = "scripts";
 
   it("成片列表必须过滤测试素材产物", () => {
-    // 真实事故:verify:wrap / verify:variant-* 都走真实出片链路,
+    // 真实事故:verify-opening / verify-wrap 都走真实出片链路,
     // 在库里堆了几十个测试 clip_project。成片列表按 id 倒序,
     // 这些记录正好排在最前面 —— 用户打开界面看到的第一批全是测试视频,
     // 其中 21KB 那个还是彩条测试图,看起来像程序坏了。
@@ -2737,9 +2691,7 @@ describe("验证脚本不许污染用户数据", () => {
   it("走了真实出片链路的验证脚本必须收尾清理", () => {
     const dirty = [
       "verify-opening.cjs",
-      "verify-wrap.cjs",
-      "verify-variant-pick.cjs",
-      "verify-variant-opening-toggle.cjs"
+      "verify-wrap.cjs"
     ];
     for (const f of dirty.filter((x) => !scriptMissing(x))) {
       const src = readFileSync(`${scriptsDir}/${f}`, "utf8");
@@ -2764,10 +2716,8 @@ describe("验证脚本不许污染用户数据", () => {
   });
 });
 
-describe("多版本选定后能真的出片", () => {
-  const client = read("src/main/hermes-client.ts");
+describe("出片台有出口,不吞掉分析成果", () => {
   const wb = read("src/renderer/src/components/Workbench.tsx");
-  const panel = read("src/renderer/src/components/VariantPanel.tsx");
 
   it("出片台必须有明确的返回上传页入口", () => {
     /*
@@ -2790,73 +2740,38 @@ describe("多版本选定后能真的出片", () => {
     expect(wb).toMatch(/留在出片台/);
     expect(wb).toMatch(/最近项目/);
   });
-  const types = read("src/shared/api-types.ts");
-  const clipper = readFileSync("D:/GLB/Hermes/src/clipper/index.js", "utf8");
 
-  it("ExportRequest 必须能带 projectId", () => {
-    // 不带的话包装永远按原始勾选新建工程,用户选的版本被无视,而且不报错
-    expect(types).toMatch(/projectId\?: number/);
-  });
+  it("多版本对比已经整个删掉了,别让它悄悄回来", () => {
+    /*
+     * 2026-10-07 删除「出多版对比」。理由：
+     * 记忆重排已经管了时长档位和选段，两套机制两个入口、两套打架的时长数字
+     * （重排"长视频 3-9 分钟" vs 多版本"标准 4 分钟"）；
+     * 而多版本承诺的"对比"在界面上根本做不到 —— 生成完只给时长数字和文件名，
+     * 没有播放、没有并排，要比就得自己去输出目录找文件挨个播。
+     * 它唯一独有的能力是"指定开头版"，用户确认不需要。
+     *
+     * 这条留着是为了：万一哪天接口又被加回来，能立刻发现。
+     */
+    const dock = read("src/renderer/src/components/ExportDock.tsx");
+    const client = read("src/main/hermes-client.ts");
+    const types = read("src/shared/api-types.ts");
+    const preload = read("src/preload/index.ts");
+    const main = read("src/main/index.ts");
 
-  it("带了 projectId 必须跳过建工程,直接包装那一版", () => {
-    expect(client).toMatch(/if \(request_\.projectId\)/);
-    expect(client).toMatch(/wrapExistingProject/);
-  });
-
-  it("包装那一版时不得再调 /pipeline/clip", () => {
-    // 这就是原来的 bug:重新建工程 -> 出的是另一版片子。
-    // 只取 projectId 分支那一段(到"分支 B"标记为止),否则会把正常那条路圈进来。
-    const start = client.indexOf("if (request_.projectId)");
-    const end = client.indexOf("分支 B");
-    const branch = client.slice(start, end);
-    expect(start).toBeGreaterThan(-1);
-    expect(end).toBeGreaterThan(start);
-    expect(branch).not.toMatch(/"\/pipeline\/clip"/);
-    expect(branch).toMatch(/wrapExistingProject/);
-  });
-
-  it("界面必须记住选了哪一版并传给导出", () => {
-    expect(wb).toMatch(/pickedVariant/);
-    expect(wb).toMatch(/pickedVariant\?\.projectId \? \{ projectId: pickedVariant\.projectId \}/);
-  });
-
-  it("面板要标出当前选中的版本,并允许取消", () => {
-    expect(panel).toMatch(/pickedVariant\?\.id === v\.id/);
-    expect(panel).toMatch(/onClearPick/);
-  });
-
-it("编排层必须转发 viralOpening,否则界面上关不掉前置", () => {
-    // 以前 clip-variants 的解构里没有 viralOpening,用户关了开关,
-    // 每一版照样被前置,而界面只显示"已关闭"
-    const orch = readFileSync("D:/GLB/Hermes/src/orchestrator/index.js", "utf8");
-    const handler = orch.slice(orch.indexOf("'/pipeline/clip-variants'"), orch.indexOf("'/pipeline/set-selection'"));
-    expect(handler).toMatch(/viralOpening/);
-  });
-
-  it("Clipper 也要看全局开关,不然转发下来也没用", () => {
-    // 以前写死 viralOpening: plan.opening !== 'none',把界面开关整个架空。
-    // 光在编排层转发不够,这一行必须取交集。
-    expect(clipper).toMatch(/viralOpening: opts\.viralOpening !== false && plan\.opening !== 'none'/);
-  });
-
-  it("多版本链路必须传 segmentIds,否则每版都报'没有可用分段'", () => {
-    // _resolveVariantSegments 没有 segmentIds 就返回空,不做自动选段
-    expect(clipper).toMatch(/_resolveVariantSegments\(liveVideoId, opts\)/);
-    expect(orchestratorSegIds()).toBe(true);
-  });
-
-  function orchestratorSegIds(): boolean {
-    const orch = readFileSync("D:/GLB/Hermes/src/orchestrator/index.js", "utf8");
-    const handler = orch.slice(orch.indexOf("'/pipeline/clip-variants'"), orch.indexOf("'/pipeline/set-selection'"));
-    return /segmentIds/.test(handler);
-  }
-
-  it("没有 projectId 的版本不能被选(否则选了个空壳)", () => {
-    expect(panel).toMatch(/disabled=\{!done\.projectId\}/);
-  });
-
-  it("选了版本时不该再要求勾选非空", () => {
-    expect(wb).toMatch(/picked\.length === 0 && !pickedVariant\?\.projectId/);
+    expect(existsSync("src/renderer/src/components/VariantPanel.tsx")).toBe(false);
+    for (const [name, src] of [["Workbench", wb], ["ExportDock", dock]] as const) {
+      expect(src, `${name} 里不该再有 variant`).not.toMatch(/[Vv]ariant/);
+    }
+    for (const [name, src] of [
+      ["hermes-client", client],
+      ["api-types", types],
+      ["preload", preload],
+      ["main/index", main]
+    ] as const) {
+      expect(src, `${name} 里不该再有 variant`).not.toMatch(/[Vv]ariant/);
+    }
+    expect(existsSync("scripts/verify-variant-pick.cjs")).toBe(false);
+    expect(existsSync("scripts/verify-variant-opening-toggle.cjs")).toBe(false);
   });
 });
 

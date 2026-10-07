@@ -1,7 +1,7 @@
 /**
  * 验证脚本跑完后的清理钩子
  *
- * 为什么需要:verify-opening / verify-wrap / verify-variant-* 都必须走真实的
+ * 为什么需要:verify-opening / verify-wrap 这些必须走真实的
  * 出片链路才能验证,所以它们会在真实库里建 clip_projects、clip_outputs,
  * 并在 output/draft 下留成片文件。
  *

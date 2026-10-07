@@ -33,7 +33,6 @@ export function ExportDock({
   onOpenOptions,
   onRunExport,
   onRerank,
-  onOpenVariants,
   clipProjectId,
   onOpenReview,
   reviewHint
@@ -53,7 +52,6 @@ export function ExportDock({
   reviewHint?: string | null;
   onRunExport: () => Promise<void>;
   onRerank: (tier: TierId) => Promise<string>;
-  onOpenVariants: () => void;
 }): React.JSX.Element {
   const session = useSession();
   const { candidates, selected, outDir, stage } = session;
@@ -236,17 +234,6 @@ export function ExportDock({
           <Progress percent={null} label="正在出片…" />
         ) : (
           <>
-            {/* 多版本对比:一次出多条不同长度/开头的粗剪,用户看完再挑一版包装。
-                以前只能出一版,要试另一种长度就得改配置重跑。 */}
-            <button
-              type="button"
-              disabled={picked.length === 0 || busy !== null || disabled}
-              onClick={onOpenVariants}
-              className="mb-1.5 flex w-full items-center justify-center gap-2 rounded-xl border border-line px-4 py-2.5 text-[12.5px] font-bold text-mut transition-colors hover:border-ember/60 hover:text-ember disabled:cursor-not-allowed disabled:opacity-45"
-            >
-              <LuLayers className="h-4 w-4" />
-              出多版对比挑
-            </button>
             <button
               type="button"
               disabled={picked.length === 0 || busy !== null || disabled}

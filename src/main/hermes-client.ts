@@ -48,8 +48,7 @@ import type {
   HotwordRule,
   LocalStackStatus,
   RenderOptions,
-  Transcript,
-  VariantResult
+  Transcript
 } from "@shared/api-types";
 
 const DEFAULT_PORT = 17841;
@@ -475,55 +474,7 @@ async cancelDetect(filePath: string): Promise<{ ok: boolean; aborted: boolean }>
   }
 
   /** 按目标时长重排并拼装:短/中/长三档。 */
-  /**
-   * 多版本粗剪：一次产出多条不同长度/开头的成片。
-   * 与 export() 的区别:export 出成品(带包装),这里出的是"待挑的粗剪"。
-   */
-  async clipVariants(request_: {
-    liveVideoId: number;
-    clipSegmentIds: number[];
-    clips?: ExportRequest["clips"];
-    variants?: string[];
-    openingText?: string;
-  }): Promise<VariantResult[]> {
-    if (!request_.liveVideoId) return [];
 
-    // 逐句裁剪区间同样要带过去,否则多版本会丢掉用户的挑句结果
-    const cutsByIndex = (request_.clips ?? [])
-      .filter((c) => Array.isArray(c.manualCuts) && c.manualCuts.length > 0)
-      .map((c) => ({
-        index: c.id,
-        cuts: c.manualCuts?.map((r) => ({ st: Math.round(r.startSec * 1000), en: Math.round(r.endSec * 1000) }))
-      }));
-
-    const res = await this.call<{
-      variants?: Array<{
-        id: string;
-        label: string;
-        hint: string;
-        targetSec: number | null;
-        ok: boolean;
-        projectId?: number;
-        files: string[];
-        viralOpening?: string | null;
-        totalSec?: number;
-        elapsedSec?: number;
-        error?: string;
-      }>;
-    }>(
-      "POST",
-      "/pipeline/clip-variants",
-      {
-        liveVideoId: request_.liveVideoId,
-        segmentIds: request_.clipSegmentIds,
-        ...(cutsByIndex.length > 0 ? { cutsByIndex } : {}),
-        ...(request_.variants?.length ? { variants: request_.variants } : {}),
-        ...(request_.openingText ? { openingText: request_.openingText } : {})
-      },
-      60 * 60_000
-    );
-    return res.variants ?? [];
-  }
 
   async rerank(
     fileName: string,
@@ -753,17 +704,7 @@ async cancelDetect(filePath: string): Promise<{ ok: boolean; aborted: boolean }>
 
     const opts = request_.options;
 
-    // ── 分支 A:复用多版本里选中的那个工程 ──────────────────────────
-    //
-    // 这一版已经在 /pipeline/clip-variants 里建好工程、粗剪也渲过了。
-    // 它的选段和裁剪跟原始勾选不一样,所以绝不能再走建工程那条路 ——
-    // 那样会生成另一份片子,而界面不会报错,用户以为"选这版"生效了。
-    if (request_.projectId) {
-      return this.wrapExistingProject(request_.projectId, opts, request_.outDir);
-    }
-
-    // ── 分支 B:按当前勾选新建工程 ────────────────────────────────
-    // 1) 建工程 + 渲染。
+    // 建工程 + 渲染。
     //
     // 把 segmentIds / cutsByIndex 一起传给 /pipeline/clip,让服务端跳过自动选段。
     // 以前分两步(先 clip 再 set-selection),可 createProject 内部的
@@ -880,37 +821,7 @@ async cancelDetect(filePath: string): Promise<{ ok: boolean; aborted: boolean }>
     };
   }
 
-  /**
-   * 只做包装(字幕/封面/标题),复用已有工程。
-   *
-   * 多版本"选这版"走这里:那一版已经在 clip-variants 里建好工程渲过粗剪,
-   * 用户要的是给这一版套包装,不是重新选段出片。
-   */
-  private async wrapExistingProject(
-    projectId: number,
-    opts: RenderOptions | undefined,
-    outDir?: string
-  ): Promise<ExportResult> {
-    const wantsWrap = Boolean(opts && wantsPackaging(opts));
-    // 一个开关都没开也要给结果,否则界面只能显示"失败"
-    if (!wantsWrap) {
-      return {
-        ok: true,
-        outputDir: outDir ?? "",
-        files: [],
-        viralOpening: null,
-        error: "包装选项全关,没有可生成的成片"
-      };
-    }
-    const wrapped = await this.runGenerate(projectId, opts);
-    return {
-      ok: wrapped.ok,
-      outputDir: wrapped.outputDir ?? outDir ?? "",
-      files: wrapped.deliver,
-      viralOpening: null,
-      error: wrapped.ok ? undefined : wrapped.error
-    };
-  }
+
 
   /** POST /pipeline/generate,返回交付物与输出目录 */
   private async runGenerate(

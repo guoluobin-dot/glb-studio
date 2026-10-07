@@ -759,7 +759,7 @@ function registerIpc(): void {
   // 「取消」必须真的取消。以前这里没有端点，前端按钮调的是 detect() 重跑一遍。
   handle("algo:cancelDetect", (filePath: string) => hermes.cancelDetect(filePath));
   handle("algo:readTranscript", (filePath: string) => hermes.readTranscript(filePath));
-  handle("algo:clipVariants", (request_: Parameters<StudioApi["clipVariants"]>[0]) => hermes.clipVariants(request_));
+  
   handle("algo:rerank", (fileName: string, mode: "short" | "mid" | "long", candidates: Parameters<StudioApi["rerank"]>[2]) =>
     hermes.rerank(fileName, mode, candidates)
   );

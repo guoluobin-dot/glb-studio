@@ -805,7 +805,7 @@ export class Orchestrator {
       if (s.id !== undefined && s.id !== null) byId.set(Number(s.id), s);
       if (s.segment_index !== undefined && s.segment_index !== null) byIndex.set(Number(s.segment_index), s);
     }
-    // 同 _resolveVariantSegments：工程里记的段可能已被后续重分析标成 superseded，
+// 工程里记的段可能已被后续重分析标成 superseded，
     // 但源视频与起止时间没变，按 id 回捞一次，只补 draft 里没有的。
     const known = new Set(byId.keys());
     const wanted = (segmentIds || []).map(Number).filter((n) => Number.isFinite(n));
@@ -1254,30 +1254,7 @@ export class Orchestrator {
      * 而 /pipeline/clip 只认 liveVideoId 并会走 Clipper 自己的选段逻辑，
      * 直接对接会把用户的勾选覆盖掉。这里补一个显式写 selected_segments 的入口。
      */
-    /**
-     * 多版本粗剪：一次产出多条不同长度/不同开头的成片，供用户挑。
-     * 2026-09-30 新增。以前一次只能出一版，要试另一种长度就得改配置重跑。
-     */
-    this.app.post('/pipeline/clip-variants', this.requireWriteAuth, async (req, res) => {
-      const { liveVideoId, segmentIds, cutsByIndex, variants, openingText, viralOpening } = req.body;
-      if (!liveVideoId) return res.status(400).json({ error: 'liveVideoId required' });
-      try {
-        const result = await this.clipper.clipVariants(liveVideoId, {
-          segmentIds,
-          cutsByIndex,
-          variants,
-          openingText,
-          // 前置开关以前被丢掉了,界面上关掉也没用 ——
-          // 界面只是提示"已关闭",实际每一版都还是被前置了钩子。
-          ...(viralOpening !== undefined ? { viralOpening: viralOpening !== false } : {})
-        });
-        res.json({ ok: true, ...result });
-      } catch (err) {
-        res.status(500).json({ error: err.message });
-      }
-    });
-
-    this.app.post('/pipeline/set-selection', this.requireWriteAuth, async (req, res) => {
+this.app.post('/pipeline/set-selection', this.requireWriteAuth, async (req, res) => {
       const { projectId, segmentIds } = req.body;
       if (!projectId || !Array.isArray(segmentIds)) {
         return res.status(400).json({ error: 'projectId and segmentIds[] required' });
@@ -3654,7 +3631,7 @@ this.store.addReviewFeedback({
            ORDER BY o.id DESC LIMIT 100`
         ).all()
           // 过滤测试素材的产物。
-          // 验证脚本(verify:wrap / verify:variant-* 等)会跑真实的出片链路,
+          // 验证脚本(verify:wrap / verify-opening 等)会跑真实的出片链路,
           // 于是 clip_outputs 里堆满 test-live-01 / _vo_test / _mv_test 的产物。
           // 成片列表按 id 倒序,这些测试记录正好排在最前面 —— 用户打开列表
           // 看到的就是满屏测试视频,还以为是自己的成片。
