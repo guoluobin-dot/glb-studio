@@ -33,6 +33,11 @@ export class IdleScheduler {
     // 失败退避：确定性失败（静音/无转写/坏文件）以前每 30s 重跑一次全量流程还永远失败，
     // 11 个坏爆款就能把整轮 tick 堵死。5 次后放弃（重启清零），30 分钟内不重试同文件
     this._failStrikes = new Map();
+    // "让路原因"的节流时间戳。三个分支各一个，缺一个就会被 undefined
+    // 反复触发判断、每轮都打一行日志。
+    this._busyLogged = 0;
+    this._loadedLogged = 0;
+    this._limitLogged = 0;
     // failed 状态冷却表：analyse() 失败时是"置 failed 后正常 return"，不抛异常，
     // 调度器因此走 _noteOk() 把上面的退避清零 —— 结果就是每 30s 完整重跑一次 ffprobe+ASR。
     // 这里单独给 failed 记一次时间戳，6 小时内不再自动捡起来（想立刻重来去点"重新分析"）。
@@ -192,6 +197,20 @@ export class IdleScheduler {
     // 自家负载 = 本调度器在跑的任务 + Ollama 正在推理。
     // 后者多为看板手动触发的分析，不进 runningTasks，只盯 GPU 利用率会把它当成"用户在用电脑"。
     const busyByUs = this.runningTasks.size > 0 || !!gpu.ollamaBusy;
+
+    /*
+     * 2026-10-06 修：模型常驻显存不再等于"让路"。
+     *
+     * 原来只要 `gpu.ollamaBusy` 为真就整轮 return（只转写、不分析）。但
+     * ollamaBusy 判据是"权重还留在显存里" —— 手动分析跑完一次，模型会
+     * 常驻几十分钟甚至一直不卸。于是自动队列从那之后就再也不动了，
+     * 表现为"上传了素材但什么都不学进去"。
+     *
+     * 现在区分两件事：
+     *   - ollamaBusy（真在推理）→ 仍让路，避免和手动任务抢显存
+     *   - ollamaLoaded（只是占着显存）→ 不让路，但并发降一档，
+     *     因为 8G 显存里已经有 5-7G 被权重吃掉了
+     */
     if (gpu.mode === 'busy' || gpu.ollamaBusy) {
       // 两种忙都不再起新的 LLM 任务（在跑的不停）：用户忙是让路，自家推理是等它跑完，
       // 避免自动任务和手动任务同时抢占 8G 显存、双双 fetch failed。
@@ -216,19 +235,42 @@ export class IdleScheduler {
     // 原来这里只读 maxConcurrentIdle，config 里的 performance.maxConcurrentBusy 从来没人读，
     // 于是"忙时让路"这条配置一直是废的。0 = normal 档也完全不开新的 LLM 任务。
     const limit = this._computeLimit(gpu);
-    if (limit <= 0) {
+
+    /*
+     * 显存闸门：权重已常驻但没在推理时（ollamaLoaded），并发降一档。
+     *
+     * 8G 显卡上 Qwen 3 8B 权重约 5.7G、视觉模型另占 1.6G。
+     * 如果这会儿再起一个分析任务，就是两个模型挤在同一张卡上 ——
+     * 结果是 fetch failed / OOM，而且不会自动恢复。
+     * 所以：让权重占着不等于让路，但也不能当空闲用。
+     */
+    let effLimit = limit;
+    if (gpu.ollamaLoaded && !gpu.ollamaBusy && effLimit > 1) {
+      effLimit = 1;
+      if (!this._loadedLogged || Date.now() - this._loadedLogged > 300000) {
+        this._loadedLogged = Date.now();
+        console.log(
+          `[Scheduler] 模型常驻显存（${gpu.memUsedMiB}/${gpu.memTotalMiB} MiB）但未在推理，` +
+          `并发降到 1，避免两个模型挤同一张卡`
+        );
+      }
+    }
+
+    if (effLimit <= 0) {
       if (!this._limitLogged || Date.now() - this._limitLogged > 300000) {
         this._limitLogged = Date.now();
-        console.log(`[Scheduler] GPU ${gpu.util}%（${gpu.mode} 档），performance.maxConcurrentBusy=${limit}，本轮不开新的 LLM 任务（转写照常）`);
+        console.log(`[Scheduler] GPU ${gpu.util}%（${gpu.mode} 档），performance.maxConcurrentBusy=${effLimit}，本轮不开新的 LLM 任务（转写照常）`);
       }
       this.orchestrator.userQuery?.checkTimeouts();
       return;
     }
-    if (this.runningTasks.size >= limit) {
-      console.log(`[Scheduler] Max concurrent tasks reached (${this.runningTasks.size}/${limit}, mode=${gpu.mode}), skipping tick`);
+    // 用 effLimit 而不是 limit：模型常驻显存时上面已经把并发降成 1，
+    // 这里如果还用 limit，降档就白降了。
+    if (this.runningTasks.size >= effLimit) {
+      console.log(`[Scheduler] Max concurrent tasks reached (${this.runningTasks.size}/${effLimit}, mode=${gpu.mode}), skipping tick`);
       return;
     }
-    this._effLimit = limit;
+    this._effLimit = effLimit;
 
     /*
      * 2026-10-05 修：空闲路径也要预转写，但**不能挡住分析**。
