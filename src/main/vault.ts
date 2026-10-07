@@ -153,21 +153,56 @@ export async function deleteIp(
   return true;
 }
 
-/** 恢复误删的 IP(从 .trash 里找最近一次) */
-export async function restoreLastDeletedIp(userData: string): Promise<HitCollection | null> {
+/**
+ * 读回收站（.trash），按"最近删除的在前"排序。
+ *
+ * 「恢复误删」要恢复哪一条，和界面提示"现在能恢复什么"必须完全一致 ——
+ * 两处各写一份排序，过几个月一定会漂：提示说能恢复 A，实际恢复出来 B，
+ * 而用户分不清是提示错了还是恢复错了。所以只留这一份实现。
+ *
+ * 目录名格式 `${Date.now()}-${IP 名}`，时间戳是定长前缀，
+ * 所以字符串倒序就等于时间倒序。
+ */
+async function readTrashItems(
+  userData: string
+): Promise<{ saved: HitCollection; dir: string }[]> {
   const trashRoot = join(rootOf(userData), ".trash");
-  if (!existsSync(trashRoot)) return null;
-  const items = (await readdir(trashRoot, { withFileTypes: true }))
+  if (!existsSync(trashRoot)) return [];
+  const names = (await readdir(trashRoot, { withFileTypes: true }))
     .filter((d) => d.isDirectory())
     .map((d) => d.name)
     .sort()
     .reverse();
-  const newest = items[0];
-  if (!newest) return null;
 
-  const dir = join(trashRoot, newest);
-  const saved = await readJson<HitCollection | null>(join(dir, "collection.json"), null);
-  if (!saved?.id) return null;
+  const out: { saved: HitCollection; dir: string }[] = [];
+  for (const name of names) {
+    const dir = join(trashRoot, name);
+    const saved = await readJson<HitCollection | null>(join(dir, "collection.json"), null);
+    // collection.json 缺失/损坏的直接跳过。早先这里是先取最新的目录名、
+    // 再去读它的 collection.json，读不到就 return null ——
+    // 结果回收站里明明有能恢复的东西，界面却说"没有可恢复的 IP"。
+    if (saved?.id) out.push({ saved, dir });
+  }
+  return out;
+}
+
+/**
+ * 回收站里能恢复什么（界面提示用）。
+ *
+ * 顺带说清边界：这个按钮只管**被删除的 IP 老师**（连同它整个文件夹和记忆库）。
+ * 单条爆款用 deleteEntry 删掉时是直接 rm、不进回收站，那种只能靠"按批撤回"。
+ * 界面上这两件事长得都不像"删除"，所以提示里必须讲明白。
+ */
+export async function listRestorableIps(userData: string): Promise<HitCollection[]> {
+  const items = await readTrashItems(userData);
+  return items.map((i) => i.saved);
+}
+
+/** 恢复误删的 IP(从 .trash 里找最近一次) */
+export async function restoreLastDeletedIp(userData: string): Promise<HitCollection | null> {
+  const target = (await readTrashItems(userData))[0];
+  if (!target) return null;
+  const { saved, dir } = target;
 
   // 目标目录必须先不存在。
   // 以前这里先 mkdir 再 rename,Windows 上 rename 目录进已存在的目录会直接失败,
@@ -176,7 +211,7 @@ export async function restoreLastDeletedIp(userData: string): Promise<HitCollect
   await rm(dest, { recursive: true, force: true });
   try {
     await rename(dir, dest);
-  } catch (err) {
+  } catch {
     return null;
   }
   await mkdir(join(dest, "clips"), { recursive: true });

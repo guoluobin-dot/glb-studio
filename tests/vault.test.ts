@@ -8,7 +8,7 @@
  *  3) 校准必须随数据叠加变化,撤掉后要跟着回去
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -16,6 +16,7 @@ import {
   listIps,
   deleteIp,
   restoreLastDeletedIp,
+  listRestorableIps,
   renameIp,
   importEntries,
   undoBatch,
@@ -307,5 +308,74 @@ const victim = entries[0];
     expect(await deleteEntry(root, ip.id, "不存在的id")).toBe(false);
     expect(await undoBatch(root, ip.id, "不存在的批次")).toMatchObject({ ok: false });
     expect(await deleteIp(root, "不存在的id")).toBe(false);
+  });
+});
+
+describe("回收站列表要和实际恢复的那一个一致", () => {
+  // 界面的悬停提示要靠它告诉用户"现在能恢复谁"。
+  // 如果列表顺序和真正恢复的顺序不是同一份实现，
+  // 就会提示能恢复 A、点下去恢复出 B，而用户分不清是提示错了还是恢复错了。
+  it("列表第一个就是恢复动作会恢复的那一个", async () => {
+    const trash = join(root, "hits", ".trash");
+    rmSync(trash, { recursive: true, force: true });
+
+    const a = await createIp(root, "先删的老师");
+    await new Promise((r) => setTimeout(r, 5));
+    const b = await createIp(root, "后删的老师");
+    expect(a && b).toBeTruthy();
+
+    await deleteIp(root, a!.id, true);
+    await new Promise((r) => setTimeout(r, 5));
+    await deleteIp(root, b!.id, true);
+
+    const list = await listRestorableIps(root);
+    expect(list.length).toBe(2);
+    expect(list[0]!.name).toBe("后删的老师");
+
+    const back = await restoreLastDeletedIp(root);
+    expect(back?.name).toBe("后删的老师");
+    expect(back?.id).toBe(list[0]!.id);
+  });
+
+  it("回收站里最新那项坏了不能连累下面还能恢复的", async () => {
+    /*
+     * 回归：早先先取最新的目录名、再去读它的 collection.json，
+     * 读不到就直接 return null —— 明明下面还有能恢复的，
+     * 界面却说"没有可恢复的 IP"，回收站里的东西再也回不来。
+     */
+    const trash = join(root, "hits", ".trash");
+    rmSync(trash, { recursive: true, force: true });
+
+    const good = await createIp(root, "能恢复的老师");
+    await new Promise((r) => setTimeout(r, 5));
+    const bad = await createIp(root, "资料坏了的老师");
+    await deleteIp(root, good!.id, true);
+    await new Promise((r) => setTimeout(r, 5));
+    await deleteIp(root, bad!.id, true);
+
+    // 破坏"最新那项"的 collection.json
+    const newest = readdirSync(trash).sort().reverse()[0]!;
+    writeFileSync(join(trash, newest, "collection.json"), "{ 这不是合法 JSON", "utf8");
+
+    const list = await listRestorableIps(root);
+    expect(list.map((i) => i.name)).toEqual(["能恢复的老师"]);
+
+    const back = await restoreLastDeletedIp(root);
+    expect(back?.name).toBe("能恢复的老师");
+    expect(existsSync(join(root, "hits", good!.id))).toBe(true);
+  });
+
+  it("回收站为空时返回空数组，恢复返回 null", async () => {
+    rmSync(join(root, "hits", ".trash"), { recursive: true, force: true });
+    expect(await listRestorableIps(root)).toEqual([]);
+    expect(await restoreLastDeletedIp(root)).toBeNull();
+  });
+
+  it("彻底删除的东西不会出现在回收站里（那是不可逆的，得说清）", async () => {
+    const trash = join(root, "hits", ".trash");
+    rmSync(trash, { recursive: true, force: true });
+    const gone = await createIp(root, "不可逆删除");
+    await deleteIp(root, gone!.id, false);
+    expect(await listRestorableIps(root)).toEqual([]);
   });
 });

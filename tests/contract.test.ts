@@ -2635,6 +2635,39 @@ it("「用这套记忆」必须贴在 IP 卡片旁边，不能再埋在画像栏
     expect(code.slice(start - 500, end + 200), "IP 操作按钮不该再用 mt-auto 沉底").not.toContain("mt-auto");
   });
 
+  it("「恢复误删」必须说清恢复的是什么、恢复不了什么", () => {
+    /*
+     * 用户问的是"这个恢复误删是误删了什么可以恢复"——
+     * 光有个按钮名不够，悬停提示必须回答两件事：
+     *   1. 只恢复被删除的 IP 老师（连同文件夹和记忆库）
+     *   2. 单条爆款删除不进回收站，那种要用「撤回」
+     * 第 2 条最要紧：两个"删除"在界面上长得不一样，用户默认都以为能撤销。
+     *
+     * 提示还要指名当前能恢复谁（restorable[0]），
+     * 只说"有可恢复的"等于让用户猜、不敢点。
+     */
+    const code = stripComments(panel);
+    expect(code).toContain("hitListRestorableIps");
+    expect(code).toContain("const restoreHint = useMemo");
+    expect(code).toMatch(/restorable\.length === 0/);
+    // 界面上得真的把提示接到按钮的 title 上
+    expect(code).toMatch(/title=\{restoreHint\}/);
+    // 回收站空了就别让用户点了个寂寞
+    expect(code).toMatch(/disabled=\{busy !== null \|\| restorable\.length === 0\}/);
+    // 恢复完/删完都要刷新列表，否则提示停在旧状态
+    const code2 = stripComments(panel);
+    expect((code2.match(/loadRestorable\(\)/g) ?? []).length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("主进程里列回收站和执行恢复必须共用同一份排序", () => {
+    // 两处各写一份排序，过几个月必然漂：提示说能恢复 A，实际恢复出 B，
+    // 用户分不清是提示错了还是恢复错了。
+    const v = read("src/main/vault.ts");
+    expect(v).toMatch(/async function readTrashItems/);
+    expect(v).toMatch(/listRestorableIps[\s\S]{0,200}readTrashItems/);
+    expect(v).toMatch(/restoreLastDeletedIp[\s\S]{0,400}readTrashItems\(userData\)\)\[0\]/);
+  });
+
   it("左导航要有爆款库入口,并显示当前用的老师", () => {
     expect(wb).toMatch(/onOpenVault=\{openVault\}/);
     expect(wb).toMatch(/memoryIpName=\{memoryIpName\}/);

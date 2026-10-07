@@ -157,6 +157,7 @@ const api: StudioApi = {
   hitRenameIp: (ipId, name, note) => ipcRenderer.invoke("hit:renameIp", ipId, name, note) as Promise<HitCollection | null>,
   hitDeleteIp: (ipId, toTrash) => ipcRenderer.invoke("hit:deleteIp", ipId, toTrash) as Promise<boolean>,
   hitRestoreIp: () => ipcRenderer.invoke("hit:restoreIp") as Promise<HitCollection | null>,
+  hitListRestorableIps: () => ipcRenderer.invoke("hit:listRestorableIps") as Promise<HitCollection[]>,
   hitListEntries: (ipId) => ipcRenderer.invoke("hit:listEntries", ipId) as Promise<HitEntry[]>,
   hitImport: (ipId, entries) => ipcRenderer.invoke("hit:import", ipId, entries) as Promise<HitImportResult>,
   hitImportFiles: (ipId, copy) => ipcRenderer.invoke("hit:importFiles", ipId, copy) as Promise<HitAttachResult>,

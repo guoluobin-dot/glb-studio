@@ -1071,6 +1071,7 @@ export interface StudioApi {
   hitDeleteIp(ipId: string, toTrash?: boolean): Promise<boolean>;
   /** 恢复最近一次误删 */
   hitRestoreIp(): Promise<HitCollection | null>;
+  hitListRestorableIps(): Promise<HitCollection[]>;
 
   /** 某 IP 下的爆款条目 */
   hitListEntries(ipId: string): Promise<HitEntry[]>;

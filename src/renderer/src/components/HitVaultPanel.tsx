@@ -67,6 +67,9 @@ export function HitVaultPanel({ onClose, onOpenSettings, onPickIp, activeIpId }:
   /** 正在提交截图更正的那一条 */
   const [feedbackFor, setFeedbackFor] = useState<HitEntry | null>(null);
 
+  /** 回收站里能恢复的 IP 老师，按最近删除的在前 */
+  const [restorable, setRestorable] = useState<HitCollection[]>([]);
+
 /** 大数字缩写：12345 -> 1.2万，界面里 8 位数会把整行挤爆 */
 function formatCount(n?: number | null): string {
   const v = Number(n);
@@ -129,10 +132,55 @@ function hasRealPerformance(e: HitEntry): boolean {
 
   const ip = useMemo(() => ips.find((i) => i.id === current) ?? null, [ips, current]);
 
+  /*
+   * 「恢复误删」的悬停提示。
+   *
+   * 光写"恢复误删"用户猜不出边界：这个按钮名像是万能撤销，
+   * 但它只管被删除的 **IP 老师**（连同整个文件夹和它的记忆库）；
+   * 单条爆款用另一个删除按钮删掉时是直接删文件、不进回收站，
+   * 那种只能靠"按批撤回"找回。两件事在界面上长得都不像删除，
+   * 所以提示里必须把这条界线说清楚。
+   *
+   * 还要指名道姓当前能恢复谁：只说"有可恢复的内容"等于让用户自己猜，
+   * 不敢点。列表取主进程那份（和实际恢复的排序同一份实现）。
+   */
+  const restoreHint = useMemo(() => {
+    const scope =
+      "只恢复被删除的「IP 老师」文件夹和它的记忆库；" +
+      "单条爆款被删除后不进这里，要用列表里的「撤回」按导入批次找回。";
+    if (restorable.length === 0) {
+      return `回收站里没有可恢复的 IP 老师。${scope}`;
+    }
+    const top = restorable[0];
+    const head = `恢复最近删除的「${top.name}」` +
+      (Number(top.entryCount) > 0 ? `（原 ${top.entryCount} 条爆款）` : "（当时是空的）");
+    const more = restorable.length > 1
+      ? `回收站里还有 ${restorable.length - 1} 位，再点一次恢复下一位。`
+      : "";
+    return `${head}\n${scope}${more ? "\n" + more : ""}`;
+  }, [restorable]);
+
   const refreshAll = useCallback(async (): Promise<void> => {
     await loadIps();
     await loadIp(current);
   }, [loadIps, loadIp, current]);
+
+  /*
+   * 回收站内容要和「恢复误删」按钮的状态一起刷新。
+   * 删除/恢复都会改变可恢复列表，所以跟着 refreshAll 走，不单独开一条路径 ——
+   * 多一条刷新路径就多一处可能不同步。
+   */
+  const loadRestorable = useCallback(async (): Promise<void> => {
+    try {
+      setRestorable(await call((api) => api.hitListRestorableIps()));
+    } catch {
+      setRestorable([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadRestorable();
+  }, [loadRestorable]);
 
   /* ---------------- IP 档案操作 ---------------- */
 
@@ -187,6 +235,8 @@ function hasRealPerformance(e: HitEntry): boolean {
       setMsg({ tone: "ok", text: `已删除「${ip.name}」,可用「恢复误删」找回` });
       setCurrent(null);
       await loadIps();
+      // 刚删掉的就是现在最新可恢复的那条，提示要立刻跟上
+      await loadRestorable();
     } catch (err) {
       setMsg({ tone: "warn", text: err instanceof Error ? err.message : String(err) });
     } finally {
@@ -199,12 +249,14 @@ function hasRealPerformance(e: HitEntry): boolean {
     try {
       const back = await call((api) => api.hitRestoreIp());
       if (!back) {
-        setMsg({ tone: "warn", text: "没有可恢复的 IP" });
+        setMsg({ tone: "warn", text: "回收站里没有可恢复的 IP 老师" });
         return;
       }
       setCurrent(back.id);
       setMsg({ tone: "ok", text: `已恢复「${back.name}」` });
       await loadIps();
+      // 恢复完列表就变了，提示必须跟着变，否则按钮还显示"可恢复 X"
+      await loadRestorable();
     } catch (err) {
       setMsg({ tone: "warn", text: err instanceof Error ? err.message : String(err) });
     } finally {
@@ -357,7 +409,8 @@ function hasRealPerformance(e: HitEntry): boolean {
             <button
               type="button"
               onClick={restoreIp}
-              disabled={busy !== null}
+              disabled={busy !== null || restorable.length === 0}
+              title={restoreHint}
               className="flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-line px-3 py-2 text-[11.5px] font-semibold text-mut transition-colors hover:text-fg disabled:opacity-40"
             >
               <LuUndo2 className="h-3.5 w-3.5" />

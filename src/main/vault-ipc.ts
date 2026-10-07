@@ -8,7 +8,7 @@
 import type { BrowserWindow } from "electron";
 import { dialog } from "electron";
 import {
-  listIps, createIp, renameIp, deleteIp, restoreLastDeletedIp,
+  listIps, createIp, renameIp, deleteIp, restoreLastDeletedIp, listRestorableIps,
   listEntries, importEntries, undoBatch, deleteEntry, listBatches,
   rebuildProfile, getProfile, profileToBrief, attachSources
 } from "./vault";
@@ -202,6 +202,11 @@ export function registerVaultIpc(
   );
   handle("hit:deleteIp", (ipId: string, toTrash?: boolean) => deleteIp(userData(), ipId, toTrash !== false));
   handle("hit:restoreIp", () => restoreLastDeletedIp(userData()));
+  /*
+   * 回收站里能恢复什么 —— 界面提示要指名道姓，不能只说"恢复误删"。
+   * 用户看到的是"误删了什么可以恢复"，而不是猜这个按钮的边界。
+   */
+  handle("hit:listRestorableIps", () => listRestorableIps(userData()));
   handle("hit:listEntries", (ipId: string) => listEntries(userData(), ipId));
   handle("hit:import", (ipId: string, entries: HitEntry[]) => importEntries(userData(), ipId, entries ?? []));
   handle("hit:listBatches", (ipId: string) => listBatches(userData(), ipId));
