@@ -11,17 +11,6 @@ data/
 upload/
 logs/
 
-# ── data/ 里跟源码走的配置，必须跟着仓库走 ──
-# 上面 data/ 整目录被忽略，下面要显式放行这些文件。
-# Git 不会进入被忽略的目录，所以这里必须先放行目录本身再放行文件。
-!data/
-data/*
-!data/clip-rules.json
-!data/clip-standard.json
-!data/copywriting-presets.json
-!data/theme-taxonomy.json
-data/.hermes-secret
-
 # ── 依赖与构建产物 ──
 node_modules/
 dist/

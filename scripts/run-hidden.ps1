@@ -39,6 +39,16 @@ $psi.RedirectStandardError = $true
 if ($CmdArgs) { $psi.Arguments = $CmdArgs }
 if ($WorkDir) { $psi.WorkingDirectory = $WorkDir }
 
+# 子进程按 UTF-8 写 stdout，.NET 默认按系统 ANSI 码页（本机是 GBK）读，
+# 于是每个中文字符都变成乱码，脚本里的中文提示和断言信息全看不清。
+# 不设这个，UTF8Encoding 探测也救不了 —— 必须显式指定。
+try {
+  $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+  $psi.StandardErrorEncoding  = [System.Text.Encoding]::UTF8
+} catch {
+  Write-Warning '当前 .NET 不支持指定输出编码，中文日志可能是乱码'
+}
+
 $p = [System.Diagnostics.Process]::Start($psi)
 
 # 必须异步读两个流：先同步读完 stdout 再读 stderr，
