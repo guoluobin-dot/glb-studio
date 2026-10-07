@@ -11,6 +11,10 @@ build/
 config/secrets.local.json
 config/*.local.json
 
+# 姓名脱敏映射表：本机自留，绝不能进仓库。
+# 脚本本身要公开，所以真名只能待在这个被忽略的文件里。
+scripts/sanitize-names.local.json
+
 # ── 运行数据 ──
 # 里面是逐句稿、抽帧、缓存
 data/

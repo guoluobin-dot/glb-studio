@@ -17,6 +17,52 @@ import { ASRHelper } from './asr-helper.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+/*
+ * 受控主题词表（2026-10-06 加）
+ *
+ * 为什么不能让模型自由命名主题：实测 16 条爆款素材产出 47 个主题，
+ * 全是同义变体 ——
+ *   「高音技巧教学」/「高音定位训练」/「高音位置衔接」其实是一类
+ *   「科学发声技巧」/「声乐技巧教学」/「歌唱技巧讲解」也是一类
+ * 样本最多的主题只有 3 个，没有一个到门槛，面板显示成一堆几乎不重复的词，
+ * 匹配时也因为叫法不同而命不中。
+ *
+ * 所以改成从固定分类里选。词表放 data/theme-taxonomy.json（可编辑，
+ * 加品类不用改代码）。文件不在或读失败就退回自由命名 —— 宁可主题碎，
+ * 也不能让分析整个失败。
+ */
+function loadThemeTaxonomy() {
+  const p = join(__dirname, '..', '..', 'data', 'theme-taxonomy.json');
+  try {
+    if (!existsSync(p)) return null;
+    const j = JSON.parse(readFileSync(p, 'utf-8'));
+    if (!Array.isArray(j.categories) || j.categories.length === 0) return null;
+    return j.categories;
+  } catch (err) {
+    console.warn(`[HitAnalyzer] 主题词表读取失败，退回自由命名: ${err.message}`);
+    return null;
+  }
+}
+
+/** 把词表渲染进提示词；没有词表时返回空串 */
+function themeTaxonomyHint() {
+  const cats = loadThemeTaxonomy();
+  if (!cats) return '';
+  const lines = cats.map(
+    (c) => `  "${c.name}" — ${c.hint}\n     召回词: ${c.keywords.join('、')}`
+  );
+  return `
+THEME TAXONOMY (必须遵守):
+- themes 里的 theme_name **只能**从下面这 ${cats.length} 个分类里选，**不要自己另起名字**。
+  自由命名会让同一件事出现十几种叫法，样本永远聚不起来，也匹配不上。
+- 每条素材选 2-3 个最能代表内容的分类；都不合适就返回空数组，
+  不要为了凑数硬塞一个不准的（错的主题比没主题更有害）。
+- keywords 从该分类的召回词里挑，也可以补原文里真实出现的说法。
+
+${lines.join('\n')}
+`;
+}
+
 const SYSTEM_PROMPT = `You are Hermes Video Analytics AI. You analyze short viral video transcripts to extract the creator's structural patterns, emotional arcs, and content themes.
 
 Output strict JSON with this structure:
@@ -36,7 +82,7 @@ Output strict JSON with this structure:
   ],
   "themes": [
     {
-      "theme_name": "descriptive name in Chinese or English",
+      "theme_name": "从下方 THEME TAXONOMY 里选一个分类名（不要自己另起名字）",
       "confidence": 0.0-1.0,
       "keywords": ["keyword1", "keyword2"],
       "related_segment_indices": [0, 1, 2]
@@ -107,7 +153,7 @@ Rules:
 - emotion_curve 要覆盖全片，每段给出表情和语气，用于后续选封面和学情绪节奏
 - For teaching/knowledge content, label value-first follow invitations (follow for part 2, live practice invites) as soft_cta, not cta
 - Rate effectiveness based on language impact and psychological triggers
-- All text can be in Chinese or the language of the transcript`;
+- All text can be in Chinese or the language of the transcript${themeTaxonomyHint()}`;
 
 export class HitAnalyzer {
   constructor(ollama, store, config, hooks = {}) {
@@ -355,12 +401,41 @@ export class HitAnalyzer {
         }
       }
 
-      // Store themes
+      /*
+ * 主题归一：把模型给的主题名收敛到受控分类。
+ *
+ * 提示词里已经要求"只能从词表里选"，但模型不一定听话（本地 8B 尤其不稳）。
+ * 所以写库前再兜一层：拿分类的召回词去匹配模型给的主题名和 keywords，
+ * 命中就把主题名换成标准分类名。这样即便模型自由命名，落库的也是可聚合的。
+ *
+ * 匹配不上就原样保留 —— 宁可多一个野生主题，也不要把内容归错类
+ * （归错类比不归更坏：它会污染这个分类下的所有样本）。
+ */
+function normalizeThemeName(themeName, keywords) {
+  const cats = loadThemeTaxonomy();
+  if (!cats) return themeName;
+  const hay = `${themeName || ''} ${(keywords || []).join(' ')}`;
+  let best = null;
+  let bestScore = 0;
+  for (const c of cats) {
+    if (c.name === themeName) return c.name;   // 已经是标准名
+    let score = 0;
+    for (const kw of c.keywords || []) {
+      if (kw && hay.includes(kw)) score++;
+    }
+    // 主题名本身就命中分类名，算最强证据
+    if (themeName && (themeName.includes(c.name) || c.name.includes(themeName))) score += 3;
+    if (score > bestScore) { bestScore = score; best = c.name; }
+  }
+  return bestScore > 0 ? best : themeName;
+}
+
+// Store themes
       if (analysisResult.themes) {
         for (const theme of analysisResult.themes) {
           this.store.addHitTheme({
             hitVideoId: videoId,
-            themeName: theme.theme_name,
+            themeName: normalizeThemeName(theme.theme_name, theme.keywords),
             confidence: theme.confidence,
             keywords: theme.keywords,
             relatedSegments: theme.related_segment_indices

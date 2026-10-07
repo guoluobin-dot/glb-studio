@@ -55,10 +55,10 @@
   },
   "glb": {
     "webhookSecret": "hermes-local-secret",
-    "outputWatchDir": "<GLB_OUTPUT>",
-    "transcriptDir": "<GLB_OUTPUT>/transcripts",
-    "highlightDir": "<GLB_OUTPUT>/highlights",
-    "clipDir": "<GLB_OUTPUT>/clips",
+    "outputWatchDir": "<GLB_ROOT>/output",
+    "transcriptDir": "<GLB_ROOT>/output/transcripts",
+    "highlightDir": "<GLB_ROOT>/output/highlights",
+    "clipDir": "<GLB_ROOT>/output/clips",
     "exePath": "<GLB_ROOT>/GLB/GLB.exe",
     "userDataDirs": []
   },
@@ -97,8 +97,8 @@
     "maxTotalBytes": 53687091200
   },
   "output": {
-    "finishedDir": "<GLB_OUTPUT>/finished",
-    "draftDir": "<GLB_OUTPUT>/draft"
+    "finishedDir": "<GLB_ROOT>/output/finished",
+    "draftDir": "<GLB_ROOT>/output/draft"
   },
   "analyzer": {
     "ffmpegPath": "",
@@ -158,8 +158,8 @@
   "security": {
     "extraAllowedDirs": [
       "<USER_VIDEOS>/GLB",
-      "<GLB_OUTPUT>",
-      "<GLB_USERDATA>",
+      "<GLB_ROOT>/output",
+      "<GLB_ROOT>/GLBUserData",
       "E:/"
     ]
   }
