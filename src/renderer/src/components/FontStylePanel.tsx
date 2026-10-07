@@ -17,7 +17,8 @@ import type { CaptionStyle, TitleStyle } from "@shared/api-types";
 function TextLayoutPreview({
   caption,
   title,
-  frameHeight
+  frameHeight,
+  width = 176
 }: {
   caption: CaptionStyle;
   title: TitleStyle;
@@ -26,7 +27,7 @@ function TextLayoutPreview({
   /** 预览宽度（px）。高度按 9:16 推出来，和素材真实比例无关 */
   width?: number;
 }): React.JSX.Element {
-  const W = width ?? 176;
+  const W = width;
   const H = Math.round(W / 0.5625);
   // 位置按百分比下，和预览实际尺寸无关
   const geo = layoutFor(H, caption, title);

@@ -154,4 +154,37 @@ describe("字幕 / 标题位置几何", () => {
       /<\/div>\s*<div className="grid min-w-0 flex-1/
     );
   });
+
+  it("预览组件的 props：类型里声明的每个键都要真的解构出来", () => {
+    /*
+     * 真实事故：给预览加了 width 这个可选 prop，写在类型里但忘了加进解构模式，
+     * 函数体里又直接用了 width —— 运行时报 "width is not defined"，
+     * 整个应用白屏进错误页。
+     *
+     * 为什么 typecheck 没抓到：width 是可选属性，TS 不会因为"只声明没解构"报错。
+     * 而这类错误只有在渲染那一刻才暴露 —— 测试全绿、应用起不来。
+     * 所以这里直接对源码做检查。
+     */
+    const src = readFileSync("D:/GLB-NEW/src/renderer/src/components/FontStylePanel.tsx", "utf8");
+
+    const start = src.indexOf("function TextLayoutPreview(");
+    expect(start).toBeGreaterThan(-1);
+
+    // 解构模式 {...}：第一个 { 之后到对应的 } 之前
+    const braceStart = src.indexOf("{", start);
+    const braceEnd = src.indexOf("}", braceStart);
+    const destructured = src.slice(braceStart + 1, braceEnd);
+    for (const name of ["caption", "title", "frameHeight", "width"]) {
+      expect(destructured, `解构里必须真的有 ${name}`).toMatch(new RegExp(`\\b${name}\\b`));
+    }
+
+    // 类型里的键也要都在解构里（反方向：类型多写一个也要发现）
+    const typeStart = src.indexOf("}: {", braceEnd);
+    const typeEnd = src.indexOf("}): React.JSX.Element", typeStart);
+    const typeBody = src.slice(typeStart, typeEnd);
+    for (const m of typeBody.matchAll(/^\s*(\w+)\??:/gm)) {
+      const key = m[1]!;
+      expect(destructured, `类型里声明了 ${key}，解构里却漏了`).toMatch(new RegExp(`\\b${key}\\b`));
+    }
+  });
 });
