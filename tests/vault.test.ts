@@ -125,6 +125,58 @@ describe("批量导入", () => {
   });
 });
 
+describe("重复同步必须刷新派生字段", () => {
+  // 回归：早先刷新路径只合 prediction/metrics/viralPoints 等原始字段，
+  // 漏了 themes / tags / hooks / genre —— 它们都是从 Hermes 侧**派生**的。
+  // 于是 Hermes 那边换词表重算了主题，用户点"把已分析结果写入记忆库"，
+  // 老条目还是旧主题名，看起来就像同步没生效。
+  // 派生字段最容易漏，因为它们不在原始字段列表里。
+  it("themes / tags / hooks / genre 都要跟着刷新", async () => {
+    const a = await ipOf();
+    const old = mkEntry(30, {
+      themes: [{ themeName: "高音技巧教学", keywords: ["高音"], confidence: 0.9 }],
+      tags: ["高音技巧教学"],
+      hooks: ["旧钩子"],
+      genre: "旧分类"
+    });
+    await importEntries(root, a.id, [old]);
+
+    const fresh = mkEntry(30, {
+      themes: [{ themeName: "高音突破", keywords: ["高音", "鼻孔发力"], confidence: 0.95 }],
+      tags: ["高音突破", "hook_opening×1"],
+      hooks: ["新钩子"],
+      genre: "新分类"
+    });
+    const r = await importEntries(root, a.id, [fresh]);
+
+    expect(r.skipped).toBe(1);
+    expect(r.imported).toBe(0);
+    expect(r.refreshed).toBe(1);
+
+    const got = (await listEntries(root, a.id)).find((e) => e.sourceKey === "hit-30");
+    expect(got?.themes?.[0]?.themeName).toBe("高音突破");
+    expect(got?.tags).toContain("高音突破");
+    expect(got?.hooks).toEqual(["新钩子"]);
+    expect(got?.genre).toBe("新分类");
+  });
+
+  it("Hermes 没给新值时不能把本地已有的清空", async () => {
+    const a = await ipOf();
+    await importEntries(root, a.id, [
+      mkEntry(31, { tags: ["本地标签"], hooks: ["本地钩子"], genre: "本地分类" })
+    ]);
+    // 空数组/空串不算"有值"：Hermes 这次没给主题，不能把本地已有的抹掉
+    await importEntries(root, a.id, [
+      mkEntry(31, { themes: [], tags: [], hooks: [], genre: null })
+    ]);
+
+    const got = (await listEntries(root, a.id)).find((e) => e.sourceKey === "hit-31");
+    expect(got?.tags).toEqual(["本地标签"]);
+    expect(got?.hooks).toEqual(["本地钩子"]);
+    expect(got?.genre).toBe("本地分类");
+  });
+});
+
 describe("撤回", () => {
   // 撤回后批次就没了,所以这里必须先把 batchId 记下来给下一个用例用
   let undoneBatchId = "";

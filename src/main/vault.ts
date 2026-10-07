@@ -276,6 +276,23 @@ for (const raw of incoming) {
           openingScript: raw.openingScript ?? prev.openingScript,
           fullTranscript: raw.fullTranscript ?? prev.fullTranscript,
           segments: prev.segments?.length ? prev.segments : raw.segments,
+          /*
+           * themes / tags / hooks 也要刷新 —— 早先漏了，症状是
+           * "改了词表归一了主题，同步之后老条目还是旧主题名"。
+           * 这三个字段都不是原始字段，而是从 Hermes 侧派生出来的：
+           *   tags  = themes 的名字 + 结构段统计
+           *   hooks = openingScript + patterns 里的 hook
+           * 所以只要 Hermes 那边重算过（换词表、重新分析），
+           * 本地这条就跟着过期了。openingScript 明明在刷新列表里，
+           * hooks 却不刷新 —— 派生关系最容易漏的就是这一层。
+           *
+           * genre 同理，Hermes 侧改了分类本地不会变。
+           * 空数组/空串不算"有值"，否则 Hermes 没给会清掉本地已有的。
+           */
+          themes: raw.themes?.length ? raw.themes : prev.themes,
+          tags: raw.tags?.length ? raw.tags : prev.tags,
+          hooks: raw.hooks?.length ? raw.hooks : prev.hooks,
+          genre: raw.genre ?? prev.genre,
           updatedAt: now
         };
         added.push(merged);
