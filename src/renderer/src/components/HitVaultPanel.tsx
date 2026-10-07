@@ -316,25 +316,32 @@ function hasRealPerformance(e: HitEntry): boolean {
       onClose={onClose}
       width="max-w-5xl"
       footer={
-        <div className="flex w-full items-center justify-between gap-3">
-          <span className="text-[11px] text-mut-2">
+<div className="flex w-full flex-wrap items-center justify-between gap-x-3 gap-y-2">
+          <span className="shrink-0 whitespace-nowrap text-[11px] text-mut-2">
             {ips.length > 0
               ? `${ips.length} 位老师 · ${ips.reduce((s, i) => s + i.entryCount, 0)} 条爆款`
               : "还没有 IP 档案"}
           </span>
-          <div className="flex items-center gap-2">
+          {/*
+           * flex-wrap + 每个按钮 whitespace-nowrap 是必须的。
+           * 早先这里是 items-center 不换行、按钮也不禁止收缩，
+           * 一旦内容总宽超过弹窗，flex 就把 4 个按钮压成每行一个字 ——
+           * "返回主界面"竖着排，比中英文混排还难认。
+           * 文字一多就挤压是这个布局的固有失败模式，必须在结构上防住。
+           */}
+          <div className="flex flex-wrap items-center justify-end gap-2">
             {/*
-             * 回主界面 + 去设置。
-             *
-             * 之前这个弹窗只有右上角一个 X 和点遮罩关闭，
-             * 打开设置只能：关掉弹窗 → 在左侧导航找设置 → 再打开素材。
-             * 而"爆款库 → 设置"是很自然的一跳（引擎、分析引擎、Gemini key 都在那）。
-             * 用户反馈"没有返回主界面的功能或设置"，所以显式补上两个出口。
-             */}
+              回主界面 + 去设置。
+
+              之前这个弹窗只有右上角一个 X 和点遮罩关闭，
+              打开设置只能：关掉弹窗 → 在左侧导航找设置 → 再打开素材。
+              而"爆款库 → 设置"是很自然的一跳（引擎、分析引擎、Gemini key 都在那）。
+              用户反馈"没有返回主界面的功能或设置"，所以显式补上两个出口。
+            */}
             <button
               type="button"
               onClick={onClose}
-              className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-2 text-[11.5px] font-semibold text-mut transition-colors hover:border-ember/50 hover:text-ember"
+              className="flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-line px-3 py-2 text-[11.5px] font-semibold text-mut transition-colors hover:border-ember/50 hover:text-ember"
             >
               <LuArrowLeft className="h-3.5 w-3.5" />
               返回主界面
@@ -342,7 +349,7 @@ function hasRealPerformance(e: HitEntry): boolean {
             <button
               type="button"
               onClick={onOpenSettings}
-              className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-2 text-[11.5px] font-semibold text-mut transition-colors hover:border-ember/50 hover:text-ember"
+              className="flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-line px-3 py-2 text-[11.5px] font-semibold text-mut transition-colors hover:border-ember/50 hover:text-ember"
             >
               <LuSettings className="h-3.5 w-3.5" />
               设置
@@ -351,26 +358,21 @@ function hasRealPerformance(e: HitEntry): boolean {
               type="button"
               onClick={restoreIp}
               disabled={busy !== null}
-              className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-2 text-[11.5px] font-semibold text-mut transition-colors hover:text-fg disabled:opacity-40"
+              className="flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-line px-3 py-2 text-[11.5px] font-semibold text-mut transition-colors hover:text-fg disabled:opacity-40"
             >
               <LuUndo2 className="h-3.5 w-3.5" />
               恢复误删
             </button>
-            /*
-              文案为什么改成这样（2026-10-06）：
-              原来叫"「把已分析结果写入记忆库」"，和出片台的"按记忆重找爆款"撞在
-              "爆款"两个字上，方向却相反 —— 这个是**写入**记忆库，
-              那个是**读取**记忆。用户以为导入后没变化就是因为这个按钮，
-              实际上记忆库要等分析跑完才有东西可同步。
-
-              现在改成"把已分析结果写入记忆库"，动词（写入）把方向说死。
-            */
+            {/*文案为什么改成这样（2026-10-06）：原来叫「把已分析结果写入记忆库」，和出片台的"按记忆重找爆款"撞在
+              "爆款"两个字上，方向却相反 —— 这个是**写入**记忆库，那个是**读取**记忆。
+              用户以为导入后没变化就是因为这个按钮，实际上记忆库要等分析跑完才有东西可同步。
+              现在改成"把已分析结果写入记忆库"，动词（写入）把方向说死。*/}
             <button
               type="button"
               onClick={() => void syncFromHermes()}
               disabled={busy !== null}
               title="把 Hermes 里已分析完成的爆款搬进这个记忆库。分析在后台跑，跑完再点。分析没完成时同步过来的仍是旧数据。"
-              className="flex items-center gap-1.5 rounded-lg border border-ember/50 bg-ember/10 px-3.5 py-2 text-[11.5px] font-bold text-ember transition-colors hover:bg-ember/20 disabled:opacity-40"
+              className="flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-ember/50 bg-ember/10 px-3.5 py-2 text-[11.5px] font-bold text-ember transition-colors hover:bg-ember/20 disabled:opacity-40"
             >
               {busy === "sync" ? <LuLoaderCircle className="h-3.5 w-3.5 spin-slow" /> : <LuCloudDownload className="h-3.5 w-3.5" />}
               把已分析结果写入记忆库
@@ -396,26 +398,50 @@ function hasRealPerformance(e: HitEntry): boolean {
             {ips.map((x) => {
               const on = x.id === current;
               return (
-                <button
+                /*
+                 * 外层用 div 而不是直接一个 button：要给卡片右侧塞第二个按钮
+                 * （「用这套记忆」），而 button 里不能再嵌 button —— 那是无效
+                 * HTML，浏览器会把点击事件报给外层，键盘 Tab 也会乱。
+                 */
+                <div
                   key={x.id}
-                  type="button"
-                  onClick={() => setCurrent(x.id)}
                   className={cx(
-                    "rounded-lg border px-2.5 py-2 text-left transition-colors",
+                    "flex items-stretch gap-1 rounded-lg border pr-1 transition-colors",
                     on ? "border-ember/45 bg-ember/8" : "border-line hover:border-line/80 hover:bg-panel-2/50"
                   )}
                 >
-                  <div className="flex items-center gap-1.5">
-                    <Dot tone={x.entryCount > 0 ? "ok" : "idle"} />
-                    <span className={cx("truncate text-[12px] font-bold", on ? "text-fg" : "text-mut")}>
-                      {x.name}
-                    </span>
-                    {on && onPickIp && <LuCheck className="ml-auto h-3 w-3 shrink-0 text-ember" strokeWidth={3} />}
-                  </div>
-                  <div className="mt-0.5 pl-3 text-[10px] text-mut-2">
-                    {x.entryCount} 条 · {x.totalSec > 0 ? formatDurationCN(x.totalSec) : "0s"}
-                  </div>
-                </button>
+                  <button
+                    type="button"
+                    onClick={() => setCurrent(x.id)}
+                    className="min-w-0 flex-1 px-2.5 py-2 text-left"
+                  >
+                    <div className="flex items-center gap-1.5">
+                      <Dot tone={x.entryCount > 0 ? "ok" : "idle"} />
+                      <span className={cx("truncate text-[12px] font-bold", on ? "text-fg" : "text-mut")}>
+                        {x.name}
+                      </span>
+                    </div>
+                    <div className="mt-0.5 pl-3 text-[10px] text-mut-2">
+                      {x.entryCount} 条 · {x.totalSec > 0 ? formatDurationCN(x.totalSec) : "0s"}
+                    </div>
+                  </button>
+                  {/*
+                    * 「用这套记忆」原来放在右侧画像栏的最底部（mt-auto 推下去），
+                    * 画像一长就被埋掉，用户反馈"藏得太深"。
+                    * 选哪位老师和应用哪位老师的记忆是同一个动作的两步，
+                    * 所以按钮就贴在对应那张卡片右边 —— 选完顺手点，不用再去右边找。
+                    */}
+                  <button
+                    type="button"
+                    onClick={() => onPickIp?.(x)}
+                    disabled={!onPickIp}
+                    title={`用「${x.name}」的记忆库重挑片段`}
+                    className="flex shrink-0 items-center justify-center gap-1 self-center whitespace-nowrap rounded border border-ember/50 bg-ember/10 px-1.5 py-1 text-[10.5px] font-bold text-ember transition-colors hover:bg-ember/20 disabled:opacity-35"
+                  >
+                    <LuCheck className="h-3 w-3" strokeWidth={3} />
+                    用这套
+                  </button>
+                </div>
               );
             })}
           </div>
@@ -710,17 +736,6 @@ function hasRealPerformance(e: HitEntry): boolean {
                 画像由样本反推,不是行业经验值。新增爆款会自动叠加校准;删掉某条它的贡献也会一起撤回。
               </p>
             </div>
-          )}
-
-          {ip && onPickIp && (
-            <button
-              type="button"
-              onClick={() => onPickIp(ip)}
-              className="mt-auto flex items-center justify-center gap-1.5 rounded-lg border border-ember/50 bg-ember/10 px-2 py-2 text-[11px] font-bold text-ember transition-colors hover:bg-ember/20"
-            >
-              <LuCheck className="h-3.5 w-3.5" />
-              用这套记忆
-            </button>
           )}
         </div>
       </div>

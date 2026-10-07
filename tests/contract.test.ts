@@ -2552,6 +2552,30 @@ it("UI 要能完成全流程:新建/重命名/删除/恢复/写入记忆/批量�
     expect(panel).toMatch(/hitDeleteEntry/);
   });
 
+  it("「用这套记忆」必须贴在 IP 卡片旁边，不能再埋在画像栏底部", () => {
+    /*
+     * 回归：原来这个按钮放在右侧画像栏最底部（mt-auto 推下去）。
+     * 画像一长它就被埋到看不见的地方，用户反馈"藏得太深"。
+     * 选哪位老师和应用哪位老师的记忆本来就是同一个动作的两步，
+     * 按钮就该贴在对应卡片右边。
+     */
+    expect(panel).toContain("用这套");
+
+    // 按钮必须在 IP 卡片那一段里：卡片容器是 flex，按钮是它的兄弟节点
+    const cardIdx = panel.indexOf("用这套");
+    const ipMapIdx = panel.indexOf("ips.map");
+    const pickIpIdx = panel.indexOf("onPickIp?.(x)");
+    expect(ipMapIdx).toBeGreaterThan(-1);
+    expect(pickIpIdx).toBeGreaterThan(ipMapIdx);
+    expect(cardIdx).toBeGreaterThan(ipMapIdx);
+
+    // 画像栏底部那个 mt-auto 版本必须已经拿掉，否则同一个动作有两个入口
+    expect(panel).not.toMatch(/mt-auto[^"]*"[\s\S]{0,200}用这套记忆/);
+
+    // 不能出现「外层 button 里再套 button」—— 无效 HTML，点击会被报给外层
+    expect(panel).not.toMatch(/<button[^>]*>\s*(?:(?!\/button)[\s\S])*?<button/);
+  });
+
   it("左导航要有爆款库入口,并显示当前用的老师", () => {
     expect(wb).toMatch(/onOpenVault=\{openVault\}/);
     expect(wb).toMatch(/memoryIpName=\{memoryIpName\}/);
