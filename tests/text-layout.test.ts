@@ -123,4 +123,35 @@ describe("字幕 / 标题位置几何", () => {
     // 字幕 MarginV 同样按画面高度缩放
     expect(hermesGenerator).toMatch(/MarginV=\$\{Math\.round\(Number\(cs\.marginV\) \* \(h0 \/ 1920 \|\| 1\)\)\}/);
   });
+
+  it("预览必须和控件并排，不能叠在控件上方", () => {
+    /*
+     * 回归：预览原来在整个面板上方，控件在下方。
+     * 结果拖"位置"滑块时预览已经滚出屏幕，调完要往上滑一屏才看得到 ——
+     * 那就等于没有预览，用户还是不知道字落在哪儿。
+     * 反馈"放在这个位置不是很好调"说的正是这个。
+     *
+     * 判据：预览容器和两个样式面板必须是**兄弟**（flex 的左右两列），
+     * 而且预览那一列要 sticky，否则控件一长预览照样会被顶走。
+     */
+    const src = readFileSync("D:/GLB-NEW/src/renderer/src/components/FontStylePanel.tsx", "utf8");
+
+    // 左右分栏
+    expect(src).toMatch(/<div className="flex items-start gap-3">/);
+    // 预览列固定宽度 + 粘在顶部
+    expect(src).toMatch(/w-\[176px\] shrink-0 self-sticky top-0/);
+    // 控件列占据剩余空间
+    expect(src).toMatch(/min-w-0 flex-1/);
+
+    // 预览不许再出现在两个 section 之前（那正是原来"叠在上方"的写法）
+    const previewAt = src.indexOf("<TextLayoutPreview");
+    const captionAt = src.indexOf("字幕样式");
+    expect(previewAt).toBeGreaterThan(-1);
+    expect(captionAt).toBeGreaterThan(-1);
+    // 两者必须在同一个 flex 容器里：预览之后紧跟控件列的开标签
+    // （控件列的 class 是 "grid min-w-0 flex-1 ..."，grid 在前）
+    expect(src.slice(previewAt, previewAt + 400)).toMatch(
+      /<\/div>\s*<div className="grid min-w-0 flex-1/
+    );
+  });
 });

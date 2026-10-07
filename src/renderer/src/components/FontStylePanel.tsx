@@ -23,9 +23,12 @@ function TextLayoutPreview({
   title: TitleStyle;
   /** 素材画面高度，用来把 1920 基准的 px 值缩到真实比例 */
   frameHeight: number;
+  /** 预览宽度（px）。高度按 9:16 推出来，和素材真实比例无关 */
+  width?: number;
 }): React.JSX.Element {
-  // 预览本身固定 360 高，位置按百分比下，和实际尺寸无关
-  const H = 360;
+  const W = width ?? 176;
+  const H = Math.round(W / 0.5625);
+  // 位置按百分比下，和预览实际尺寸无关
   const geo = layoutFor(H, caption, title);
 
   const capColor = caption.color ?? "#FFFFFF";
@@ -34,18 +37,15 @@ function TextLayoutPreview({
   const ttlText = "标题出现在这里";
 
   return (
-    <div className="mb-2.5">
-      <div className="mb-1.5 flex items-center gap-2">
-        <LuEye className="h-3.5 w-3.5 text-mut-2" />
-        <span className="text-[12px] font-bold text-fg">位置示意</span>
-        <span className="text-[10px] text-mut-2">
-          按素材画面 {Math.round(frameHeight)}p 等比缩放 · 与成片一致
-        </span>
+    <div>
+      <div className="mb-1.5 flex items-center gap-1.5">
+        <LuEye className="h-3.5 w-3.5 shrink-0 text-mut-2" />
+        <span className="text-[11.5px] font-bold text-fg">位置示意</span>
       </div>
 
       <div
         className="relative mx-auto overflow-hidden rounded-lg border border-line bg-gradient-to-b from-panel-2 to-panel"
-        style={{ height: H, maxWidth: H * 0.5625 }}
+        style={{ height: H, width: W }}
         aria-label="字幕与标题位置示意"
       >
         {/* 三条参考线：顶部/中间/底部，方便判断"居中"到底偏不偏 */}
@@ -114,8 +114,8 @@ function TextLayoutPreview({
         </div>
       </div>
 
-      <p className="mt-1 text-center text-[9.5px] text-mut-2/80">
-        虚线是画面顶部 / 中间 / 底部。示意只反映位置与样式，最终以成片为准。
+      <p className="mt-1.5 text-[9.5px] leading-relaxed text-mut-2/80">
+        按素材画面 {Math.round(frameHeight)}p 等比缩放 · 与成片一致。虚线是画面顶部 / 中间 / 底部。
       </p>
     </div>
   );
@@ -247,10 +247,21 @@ export function FontStylePanel({
   const setT = (patch: Partial<TitleStyle>): void => onTitleChange({ ...t, ...patch });
 
   return (
-    <>
-      <TextLayoutPreview caption={c} title={t} frameHeight={previewHeight ?? REF_HEIGHT} />
+    /*
+     * 预览必须和控件**并排**，不能放在上面。
+     *
+     * 原来预览在上、控件在下，结果是：拖动"位置"滑块时，预览早就滚出屏幕了，
+     * 调完要往上滑一屏才能看到效果 —— 那就等于没有预览，用户还是不知道
+     * 字落在哪儿。反馈"放在这个位置不是很好调"说的正是这个。
+     *
+     * 所以左边一列固定（sticky），右边控件随便滚，永远能同时看见两边。
+     */
+    <div className="flex items-start gap-3">
+      <div className="w-[176px] shrink-0 self-sticky top-0">
+        <TextLayoutPreview caption={c} title={t} frameHeight={previewHeight ?? REF_HEIGHT} />
+      </div>
 
-      <div className="grid gap-2.5 sm:grid-cols-2">
+      <div className="grid min-w-0 flex-1 gap-2.5">
       {/* ---------- 字幕 ---------- */}
       <section className="rounded-xl border border-line bg-panel-2/40 p-3">
         <div className="mb-2.5 flex items-center gap-2">
@@ -432,6 +443,6 @@ export function FontStylePanel({
         </div>
       </section>
       </div>
-    </>
+    </div>
   );
 }
