@@ -8,7 +8,8 @@
 import type { BrowserWindow } from "electron";
 import { dialog } from "electron";
 import {
-  listIps, createIp, renameIp, deleteIp, restoreLastDeletedIp, listRestorableIps,
+  listIps, createIp, renameIp, deleteIp, restoreLastDeletedIp,
+listTrashItems, restoreTrashItem, purgeTrashItem, emptyTrash,
   listEntries, importEntries, undoBatch, deleteEntry, listBatches,
   rebuildProfile, getProfile, profileToBrief, attachSources
 } from "./vault";
@@ -203,10 +204,15 @@ export function registerVaultIpc(
   handle("hit:deleteIp", (ipId: string, toTrash?: boolean) => deleteIp(userData(), ipId, toTrash !== false));
   handle("hit:restoreIp", () => restoreLastDeletedIp(userData()));
   /*
-   * 回收站里能恢复什么 —— 界面提示要指名道姓，不能只说"恢复误删"。
-   * 用户看到的是"误删了什么可以恢复"，而不是猜这个按钮的边界。
+   * 回收站：能恢复什么、挑着恢复、彻底删除。
+   * 只有"恢复最近一个"是不够的 —— 之前删错了想回来看一眼，
+   * 却只能一路把最近的挨个恢复回来；而想清掉又完全没入口，
+   * 删进去的东西会永远堆着。
    */
-  handle("hit:listRestorableIps", () => listRestorableIps(userData()));
+  handle("hit:listTrashItems", () => listTrashItems(userData()));
+  handle("hit:restoreTrashItem", (trashDir: string) => restoreTrashItem(userData(), trashDir));
+  handle("hit:purgeTrashItem", (trashDir: string) => purgeTrashItem(userData(), trashDir));
+  handle("hit:emptyTrash", () => emptyTrash(userData()));
   handle("hit:listEntries", (ipId: string) => listEntries(userData(), ipId));
   handle("hit:import", (ipId: string, entries: HitEntry[]) => importEntries(userData(), ipId, entries ?? []));
   handle("hit:listBatches", (ipId: string) => listBatches(userData(), ipId));

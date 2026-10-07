@@ -18,7 +18,7 @@ import {
 LuArchive, LuArrowLeft, LuBrain, LuCheck, LuCloudDownload, LuFilePlus2, LuFolderOpen,
 LuLoaderCircle, LuRefreshCw, LuSettings, LuTrash2, LuUndo2, LuUsers, LuX
 } from "react-icons/lu";
-import type { HitCollection, HitEntry, HitProfile } from "@shared/api-types";
+import type { HitCollection, HitEntry, HitProfile, TrashItem } from "@shared/api-types";
 import { call } from "../lib/bridge";
 import { formatDurationCN } from "../lib/format";
 import { cx, Dot, Empty, Modal } from "./ui";
@@ -67,8 +67,8 @@ export function HitVaultPanel({ onClose, onOpenSettings, onPickIp, activeIpId }:
   /** 正在提交截图更正的那一条 */
   const [feedbackFor, setFeedbackFor] = useState<HitEntry | null>(null);
 
-  /** 回收站里能恢复的 IP 老师，按最近删除的在前 */
-  const [restorable, setRestorable] = useState<HitCollection[]>([]);
+  /** 回收站内容，按最近删除的在前 */
+  const [trash, setTrash] = useState<TrashItem[]>([]);
 
 /** 大数字缩写：12345 -> 1.2万，界面里 8 位数会把整行挤爆 */
 function formatCount(n?: number | null): string {
@@ -142,23 +142,78 @@ function hasRealPerformance(e: HitEntry): boolean {
    * 所以提示里必须把这条界线说清楚。
    *
    * 还要指名道姓当前能恢复谁：只说"有可恢复的内容"等于让用户自己猜，
-   * 不敢点。列表取主进程那份（和实际恢复的排序同一份实现）。
+   * 不敢点。
    */
   const restoreHint = useMemo(() => {
     const scope =
       "只恢复被删除的「IP 老师」文件夹和它的记忆库；" +
       "单条爆款被删除后不进这里，要用列表里的「撤回」按导入批次找回。";
-    if (restorable.length === 0) {
-      return `回收站里没有可恢复的 IP 老师。${scope}`;
+    if (trash.length === 0) {
+      return `回收站是空的。${scope}`;
     }
-    const top = restorable[0];
+    const top = trash[0];
     const head = `恢复最近删除的「${top.name}」` +
-      (Number(top.entryCount) > 0 ? `（原 ${top.entryCount} 条爆款）` : "（当时是空的）");
-    const more = restorable.length > 1
-      ? `回收站里还有 ${restorable.length - 1} 位，再点一次恢复下一位。`
+      (top.entryCount > 0 ? `（原 ${top.entryCount} 条爆款）` : "（当时是空的）");
+    const more = trash.length > 1
+      ? `回收站里还有 ${trash.length - 1} 位，点「回收站」可以挨个处理。`
       : "";
     return `${head}\n${scope}${more ? "\n" + more : ""}`;
-  }, [restorable]);
+  }, [trash]);
+
+  /** 回收站面板是否展开 */
+  const [trashOpen, setTrashOpen] = useState(false);
+  /** 待确认的彻底删除：null=无，trashDir=删这一项，"*"=清空全部 */
+  const [confirmPurge, setConfirmPurge] = useState<string | null>(null);
+
+  const purgeOne = async (trashDir: string): Promise<void> => {
+    setBusy("delete");
+    try {
+      const ok = await call((api) => api.hitPurgeTrashItem(trashDir));
+      setMsg(ok
+        ? { tone: "ok", text: "已彻底删除,找不回来了" }
+        : { tone: "warn", text: "没能删除(可能已被恢复),请刷新看看" });
+      await loadTrash();
+    } catch (err) {
+      setMsg({ tone: "warn", text: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setBusy(null);
+      setConfirmPurge(null);
+    }
+  };
+
+  const purgeAll = async (): Promise<void> => {
+    setBusy("delete");
+    try {
+      const n = await call((api) => api.hitEmptyTrash());
+      setMsg({ tone: "ok", text: `回收站已清空（${n} 项）,不可恢复` });
+      setTrashOpen(false);
+      await loadTrash();
+    } catch (err) {
+      setMsg({ tone: "warn", text: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setBusy(null);
+      setConfirmPurge(null);
+    }
+  };
+
+  const restoreOne = async (item: TrashItem): Promise<void> => {
+    setBusy("delete");
+    try {
+      const back = await call((api) => api.hitRestoreTrashItem(item.trashDir));
+      if (!back) {
+        setMsg({ tone: "warn", text: `没能恢复「${item.name}」,可能已被彻底删除` });
+      } else {
+        setCurrent(back.id);
+        setMsg({ tone: "ok", text: `已恢复「${back.name}」` });
+        await loadIps();
+      }
+      await loadTrash();
+    } catch (err) {
+      setMsg({ tone: "warn", text: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setBusy(null);
+    }
+  };
 
   const refreshAll = useCallback(async (): Promise<void> => {
     await loadIps();
@@ -166,21 +221,20 @@ function hasRealPerformance(e: HitEntry): boolean {
   }, [loadIps, loadIp, current]);
 
   /*
-   * 回收站内容要和「恢复误删」按钮的状态一起刷新。
-   * 删除/恢复都会改变可恢复列表，所以跟着 refreshAll 走，不单独开一条路径 ——
-   * 多一条刷新路径就多一处可能不同步。
+   * 回收站内容和「恢复误删」按钮的状态必须一起刷新。
+   * 删除/恢复/彻底删除都会改变它，所以每条路径后面都跟一次 loadTrash。
    */
-  const loadRestorable = useCallback(async (): Promise<void> => {
+  const loadTrash = useCallback(async (): Promise<void> => {
     try {
-      setRestorable(await call((api) => api.hitListRestorableIps()));
+      setTrash(await call((api) => api.hitListTrashItems()));
     } catch {
-      setRestorable([]);
+      setTrash([]);
     }
   }, []);
 
   useEffect(() => {
-    void loadRestorable();
-  }, [loadRestorable]);
+    void loadTrash();
+  }, [loadTrash]);
 
   /* ---------------- IP 档案操作 ---------------- */
 
@@ -236,27 +290,7 @@ function hasRealPerformance(e: HitEntry): boolean {
       setCurrent(null);
       await loadIps();
       // 刚删掉的就是现在最新可恢复的那条，提示要立刻跟上
-      await loadRestorable();
-    } catch (err) {
-      setMsg({ tone: "warn", text: err instanceof Error ? err.message : String(err) });
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const restoreIp = async (): Promise<void> => {
-    setBusy("delete");
-    try {
-      const back = await call((api) => api.hitRestoreIp());
-      if (!back) {
-        setMsg({ tone: "warn", text: "回收站里没有可恢复的 IP 老师" });
-        return;
-      }
-      setCurrent(back.id);
-      setMsg({ tone: "ok", text: `已恢复「${back.name}」` });
-      await loadIps();
-      // 恢复完列表就变了，提示必须跟着变，否则按钮还显示"可恢复 X"
-      await loadRestorable();
+      await loadTrash();
     } catch (err) {
       setMsg({ tone: "warn", text: err instanceof Error ? err.message : String(err) });
     } finally {
@@ -408,13 +442,14 @@ function hasRealPerformance(e: HitEntry): boolean {
             </button>
             <button
               type="button"
-              onClick={restoreIp}
-              disabled={busy !== null || restorable.length === 0}
+              onClick={() => setTrashOpen(true)}
+              disabled={busy !== null || trash.length === 0}
               title={restoreHint}
               className="flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-line px-3 py-2 text-[11.5px] font-semibold text-mut transition-colors hover:text-fg disabled:opacity-40"
             >
               <LuUndo2 className="h-3.5 w-3.5" />
               恢复误删
+              {trash.length > 0 && <span className="tabular font-mono">({trash.length})</span>}
             </button>
             {/*文案为什么改成这样（2026-10-06）：原来叫「把已分析结果写入记忆库」，和出片台的"按记忆重找爆款"撞在
               "爆款"两个字上，方向却相反 —— 这个是**写入**记忆库，那个是**读取**记忆。
@@ -541,6 +576,118 @@ function hasRealPerformance(e: HitEntry): boolean {
               );
             })}
           </div>
+
+          {/*
+            * 回收站。
+            *
+            * 为什么摆在这里常驻：删进去的东西原来永远出不来 ——
+            * 没有保留期、没有清空入口、界面上也看不见。
+            * 摆在 IP 列表正下方，"删了能捞回来、能彻底清掉"是一眼可见的事实，
+            * 而不是藏在某个按钮的悬停提示里。
+            *
+            * 只有 IP 老师会进这里：单条爆款删除是直接删文件，
+            * 那种靠「撤回」按导入批次找回。空的时候整块收起来，不占地方。
+            */}
+          {trash.length > 0 && (
+            <div className="shrink-0 rounded-lg border border-line/70">
+              <button
+                type="button"
+                onClick={() => setTrashOpen((v) => !v)}
+                className="flex w-full items-center gap-1.5 px-2.5 py-2 text-left text-[10.5px] font-bold text-mut transition-colors hover:text-fg"
+              >
+                <LuTrash2 className="h-3 w-3" />
+                回收站
+                <span className="tabular font-mono text-mut-2">({trash.length})</span>
+                <span className="ml-auto text-mut-2">{trashOpen ? "收起" : "展开"}</span>
+              </button>
+
+              {trashOpen && (
+                <div className="flex flex-col gap-1 border-t border-line/60 px-2 py-1.5">
+                  {trash.map((t) => (
+                    <div key={t.trashDir} className="flex items-center gap-1 rounded px-1 py-1">
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-[11px] font-semibold text-fg">{t.name}</div>
+                        <div className="text-[9.5px] text-mut-2">
+                          {t.entryCount > 0 ? `${t.entryCount} 条爆款` : "当时是空的"}
+                          {t.deletedAt && ` · ${new Date(t.deletedAt).toLocaleString("zh-CN", { hour12: false })}`}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={busy !== null}
+                        onClick={() => void restoreOne(t)}
+                        className="shrink-0 rounded border border-line px-1.5 py-0.5 text-[10px] font-semibold text-mut transition-colors hover:border-ember/50 hover:text-ember disabled:opacity-35"
+                      >
+                        恢复
+                      </button>
+                      {confirmPurge === t.trashDir ? (
+                        <>
+                          <button
+                            type="button"
+                            disabled={busy !== null}
+                            onClick={() => void purgeOne(t.trashDir)}
+                            className="shrink-0 rounded border border-bad/60 bg-bad/10 px-1.5 py-0.5 text-[10px] font-bold text-bad disabled:opacity-40"
+                          >
+                            确认彻底删
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmPurge(null)}
+                            className="shrink-0 rounded border border-line px-1.5 py-0.5 text-[10px] text-mut"
+                          >
+                            取消
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setConfirmPurge(t.trashDir)}
+                          className="shrink-0 rounded border border-line px-1.5 py-0.5 text-[10px] text-mut-2 transition-colors hover:border-bad/50 hover:text-bad"
+                        >
+                          彻底删
+                        </button>
+                      )}
+                    </div>
+                  ))}
+
+                  {/* 清空是破坏性的，必须二次确认，且说清不可逆 */}
+                  <div className="mt-0.5 border-t border-line/60 pt-1.5">
+                    {confirmPurge === "*" ? (
+                      <div className="flex flex-wrap items-center gap-1">
+                        <span className="text-[10px] font-semibold text-bad">
+                          彻底删除 {trash.length} 项,不可恢复,确定？
+                        </span>
+                        <button
+                          type="button"
+                          disabled={busy !== null}
+                          onClick={() => void purgeAll()}
+                          className="rounded border border-bad/60 bg-bad/10 px-1.5 py-0.5 text-[10px] font-bold text-bad disabled:opacity-40"
+                        >
+                          确定清空
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmPurge(null)}
+                          className="rounded border border-line px-1.5 py-0.5 text-[10px] text-mut"
+                        >
+                          取消
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={busy !== null}
+                        onClick={() => setConfirmPurge("*")}
+                        className="text-[10px] font-semibold text-mut-2 transition-colors hover:text-bad disabled:opacity-35"
+                      >
+                        清空回收站（{trash.length}）
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* ---------- 中:爆款条目 ---------- */}

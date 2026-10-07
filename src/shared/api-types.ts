@@ -638,6 +638,23 @@ export interface WatchStatus {
 /** ---------- 爆款记忆库(每个 IP 老师一个独立文件夹) ---------- */
 
 /** 一个 IP 老师 = 一个独立文件夹 */
+/**
+ * 回收站里的一项。
+ *
+ * 界面上要列出"删了还能捞回来什么"，而且每一项都要能单独恢复 / 彻底删除，
+ * 所以除了名字还得带回收站目录名来精确定位 —— 只给 name 的话，
+ * 改名前后各删一次会产生两个同名项，分不清点的是哪一个。
+ */
+export interface TrashItem {
+  name: string;
+  entryCount: number;
+  totalSec: number;
+  /** 删除时间（ISO）。来自目录名前缀的时间戳 */
+  deletedAt: string;
+  /** 回收站目录名，仅用于定位 */
+  trashDir: string;
+}
+
 export interface HitCollection {
   id: string;
   name: string;
@@ -1071,7 +1088,13 @@ export interface StudioApi {
   hitDeleteIp(ipId: string, toTrash?: boolean): Promise<boolean>;
   /** 恢复最近一次误删 */
   hitRestoreIp(): Promise<HitCollection | null>;
-  hitListRestorableIps(): Promise<HitCollection[]>;
+  hitListTrashItems(): Promise<TrashItem[]>;
+  /** 恢复回收站里指定的一项（按 trashDir 精确定位） */
+  hitRestoreTrashItem(trashDir: string): Promise<HitCollection | null>;
+  /** 彻底删除回收站里指定的一项 —— 不可逆 */
+  hitPurgeTrashItem(trashDir: string): Promise<boolean>;
+  /** 清空回收站 —— 不可逆，返回清掉几项 */
+  hitEmptyTrash(): Promise<number>;
 
   /** 某 IP 下的爆款条目 */
   hitListEntries(ipId: string): Promise<HitEntry[]>;

@@ -8,7 +8,7 @@
  *  3) 校准必须随数据叠加变化,撤掉后要跟着回去
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -16,7 +16,10 @@ import {
   listIps,
   deleteIp,
   restoreLastDeletedIp,
-  listRestorableIps,
+  listTrashItems,
+  restoreTrashItem,
+  purgeTrashItem,
+  emptyTrash,
   renameIp,
   importEntries,
   undoBatch,
@@ -328,13 +331,17 @@ describe("回收站列表要和实际恢复的那一个一致", () => {
     await new Promise((r) => setTimeout(r, 5));
     await deleteIp(root, b!.id, true);
 
-    const list = await listRestorableIps(root);
+    const list = await listTrashItems(root);
     expect(list.length).toBe(2);
     expect(list[0]!.name).toBe("后删的老师");
 
     const back = await restoreLastDeletedIp(root);
     expect(back?.name).toBe("后删的老师");
-    expect(back?.id).toBe(list[0]!.id);
+    // TrashItem 没有 id（界面靠 trashDir 定位），所以这里比名字和落盘结果
+    expect(back?.id).toBe(b!.id);
+    expect(existsSync(join(root, "hits", b!.id))).toBe(true);
+    // 恢复的正是列表里那一个，不是别的东西
+    expect((await listTrashItems(root)).map((i) => i.name)).toEqual(["先删的老师"]);
   });
 
   it("回收站里最新那项坏了不能连累下面还能恢复的", async () => {
@@ -357,7 +364,7 @@ describe("回收站列表要和实际恢复的那一个一致", () => {
     const newest = readdirSync(trash).sort().reverse()[0]!;
     writeFileSync(join(trash, newest, "collection.json"), "{ 这不是合法 JSON", "utf8");
 
-    const list = await listRestorableIps(root);
+    const list = await listTrashItems(root);
     expect(list.map((i) => i.name)).toEqual(["能恢复的老师"]);
 
     const back = await restoreLastDeletedIp(root);
@@ -367,7 +374,7 @@ describe("回收站列表要和实际恢复的那一个一致", () => {
 
   it("回收站为空时返回空数组，恢复返回 null", async () => {
     rmSync(join(root, "hits", ".trash"), { recursive: true, force: true });
-    expect(await listRestorableIps(root)).toEqual([]);
+    expect(await listTrashItems(root)).toEqual([]);
     expect(await restoreLastDeletedIp(root)).toBeNull();
   });
 
@@ -376,6 +383,102 @@ describe("回收站列表要和实际恢复的那一个一致", () => {
     rmSync(trash, { recursive: true, force: true });
     const gone = await createIp(root, "不可逆删除");
     await deleteIp(root, gone!.id, false);
-    expect(await listRestorableIps(root)).toEqual([]);
+    expect(await listTrashItems(root)).toEqual([]);
+  });
+});
+
+describe("回收站：挑着恢复、彻底删除、清空", () => {
+  const seed = async (names: string[]) => {
+    rmSync(join(root, "hits", ".trash"), { recursive: true, force: true });
+    const ids: string[] = [];
+    for (const n of names) {
+      const ip = await createIp(root, n);
+      ids.push(ip!.id);
+      await new Promise((r) => setTimeout(r, 5));
+      await deleteIp(root, ip!.id, true);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    return ids;
+  };
+
+  it("能只恢复指定的某一位，不是只能恢复最近那个", async () => {
+    await seed(["早的", "中的", "晚的"]);
+    const items = await listTrashItems(root);
+    expect(items.map((i) => i.name)).toEqual(["晚的", "中的", "早的"]);
+
+    const mid = items[1]!;
+    const back = await restoreTrashItem(root, mid.trashDir);
+    expect(back?.name).toBe("中的");
+    expect(existsSync(join(root, "hits", back!.id))).toBe(true);
+
+    // 恢复走的是"搬回目录"，回收站里就不该再有这一项
+    const after = await listTrashItems(root);
+    expect(after.map((i) => i.name)).not.toContain("中的");
+    expect(after.length).toBe(2);
+  });
+
+  it("彻底删除指定项，目录真没了", async () => {
+    await seed(["要留着的", "要彻底删的"]);
+    // 按名字挑，不靠顺序 —— seed 是先建先删，列表里最新的是最后删的那个
+    const items = await listTrashItems(root);
+    const target = items.find((i) => i.name === "要彻底删的")!;
+    expect(target).toBeDefined();
+
+    expect(await purgeTrashItem(root, target.trashDir)).toBe(true);
+    expect(existsSync(join(root, "hits", ".trash", target.trashDir))).toBe(false);
+    const left = await listTrashItems(root);
+    expect(left.map((i) => i.name)).toEqual(["要留着的"]);
+  });
+
+  it("彻底删除不接受越权路径：不能拿它删 hits/ 下的正经档案", async () => {
+    rmSync(join(root, "hits", ".trash"), { recursive: true, force: true });
+    // 正主必须是在线的 IP（seed 会把建好的都删进回收站，所以这里单独建）
+    const live = await createIp(root, "在线的老师");
+    expect(live).toBeDefined();
+    await seed(["回收站里的"]);
+
+    // 各种想逃出 .trash 的写法
+    for (const evil of [
+      "..",
+      "../" + live!.id,
+      "..\\" + live!.id,
+      "../../..",
+      join("hits", live!.id),
+      live!.id,
+      "",
+      "不存在的目录名"
+    ]) {
+      expect(await purgeTrashItem(root, evil), `不该允许删: ${evil}`).toBe(false);
+    }
+    // 正主还好好地在那儿，而且还在 IP 列表里
+    expect(existsSync(join(root, "hits", live!.id))).toBe(true);
+    expect((await listIps(root)).some((i) => i.id === live!.id)).toBe(true);
+  });
+
+  it("清空回收站，连恢复不了的残骸一起扫掉", async () => {
+    await seed(["一位", "二位"]);
+    // 造一个没有 collection.json 的残骸：恢复不了，但会一直占着盘
+    const junk = join(root, "hits", ".trash", "1700000000000-残骸");
+    mkdirSync(junk, { recursive: true });
+    writeFileSync(join(junk, "collection.json"), "坏掉", "utf8");
+
+    const n = await emptyTrash(root);
+    expect(n).toBe(3);   // 两位老师 + 一份残骸
+    expect(await listTrashItems(root)).toEqual([]);
+    expect(existsSync(junk)).toBe(false);
+  });
+
+  it("清空空回收站不会报错（本来就没东西可清）", async () => {
+    rmSync(join(root, "hits", ".trash"), { recursive: true, force: true });
+    expect(await emptyTrash(root)).toBe(0);
+  });
+
+  it("列表项带 trashDir 和删除时间，界面才能精确定位并说清什么时候删的", async () => {
+    await seed(["带信息的"]);
+    const item = (await listTrashItems(root))[0]!;
+    expect(item.name).toBe("带信息的");
+    expect(item.trashDir).toMatch(/^\d+-带信息的$/);
+    expect(Number.isFinite(Date.parse(item.deletedAt))).toBe(true);
+    expect(typeof item.entryCount).toBe("number");
   });
 });

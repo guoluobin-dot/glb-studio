@@ -19,9 +19,9 @@
  */
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile, appendFile, copyFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join, extname, resolve } from "node:path";
+import { join, extname, resolve, basename, sep } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { HitCollection, HitEntry, HitProfile, HitImportResult } from "@shared/api-types";
+import type { HitCollection, HitEntry, HitProfile, HitImportResult, TrashItem } from "@shared/api-types";
 
 const MEDIA_EXT = new Set([".mp4", ".mkv", ".mov", ".webm", ".avi", ".flv"]);
 
@@ -187,23 +187,89 @@ async function readTrashItems(
 }
 
 /**
- * 回收站里能恢复什么（界面提示用）。
+ * 回收站里有什么（界面列表用）。
  *
- * 顺带说清边界：这个按钮只管**被删除的 IP 老师**（连同它整个文件夹和记忆库）。
+ * 顺带说清边界：回收站只管**被删除的 IP 老师**（连同它整个文件夹和记忆库）。
  * 单条爆款用 deleteEntry 删掉时是直接 rm、不进回收站，那种只能靠"按批撤回"。
- * 界面上这两件事长得都不像"删除"，所以提示里必须讲明白。
+ * 界面上这两件事长得都不像"删除"，所以界面上必须讲明白。
  */
-export async function listRestorableIps(userData: string): Promise<HitCollection[]> {
+export async function listTrashItems(userData: string): Promise<TrashItem[]> {
+  const root = join(rootOf(userData), ".trash");
   const items = await readTrashItems(userData);
-  return items.map((i) => i.saved);
+  return items.map(({ saved, dir }) => {
+    const ms = Number(/^(\d+)-/.exec(basename(dir))?.[1] ?? NaN);
+    return {
+      name: saved.name,
+      entryCount: Number(saved.entryCount) || 0,
+      totalSec: Number(saved.totalSec) || 0,
+      deletedAt: Number.isFinite(ms) ? new Date(ms).toISOString() : "",
+      trashDir: basename(dir)
+    };
+  });
+}
+
+/** 按回收站目录名彻底删除一项（不可逆） */
+export async function purgeTrashItem(userData: string, trashDir: string): Promise<boolean> {
+  const root = join(rootOf(userData), ".trash");
+  /*
+   * trashDir 来自界面，理论上可以被构造成 "../../.."。
+   * 这里解析后必须确认它还在 .trash 里面，不能让一条记录把
+   * hits/ 下别的 IP 目录连根端掉 —— 那是不可逆的数据丢失。
+   */
+  const target = resolve(root, trashDir);
+  const inside = target.startsWith(root + sep);
+  if (!inside || basename(target) !== trashDir) return false;
+  if (!(await readJson(join(target, "collection.json"), null))) return false;
+  await rm(target, { recursive: true, force: true });
+  return true;
+}
+
+/** 清空回收站（不可逆） */
+export async function emptyTrash(userData: string): Promise<number> {
+  const root = join(rootOf(userData), ".trash");
+  if (!existsSync(root)) return 0;
+  const items = await readTrashItems(userData);
+  let n = 0;
+  for (const { dir } of items) {
+    await rm(dir, { recursive: true, force: true });
+    n++;
+  }
+  // 顺带把没有 collection.json 的残骸也扫掉：它们恢复不了、也删不掉，
+  // 留着就是永久垃圾
+  const left = (await readdir(root, { withFileTypes: true })).filter((d) => d.isDirectory());
+  for (const d of left) {
+    await rm(join(root, d.name), { recursive: true, force: true });
+    n++;
+  }
+  return n;
+}
+
+/** 恢复指定的一项（按回收站目录名） */
+export async function restoreTrashItem(userData: string, trashDir: string): Promise<HitCollection | null> {
+  const items = await readTrashItems(userData);
+  const hit = items.find((i) => basename(i.dir) === trashDir) ?? null;
+  if (!hit) return null;
+  return restoreOne(userData, hit.saved, hit.dir);
 }
 
 /** 恢复误删的 IP(从 .trash 里找最近一次) */
 export async function restoreLastDeletedIp(userData: string): Promise<HitCollection | null> {
   const target = (await readTrashItems(userData))[0];
   if (!target) return null;
-  const { saved, dir } = target;
+  return restoreOne(userData, target.saved, target.dir);
+}
 
+/**
+ * 把回收站里某一项搬回它自己的 IP 目录。
+ *
+ * 恢复和"恢复最近一个"共用它 —— 界面上既能一键恢复最新的，
+ * 也能挑着恢复某一位，两条路径的落地行为必须一致。
+ */
+async function restoreOne(
+  userData: string,
+  saved: HitCollection,
+  dir: string
+): Promise<HitCollection | null> {
   // 目标目录必须先不存在。
   // 以前这里先 mkdir 再 rename,Windows 上 rename 目录进已存在的目录会直接失败,
   // 于是 catch 掉 return null —— 界面表现为"点了恢复没反应",回收站里的东西永远回不来。

@@ -2646,17 +2646,16 @@ it("「用这套记忆」必须贴在 IP 卡片旁边，不能再埋在画像栏
      * 提示还要指名当前能恢复谁（restorable[0]），
      * 只说"有可恢复的"等于让用户猜、不敢点。
      */
-    const code = stripComments(panel);
-    expect(code).toContain("hitListRestorableIps");
+const code = stripComments(panel);
+    expect(code).toContain("hitListTrashItems");
     expect(code).toContain("const restoreHint = useMemo");
-    expect(code).toMatch(/restorable\.length === 0/);
+    expect(code).toMatch(/trash\.length === 0/);
     // 界面上得真的把提示接到按钮的 title 上
     expect(code).toMatch(/title=\{restoreHint\}/);
     // 回收站空了就别让用户点了个寂寞
-    expect(code).toMatch(/disabled=\{busy !== null \|\| restorable\.length === 0\}/);
+    expect(code).toMatch(/disabled=\{busy !== null \|\| trash\.length === 0\}/);
     // 恢复完/删完都要刷新列表，否则提示停在旧状态
-    const code2 = stripComments(panel);
-    expect((code2.match(/loadRestorable\(\)/g) ?? []).length).toBeGreaterThanOrEqual(3);
+    expect((code.match(/loadTrash\(\)/g) ?? []).length).toBeGreaterThanOrEqual(3);
   });
 
   it("主进程里列回收站和执行恢复必须共用同一份排序", () => {
@@ -2664,8 +2663,42 @@ it("「用这套记忆」必须贴在 IP 卡片旁边，不能再埋在画像栏
     // 用户分不清是提示错了还是恢复错了。
     const v = read("src/main/vault.ts");
     expect(v).toMatch(/async function readTrashItems/);
-    expect(v).toMatch(/listRestorableIps[\s\S]{0,200}readTrashItems/);
+    
     expect(v).toMatch(/restoreLastDeletedIp[\s\S]{0,400}readTrashItems\(userData\)\)\[0\]/);
+  });
+
+  it("回收站必须看得见、可挑着恢复、可彻底删除", () => {
+    /*
+     * 问的是"那他什么时候彻底删除呢"—— 答案原来是"永远不会"：
+     * 没有保留期、没有清空入口、界面上也看不见，
+     * 删进去的东西只有被恢复才会消失，越删越堆。
+     *
+     * 所以回收站要常驻可见（不是藏在悬停提示里），每一项都能单独
+     * 恢复或彻底删，顶部还有全部清空。破坏性操作一律二次确认。
+     */
+    const code = stripComments(panel);
+    expect(code, "回收站面板要常驻").toContain("回收站");
+    expect(code).toContain("hitListTrashItems");
+    expect(code).toContain("hitRestoreTrashItem");
+    expect(code).toContain("hitPurgeTrashItem");
+    expect(code).toContain("hitEmptyTrash");
+    // 破坏性操作必须有确认步骤
+    expect(code).toContain("confirmPurge");
+    expect(code).toMatch(/确认彻底删/);
+    expect(code).toMatch(/确定清空/);
+    // 清空要说明不可逆
+    expect(code).toMatch(/不可恢复/);
+  });
+
+  it("彻底删除在主进程里必须校验路径没逃出回收站", () => {
+    // trashDir 来自界面，理论上能被构造成 "../../.."。
+    // 一条回收站记录能删掉 hits/ 下的正经档案，那是不可逆的数据丢失。
+    const v = read("src/main/vault.ts");
+    expect(v).toMatch(/export async function purgeTrashItem/);
+    expect(v).toMatch(/target\.startsWith\(root \+ sep\)/);
+    expect(v).toMatch(/basename\(target\) !== trashDir/);
+    // 残留（没有 collection.json 的）也要能被清空扫掉，否则是永久垃圾
+    expect(v).toMatch(/export async function emptyTrash/);
   });
 
   it("左导航要有爆款库入口,并显示当前用的老师", () => {
