@@ -31,7 +31,20 @@ const store = new MemoryStore({ memory: { dbPath: `${REL}/t.db`, similarityThres
 
 test.after(() => {
   try { store.close?.(); } catch { /* ignore */ }
-  try { rmSync(join(join(import.meta.dirname, "..", "..", "..", "..", REL)), { recursive: true, force: true }); }
+  /*
+   * 这里原来多跳了一层目录，临时库从来没被删掉。
+   *
+   * store.js 是按 Hermes 根解析相对 dbPath 的，Hermes 根 = src/memory 上溯 3 级；
+   * 而这里从 src/memory/__tests__ 上溯了 4 级，落到 Hermes 的**父目录**，
+   * 于是 rmSync 删的是 <GLB_ROOT>/data\.tmp-test-bind-<pid>，
+   * 真正写的却是 <GLB_ROOT>/Hermes\data\.tmp-test-bind-<pid> —— 永远删不到。
+   * 后果不是"多点垃圾"，而是这类残留会跨测试残留：
+   * 同一个 pid 复用时读到旧状态，用例间互相串扰，
+   * 表现为"偶发失败"，而且极难查（谁也想不到是上个进程留下的）。
+   *
+   * 别再靠数 .. 了，直接用 run 脚本里的 Hermes 根推导方式对齐 store.js。
+   */
+  try { rmSync(join(import.meta.dirname, "..", "..", "..", REL), { recursive: true, force: true }); }
   catch { /* ignore */ }
 });
 
@@ -95,11 +108,20 @@ test("反斜杠路径能查到同一条", () => {
 
 test("getCollection* 支持显式传归属，不吃全局", () => {
   // 真正生效的判断依据：显式传 collection 时结果必须和全局无关
-  store.activeCollection = "王老师";
-  const zhuliao = store.getCollectionThemeKeywords("案例老师", 50);
-  const wang = store.getCollectionThemeKeywords("王老师", 50);
-  assert.notEqual(zhuliao === wang, undefined); // 都能查，不抛
-  store.activeCollection = null;
+  //
+  // 复位必须放 finally：activeCollection 是 store 上的全局字段，
+  // 原来直接写在末尾，中间的断言一抛它就永远停在"王老师"，
+  // 后面每个用例都读到污染过的状态 —— 表现为"某个用例偶发失败"，
+  // 而且失败点跟真正的原因八竿子打不着。
+  const saved = store.activeCollection;
+  try {
+    store.activeCollection = "王老师";
+    const zhuliao = store.getCollectionThemeKeywords("案例老师", 50);
+    const wang = store.getCollectionThemeKeywords("王老师", 50);
+    assert.notEqual(zhuliao === wang, undefined); // 都能查，不抛
+  } finally {
+    store.activeCollection = saved;
+  }
 });
 
 /* ────────────────────────────────────────────
