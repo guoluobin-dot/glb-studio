@@ -21,8 +21,8 @@ import { applyHotwords } from './hotwords.js';
  * 设置本次要套用的热词规则。
  *
  * 为什么用 setter 而不是每次传参：
- * loadTranscript 被几十处调用（review-packet、分析、字幕、爆点匹配…），
- * 逐个加参数必然漏；而漏一处就意味着"字幕改了、审阅台没改"这种鬼故事。
+ * loadTranscript 被几十处调用（review approve 学习、分析、字幕、爆点匹配…），
+ * 逐个加参数必然漏；而漏一处就意味着"字幕改了、记忆没跟上"这种鬼故事。
  * 设置一次、全部读点自动生效，是唯一能保证一致的做法。
  *
  * 用 module 级状态而不是 store：editable-text 是纯函数模块，
@@ -32,9 +32,8 @@ let activeHotwords = [];
 export function setHotwords(rules) {
   activeHotwords = Array.isArray(rules) ? rules : [];
 }
-export function getHotwords_() {
-  return activeHotwords;
-}
+// 原来还有 getHotwords_()，是打回时的文本级删除用来读当前热词的。
+// 打回链路删除后全仓库无人调用，随之移除。
 
 /**
  * 读这条直播的逐句稿（含起止时间），失败返回空数组
@@ -85,7 +84,7 @@ export function loadTranscript(asrPath, rules) {
  * @param {number} toSec 结束秒
  * @returns {Array<{startMs,endMs,text}>} 相对范围的首尾（便于按比例插值）
  */
-export function sentencesInRange(transcript, fromSec, toSec) {
+function sentencesInRange(transcript, fromSec, toSec) {
   // 入参是"秒"，转成毫秒再和 ASR 的时间戳比。
   //
   // 这里必须各自独立换算。以前写成 b = Math.max(a, toSec * 1000)，
@@ -170,34 +169,6 @@ function totalSpan(sentences) {
   const last = sentences[sentences.length - 1];
   return Math.max(0, (last?.endMs ?? 0) - (sentences[0]?.startMs ?? 0));
 }
-
-/**
- * 段里几乎没有文本时，返回一个"这是实操演示"的占位说明。
- *
- * 为什么需要：教学直播里大量片段是老师现场演示、弹琴、唱歌，
- * ASR 只能识别出零星几个字（"好的"、"来"、"一二三"）甚至完全静音。
- * 这种段如果只显示空白，用户会以为功能坏了；
- * 而它恰恰是最该保留的（实操教学通常是爆点核心）。
- *
- * @returns {{textless:boolean, hint:string}} textless=true 时让界面改成时间区间块
- */
-export function describeTextless(sentences, spanSec) {
-  const chars = sentences.reduce((n, s) => n + s.text.replace(/\s/g, '').length, 0);
-  const speech = sentences.reduce((n, s) => n + (s.endMs - s.startMs), 0) / 1000;
-  // 判据：字太少，或"说话密度"极低（每分钟不到 4 个字）
-  const density = speech > 0 ? chars / (speech / 60) : 0;
-  if (chars < 8 || density < 4) {
-    return {
-      textless: true,
-      hint: chars === 0
-        ? '这段没有识别到文字，多半是现场演示/演唱'
-        : `这段只有 ${chars} 个字（说话很少），多半是现场演示`,
-      spanSec: Math.max(0, Math.round(Number(spanSec) || 0))
-    };
-  }
-  return { textless: false, hint: '', chars, speech: Math.round(speech * 10) / 10 };
-}
-
 /**
  * 把"某段文本里的字符区间"换算成"原素材的绝对时间区间"。
  *
@@ -330,18 +301,16 @@ export function normalizeRanges(ranges) {
   }
   return out;
 }
-
-/** 一段里被剪掉的总时长（毫秒） */
-export function removedMs(ranges) {
-  return normalizeRanges(ranges).reduce((n, r) => n + (r.en - r.st), 0);
-}
-
 export default {
   loadTranscript,
-  sentencesInRange,
   buildEditableText,
-  describeTextless,
   charRangeToTime,
   normalizeRanges,
-  removedMs
 };
+/*
+  sentencesInRange 不再导出：它只有 buildEditableText 内部在用
+  （行 135），原先是打回的文本级删除要拿它。收成内部函数后，
+  既不会被外部误用，也不会在 default 里挂一个非导出名。
+  注意 node --check 查不出这种错 —— 它只做语法检查，
+  引用一个未导出的名字要到运行时才报，所以改完必须真跑测试。
+*/

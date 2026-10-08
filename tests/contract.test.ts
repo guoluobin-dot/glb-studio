@@ -1458,14 +1458,23 @@ it("秒/毫秒换算的括号不能错", () => {
     expect(et).toMatch(/入参单位可能不是秒/);
   });
 
-  it("无/少文本的实操教学段要能识别出来", () => {
-    // 教学直播里大量片段是现场演示、弹琴、唱歌，ASR 只能识别零星几个字。
-    // 这种段恰恰通常是要保留的爆点核心，给它一个空文本框用户只会以为功能坏了。
-    const et = readFileSync(hermesFile("src/analyzer/editable-text.js"), "utf8");
-    expect(et).toMatch(/export function describeTextless/);
-    expect(et).toMatch(/多半是现场演示/);
-    expect(et).toMatch(/density < 4/);
-  });
+  /*
+    「无/少文本的实操教学段要能识别出来」这条已删。
+
+    describeTextless() 的唯一调用方是被删除的粗剪审片面板 ——
+    它存在的意义是"审片时把实操段显示成时间区间块而不是空文本框"，
+    面板没了之后这个函数也无人调用，随之删除。
+
+    判断它该跟着面板一起走，而不是留在那儿备着：
+      1) 全 src/ 无任何调用方（不只前端，Hermes 里也没有）
+      2) 它输出的是界面提示文案（"多半是现场演示"），
+         属于展示层而不是分析逻辑，留着不会影响任何分析结果
+      3) 真要恢复某个功能，git 历史里有完整实现，
+         不需要靠一份没人调用的死代码"备着"
+
+    留着反而有害：它是 export，下一个人会以为实操段识别还在工作，
+    而实际上界面已经没有任何入口会调它。
+  */
 
   it("analysis_health 传对象也要能正确落库", () => {
     // 真实 bug：upsertLiveVideo 用 String(data.analysisHealth) 规范化，
