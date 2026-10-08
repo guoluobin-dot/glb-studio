@@ -85,12 +85,17 @@ const api: StudioApi = {
     ipcRenderer.invoke("algo:cancelDetect", filePath) as Promise<{ ok: boolean; aborted: boolean }>,
   rerank: (fileName, durationMode, candidates) =>
     ipcRenderer.invoke("algo:rerank", fileName, durationMode, candidates) as Promise<{ candidates: ClipCandidate[]; summary: string }>,
-  reviewPacket: (projectId) => ipcRenderer.invoke("algo:reviewPacket", projectId) as Promise<ReviewPacket>,
+  /*
+    reviewPacket 一并删了：它只被粗剪审片面板用，面板已移除。
+    submitReview 保留，但只发 approve —— 打回/重剪那条链路已经删掉。
+  */
   submitReview: (projectId, payload) =>
     ipcRenderer.invoke("algo:submitReview", projectId, payload) as Promise<{
       ok: boolean;
-      newProjectId?: number;
+      projectId?: number;
       status?: string;
+      learned?: number;
+      learnFailed?: string | null;
     }>,
 
   // 剪辑学习样本 + IP 老师档案（学习闭环的读写口）

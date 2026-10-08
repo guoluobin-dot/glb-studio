@@ -294,12 +294,14 @@ export class MemoryStore {
         answered_at TEXT
       );
 
-      -- Review feedback: user approves or sends back for re-cut, becomes memory
+      -- Review feedback: user approves (or a highlight candidate is rejected), becomes memory
+      -- 表结构与索引保持不变：approve 学习闭环与 getCollectionAvoidRules() 仍依赖它，
+      -- 且库里已有 decision='recut' 的历史行需要继续可读。
       CREATE TABLE IF NOT EXISTS review_feedback (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         clip_project_id INTEGER REFERENCES clip_projects(id),
         live_video_id INTEGER,
-        decision TEXT NOT NULL,        -- approve / recut
+        decision TEXT NOT NULL,        -- approve / recut（粗剪审片打回已下线，recut 现仅来自桌面端爆点候选否决 + 历史数据）
         segment_ids TEXT,              -- JSON array of concerned live_segment ids
         comment TEXT NOT NULL,
         created_at TEXT DEFAULT (datetime('now'))
@@ -792,7 +794,13 @@ export class MemoryStore {
       .filter((r) => r.theme);
   }
 
-  /** 某集合下被"打回"的意见（用户明确说不要的） */
+  /**
+   * 某集合下被"打回"的意见（用户明确说不要的）。
+   *
+   * 保留：这是学习闭环的一环（live-analyzer 拿它注入"避雷"）。
+   * 粗剪审片的打回重剪已下线，但桌面端爆点候选否决（/highlight/reject）
+   * 仍写 decision='recut'，加上库里的历史行，这里必须继续读。
+   */
   getCollectionAvoidRules(collection, limit = 20) {
     const name = String(collection || '').trim();
     if (!name) return [];
@@ -1418,7 +1426,8 @@ export class MemoryStore {
   /**
    * 按 id 取段，不过滤 status。
    *
-   * 用途：审片打回要按工程里记的 segmentId 找回段。
+   * 用途：按工程里记的 segmentId 找回段（orchestrator._segmentsByIndex）。
+   * 打回重剪已下线，但 /pipeline/clip 与 /pipeline/set-selection 仍走这条回捞。
    *
    * 为什么不能只靠 getLiveSegmentsByVideo：它只返回 draft。
    * 而一场直播重分析后，旧段会被标成 superseded（同一条视频、起止时间没变，

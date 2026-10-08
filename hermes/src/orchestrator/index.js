@@ -22,8 +22,11 @@ import { HitAnalyzer } from '../analyzer/hit-analyzer.js';
 import { SentenceCutter } from '../analyzer/sentence-cutter.js';
 import { DeepAnalyzer } from '../analyzer/deep-analyzer.js';
 import { LiveAnalyzer } from '../analyzer/live-analyzer.js';
-import { loadTranscript, buildEditableText, describeTextless, charRangeToTime, normalizeRanges } from '../analyzer/editable-text.js';
-import { buildLearningRecord } from '../analyzer/review-learning.js';
+// 打回重剪链路已下线：describeTextless / charRangeToTime / normalizeRanges 只服务于
+// 审片台（review-packet）与打回分支的 textCuts，两处都已删除，故不再引入。
+// review-learning.js 的 buildLearningRecord 同样只有打回分支调用（见下方删除说明），
+// approve 分支自己拼 rows，不经过它。
+import { loadTranscript, buildEditableText } from '../analyzer/editable-text.js';
 import { Clipper } from '../clipper/index.js';
 import { ContentGenerator } from '../generator/index.js';
 import { UserQuery } from '../query/index.js';
@@ -791,6 +794,12 @@ export class Orchestrator {
     return this.store._ownerOfLive(liveVideoId);
   }
 
+  /**
+   * 打回重剪链路已下线，但这个方法整体保留：
+   * 它由 /pipeline/clip（用户勾选）与 /pipeline/set-selection 共用，
+   * 里面的 byId/byIndex 双键映射、superseded 段回捞、cuts 夹紧都是出片共用逻辑，
+   * 不是打回专属，因此不删。
+   */
   _segmentsByIndex(liveVideoId, segmentIds, cutsByIndex) {
     const all = this.store.getLiveSegmentsByVideo(Number(liveVideoId)) || [];
     // id 和 segment_index 都建表，两者都能查到。
@@ -1138,7 +1147,7 @@ export class Orchestrator {
         // 这个端点返回的是整场直播的全部分段（3 小时直播能到 200+ 段），
         // 每段再拼上完整文本会让响应体膨胀到几 MB ——
         // 而它的调用方（超时回读）只需要段数和时间轴。
-        // 逐句原文只在 review-packet 里给，那是"精修单条粗剪"才需要的量级。
+        // 逐句原文只在 approve 分支自己读稿时按需取，不在这个回读端点里给。
         res.json({
           ok: true,
           liveVideoId: vid,
@@ -1308,159 +1317,13 @@ this.app.post('/pipeline/set-selection', this.requireWriteAuth, async (req, res)
       }
     });
 
-    /**
-     * 审片包：把"粗剪 + 段映射 + 历史意见"一次给全。
+    /*
+     * GET /projects/:id/review-packet 已删除（打回重剪链路下线）。
      *
-     * 为什么单独开一个端点，而不是让桌面端自己去拼：
-     *  - 粗剪文件路径以前只混在 clip() 的返回里，桌面端默认看不到它
-     *    （包装选项一开就被 deliver 覆盖），于是"审片"根本无从下手；
-     *  - 粗剪时间轴从 0 开始，段落信息却来自原素材，两套坐标必须由服务端
-     *    换算好。桌面端自己算要复刻一遍拼接顺序的逻辑，早晚会和这里不一致；
-     *  - 审片历史也只有服务端有。
+     * 它只服务"审片台"这一套交互：粗剪时间轴映射 + 可框选的逐句原文 +
+     * 历史评审记录。审片台随打回/重剪一起下线，端点没有其他调用方
+     * （approve 分支走 buildEditableText 自己读稿，不经过这里）。
      */
-    this.app.get('/projects/:id/review-packet', this.requireReadAuth, (req, res) => {
-      try {
-        const id = parseInt(req.params.id);
-        const project = this.store.getClipProject(id);
-        if (!project) return res.status(404).json({ error: '项目不存在' });
-
-        // 段映射：selected_segments 已按角色排好序，粗剪就是这个顺序拼起来的，
-        // 所以按顺序累加时长就是每段在粗剪里的位置。
-        //
-        // 注意 getClipProject() 已经把 selected_segments JSON.parse 成数组了，
-        // 这里再 parse 一次会抛错、被 catch 吞掉，结果所有工程都返回 0 段 ——
-        // 而且不报错，只表现为"这个工程没有段落"。
-        let segs = project.selected_segments;
-        if (typeof segs === 'string') {
-          try { segs = JSON.parse(segs); } catch { segs = []; }
-        }
-        if (!Array.isArray(segs)) segs = [];
-
-        // selected_segments 里只有 segmentId，没有段序号。
-        // 而界面要显示"第 N 段"、打回也要能指名道姓 —— 这里按 id 反查真实的 segment_index。
-        // （之前直接拿 segmentId 当序号用，界面上会显示成"第 1115 段"。）
-        const indexById = new Map();
-        try {
-          for (const row of (this.store.getLiveSegmentsByVideo(project.live_video_id) || [])) {
-            if (row && row.id !== undefined && row.id !== null) indexById.set(Number(row.id), row.segment_index);
-          }
-        } catch { /* 反查失败就退回按顺序编号 */ }
-
-        const map = [];
-        let cursor = 0;
-        // 逐句原文：审片台要"像编辑文本框一样框选几个字删掉"，
-        // 而 selected_segments 里只有主题名和时间轴 —— 没有文本就没有东西可选。
-        // 一次只取这条粗剪涉及的句子，不是整场，所以响应体可控。
-        const liveRow = this.store.db
-          .prepare('SELECT asr_path FROM live_videos WHERE id = ?')
-          .get(project.live_video_id);
-        /*
-         * 热词在读逐句稿之前先套上。
-         *
-         * 这一句是整个热词功能的**全部实现**：只要 loadTranscript 出口是对的，
-         * 审片台文案、打回重剪、分析提示词、成片字幕就都是对的。
-         * 之前我把热词做成"给 UI 一个列表自己替换"，
-         * 结果已存的项目要等重新分析才生效 —— 而用户要的是"改完立即生效"。
-         */
-        // 规则跟着这条直播走，不依赖全局状态（原来这里还重复调了一次）
-        const transcript = loadTranscript(
-          liveRow?.asr_path,
-          this.store.getHotwords(this._collectionOfLiveVideo(project.live_video_id))
-        );
-
-        for (const s of segs) {
-          const start = Number(s.startMs ?? 0) / 1000;
-          const end = Number(s.endMs ?? 0) / 1000;
-          /*
-           * 粗剪里的实际时长 = cuts 剩下的子区间之和，不是整段时长。
-           *
-           * 2026-10-05 修：以前直接用 end-start 累加 cursor，
-           * 而 clip() 拼接的只是 cuts 的子区间（clipper 里就是按 seg.cuts 切的）。
-           * 于是一个"删了中间 25 秒"的段，在真实文件里只有 35 秒，
-           * 但这里报成 60 秒 —— 后面所有段的粗剪位置都偏了。
-           *
-           * 后果全是用户可见的：审片台会把播放中的画面标成错误的段、
-           * 点某一行会 seek 到错的位置、标题里的"粗剪 100.0s"其实只有 75s。
-           * generator 那边早就按 cuts 累加过（见 generator/index.js 的 segDurationMs），
-           * 只有这里没跟上。
-           */
-          const roughcutDur = (() => {
-            if (Array.isArray(s.cuts) && s.cuts.length) {
-              const sum = s.cuts.reduce(
-                (a, c) => a + Math.max(0, (Number(c.en) - Number(c.st)) / 1000),
-                0
-              );
-              // cuts 全废（越界/为零）时退回整段，避免算出 0 时长把后面全挤在一起
-              return sum > 0 ? sum : Math.max(0, end - start);
-            }
-            return Math.max(0, end - start);
-          })();
-          const dur = roughcutDur;
-          const editable = buildEditableText(transcript, start, end);
-          const tl = describeTextless(editable.sentences, dur);
-          map.push({
-            // selected_segments 里存的是 segmentId（live_segments.id），没有 segment_index。
-            // 写 segmentIndex 会全部变成 0，界面上每段都显示成"第 0 段"，
-            // 点名打回也会指向错的段 —— 所以这里用 segmentId 作主键。
-            segmentId: s.segmentId ?? null,
-            segmentIndex: s.segmentId != null && indexById.has(Number(s.segmentId))
-              ? Number(indexById.get(Number(s.segmentId)))
-              : map.length + 1,
-            themeName: String(s.themeName || ''),
-            role: s.role || '',
-            hookQuality: s.hookQuality ?? null,
-            score: s.hookQuality != null ? Math.round(Number(s.hookQuality) * 100) : null,
-            roughcutStartSec: Number(cursor.toFixed(3)),
-            roughcutEndSec: Number((cursor + dur).toFixed(3)),
-            sourceStartSec: start,
-            sourceEndSec: end,
-            // 可编辑原文（按句切开，句间用空格连接）
-            text: editable.text,
-            sentences: editable.sentences,
-            // 实操教学段：几乎没有文字。这类段界面要显示成时间区间块而不是文本框 ——
-            // 给它一个空文本框，用户只会以为功能坏了，而它恰恰通常是要保留的核心内容。
-            textless: tl.textless,
-            textlessHint: tl.hint,
-            // 已经剪掉的区间（来自上一次打回），界面上要显示成删除线
-            cuts: Array.isArray(s.cuts) ? s.cuts : []
-          });
-          cursor += dur;
-        }
-
-        // 粗剪路径：优先用工程目录里现成的，兼容只有 output_path 的老数据
-        let roughcutPath = '';
-        try {
-          const dir = this.clipper?.draftDir ? join(this.clipper.draftDir, `project_${id}`) : '';
-          if (dir && existsSync(dir)) {
-            const hit = readdirSync(dir).find((f) => /roughcut\.mp4$/i.test(f));
-            if (hit) roughcutPath = join(dir, hit);
-          }
-        } catch { /* 拿不到就让前端回退到原始素材播放 */ }
-
-        let feedback = [];
-        try { feedback = this.store.getFeedbackByProject(id) || []; } catch { /* ignore */ }
-
-        res.json({
-          ok: true,
-          projectId: id,
-          status: project.status,
-          liveVideoId: project.live_video_id,
-          roughcutPath,
-          segments: map,
-          totalSec: Number(cursor.toFixed(3)),
-          feedback: feedback.map((f) => ({
-            id: f.id,
-            decision: f.decision,
-            comment: f.comment,
-            segmentIds: f.segment_ids,
-            createdAt: f.created_at,
-            collection: f.collection
-          }))
-        });
-      } catch (err) {
-        res.status(500).json({ error: err.message });
-      }
-    });
 
     /*
      * 热词硬纠正（按 IP 老师归档）
@@ -1536,10 +1399,10 @@ this.app.delete('/memory/hotwords/:id', this.requireWriteAuth, (req, res) => {
     /*
      * 某位 IP 老师的剪辑档案（归档的读取口）。
      *
-     * 为什么单独一个接口而不是塞进 review-packet：
-     * 审片包是"这一条粗剪的数据"，每开一次都要；
-     * 档案是"这位老师的历史积累"，整个会话读一次就够。
-     * 混在一起会让每次开审片台都拖着几十万字的偏好记录。
+     * 为什么单独一个接口：档案是"这位老师的历史积累"，
+     * 整段会话读一次就够，不该跟"这一条粗剪的数据"混在一起 ——
+     * 混着会让每次读都拖着几十万字的偏好记录。
+     * （原先的 review-packet 已随打回链路删除。）
      */
     this.app.get('/memory/edit-archives', this.requireReadAuth, (req, res) => {
       try {
@@ -1564,7 +1427,7 @@ this.app.delete('/memory/hotwords/:id', this.requireWriteAuth, (req, res) => {
      *
      * 为什么需要单独一个端点，而不是让桌面端走 /projects/:id/review：
      * 桌面端的审阅台是**逐个候选**改的（改标题、调起止、剔句子），
-     * 一次审阅会产生好几条独立的编辑信号，而且没有"打回重剪"这个整体动作。
+     * 一次审阅会产生好几条独立的编辑信号，没有"整体通过/否决"这种动作。
      * 硬塞进 review 会被迫伪造 segmentIds/textCuts，还容易把"改了标题"
      * 这种编辑混进"否决了这条粗剪"的语义里 —— 后者会污染黑名单。
      *
@@ -1799,6 +1662,11 @@ this.app.delete('/memory/hotwords/:id', this.requireWriteAuth, (req, res) => {
     // ─── 桌面端爆点候选打回：意见进评审表+经验，并灌给桌面端检测用 ───
     // GLB 主界面候选列表每行的“打回重找”调这里：comment 会出现在
     // review-memory.json 否决样例的 hook 里，下次“AI找爆点/按记忆重找”即生效
+    //
+    // 注意：这条**不是**已删除的“粗剪审片打回重剪”。它是 GLB 桌面端对单条
+    // 爆点候选的否决，不建工程、不重剪。它继续写 decision='recut'，
+    // 是为了让 store.getCollectionAvoidRules() 与爆点重排的“撞打回”降权
+    // 仍能读到这些意见 —— 那属于保留的学习闭环，不能一起删。
     this.app.post('/highlight/reject', this.requireWriteAuth, async (req, res) => {
       try {
         const { videoName, title, startSec, endSec, comment, opening } = req.body || {};
@@ -2310,7 +2178,9 @@ this.app.delete('/memory/hotwords/:id', this.requireWriteAuth, (req, res) => {
         } catch { /* ignore */ }
         let avoid = [];
         try {
-          // 去重：同一句打回意见重复提交会挤占 5 个避雷名额（同名打回 3 次 = 只剩 2 条其他经验）
+          // 去重：同一句否决意见重复提交会挤占 5 个避雷名额（重复 3 次 = 只剩 2 条其他经验）
+          // 这里的 decision='recut' 行现在只可能来自桌面端爆点候选否决（/highlight/reject）；
+          // 粗剪审片打回已下线，但它写过的历史行仍在，继续读。
           const seenAvoid = new Set();
           avoid = this.store.db.prepare(
             "SELECT comment FROM review_feedback WHERE decision = 'recut'" +
@@ -2376,6 +2246,8 @@ this.app.delete('/memory/hotwords/:id', this.requireWriteAuth, (req, res) => {
             "SELECT text_content FROM copywriting_patterns WHERE pattern_type IN ('hook','soft_cta') ORDER BY effectiveness DESC LIMIT 40"
           ).all().map((r) => String(r.text_content || ''));
         } catch { /* ignore */ }
+        // 保留：读历史 review_feedback 里 decision='recut' 的行做"撞车降权"。
+        // 粗剪审片打回已下线，这些行现在来自桌面端爆点候选否决 + 旧数据，属学习闭环的一部分。
         let recutTitles = [];
         try {
           recutTitles = this.store.db.prepare(
@@ -2873,11 +2745,14 @@ this.app.delete('/memory/hotwords/:id', this.requireWriteAuth, (req, res) => {
         res.status(500).json({ error: err.message });
       }
     });
-    // ─── 评审闭环：确认包装 / 提意见打回重剪（意见自动成记忆） ───
+    // ─── 评审闭环：确认通过（意见自动成记忆，approve 学习闭环） ───
+    // 打回重剪（decision='recut'）分支已下线：它只服务审片台的"打回+重剪"交互，
+    // 而审片台（/projects/:id/review-packet）已一并删除。
     this.app.post('/projects/:id/review', this.requireWriteAuth, async (req, res) => {
       try {
         const id = parseInt(req.params.id);
-        const { decision, comment, segmentIds, textCuts } = req.body || {};
+        // textCuts 不再解构：文本级删除只被已删除的打回分支消费。
+        const { decision, comment, segmentIds } = req.body || {};
         const project = this.store.getClipProject(id);
         if (!project) return res.status(404).json({ error: '项目不存在' });
 
@@ -2992,20 +2867,12 @@ this.app.delete('/memory/hotwords/:id', this.requireWriteAuth, (req, res) => {
           }
 let p = this.store.getClipProject(id);
           /*
-           * 2026-10-05 修：作废的工程不许再被"通过"。
+           * 作废的工程不许再被"通过"。
            *
-           * 原来的判据是 `!['reviewing','approved','finished'].includes(status)` 才重新出片，
-           * 于是 superseded（已打回重剪、被新工程取代）落进了 else 分支 ——
-           * 会被**用它自己那份旧 selected_segments 重新切片**，
-           * 并把状态改回 approved。
-           *
-           * 后果是两条 approved 工程并存，而用户刚在重剪版里批准的删字
-           * 并不在旧工程里 —— 等于把刚确认的成果覆盖掉了。
-           *
-           * 来源可复现：ReviewPanel.submit 先 await load() 才让父组件换 projectId，
-           * 面板会短暂地服务作废工程，而两个按钮此时都还可用。
-           *
-           * 所以这里明确拒绝，并告诉界面该用哪一个工程。
+           * 打回重剪链路已下线，正常不会再产生新的 superseded；
+           * 保留这道防线是为了挡住库里已有的历史作废工程 ——
+           * 否则它会落进下面的 else 分支，被**用它自己那份旧 selected_segments
+           * 重新切片**并把状态改回 approved，出现两条 approved 并存。
            */
           if (p.status === 'superseded') {
             const cur = this.store.db
@@ -3015,7 +2882,9 @@ let p = this.store.getClipProject(id);
               .get(project.live_video_id);
             return res.status(409).json({
               ok: false,
-              error: '这个粗剪已经被打回重剪取代，不能再确认通过',
+              // 打回重剪链路已下线，正常不会再产生新的 superseded；
+              // 这里保留是为了挡住库里已有的历史作废工程（老数据不动）。
+              error: '这个粗剪已经被作废取代，不能再确认通过',
               supersededBy: cur?.id ?? null
             });
           }
@@ -3023,7 +2892,7 @@ let p = this.store.getClipProject(id);
             await this.clipper.clip(id);
           }
           this.store.updateClipProject(id, { status: 'approved' });
-          // 看板上的确认/打回立刻灌给 GLB 桌面端（不同步等待，不挡响应）
+          // 看板上的确认立刻灌给 GLB 桌面端（不同步等待，不挡响应）
           this.glbBridge?.sync({ pull: false }).catch(() => {});
           this._briefCache = null; // 简报缓存失效：新意见下次找爆点即生效
           /*
@@ -3040,362 +2909,7 @@ let p = this.store.getClipProject(id);
           });
         }
 
-        if (decision === 'recut') {
-          // 打回：意见入库+成记忆，被点名的段直接拉黑，老项目归档，基于意见重建新项目
-          if (!comment) return res.status(400).json({ error: '打回请写一句意见（点快捷标签也行）' });
-this.store.addReviewFeedback({
-        clipProjectId: id, liveVideoId: project.live_video_id,
-        decision: 'recut', segmentIds, comment,
-        collection: this._collectionOfLiveVideo(project.live_video_id),
-      });
-          for (const sid of segmentIds || []) {
-            try { this.store.updateLiveSegmentStatus(sid, 'rejected'); } catch { /* ignore */ }
-          }
-          this.store.addReviewLesson(`粗剪#${id}被打回：${comment}`);
-
-          // 顺序很重要：先建新工程，成功了再归档老的。
-          // 原来是先 updateClipProject(superseded) 再 createProject ——
-          // 一旦重建失败（点名剔光后没有可用内容），老工程已经是 superseded，
-          // 而新工程又没建成，这条粗剪就凭空消失了：既没有能看的，也没有错误提示。
-          //
-          // 重建必须基于用户刚审过的那条粗剪，而不是从头自动重选：
-          //   ① 用户审的是这一版，认可的是这一版的编排。从头重选等于把他已经
-          //      点过头的段落全换掉，"打回"变成了"重做"，不是他要的意思。
-          //   ② 自动路径会重跑一遍"逐句剔除运营话术"。这条粗剪当初就是从
-          //      自动路径出来的，那些段已经剔过一次了；对 superseded 的旧段
-          //      再剔一次还会因为段本身零长/过短被判死，于是回一句
-          //      "逐句剔除后没有可用内容"，把问题指到素材上，其实是编排问题。
-          let origSegs = project.selected_segments;
-          if (typeof origSegs === 'string') {
-            try { origSegs = JSON.parse(origSegs); } catch { origSegs = []; }
-          }
-          if (!Array.isArray(origSegs)) origSegs = [];
-          const rejectSet = new Set((segmentIds || []).map(Number));
-          const keptIds = origSegs
-            .map((s) => Number(s.segmentId ?? s.id))
-            .filter((n) => Number.isFinite(n) && !rejectSet.has(n));
-
-          if (!keptIds.length) {
-            return res.status(400).json({ error: '这条粗剪的段落被你全点名剔掉了，没有可以重建的内容了' });
-          }
-          /*
-           * 上一轮已经剪掉的字必须带过来。
-           *
-           * 2026-10-05 修：这里原来**不传 cutsByIndex**，于是重建出来的
-           * picked 里每段都没有 seg.cuts —— 而下面 textCuts 那段的
-           * `normalizeRanges([...(seg.cuts || []), ...merged])`
-           * （注释写着"已有 cuts 要一起合并，否则两次删除会嵌套"）
-           * 永远在合并一个空数组，是死代码。
-           *
-           * 后果是真实的数据丢失：用户第一轮删掉的几秒，第二轮打回重剪后
-           * **原样复活**在新粗剪里，而新的 review-packet 也看不出任何痕迹。
-           *
-           * cutsByIndex 的形状是 [{ index: segmentId, cuts: [{st, en}] }]，
-           * index 用 segmentId —— live_segments.id 是全局主键，
-           * 与 segment_index（直播内局部序号）不是一回事，别用后者。
-           */
-          const prevCutsBySegId = [];
-          try {
-            for (const seg0 of (Array.isArray(origSegs) ? origSegs : [])) {
-              if (seg0 && seg0.segmentId != null && Array.isArray(seg0.cuts) && seg0.cuts.length) {
-                prevCutsBySegId.push({
-                  index: Number(seg0.segmentId),
-                  cuts: seg0.cuts
-                    .map((c) => ({ st: Number(c.st), en: Number(c.en) }))
-                    .filter((c) => Number.isFinite(c.st) && Number.isFinite(c.en) && c.en > c.st)
-                });
-              }
-            }
-          } catch (err) {
-            console.warn('[Review] 读取上一轮 cuts 失败（本次重剪将不带入旧删除）:', err.message);
-          }
-          if (prevCutsBySegId.length) {
-            console.log(`[Review] 带入上一轮 ${prevCutsBySegId.length} 段的文字删除，避免用户已删的内容复活`);
-          }
-          const picked = this._segmentsByIndex(project.live_video_id, keptIds, prevCutsBySegId);
-          if (!picked.length) {
-            return res.status(400).json({
-              error: `这条粗剪引用的 ${keptIds.length} 个分段在库里都找不到了。`
-                + '多半是重分析之后分段被换掉了，请重新出一次粗剪再审。'
-            });
-          }
-          // 把原工程里的角色带过去，否则 createProject 的 toRow 会一律当成 body，
-          // 新工程里片头/收尾的角色就没了（顺序还在，顺序本来就是按角色排好的）。
-          const roleById = new Map(
-            origSegs
-              .filter((s) => s && (s.role || s.segmentId != null || s.id != null))
-              .map((s) => [Number(s.segmentId ?? s.id), s.role || 'body'])
-          );
-          for (const seg of picked) {
-            if (seg && seg.id != null && roleById.has(Number(seg.id))) seg.role = roleById.get(Number(seg.id));
-          }
-
-          // ── 应用用户在审片台做的文本级删除 ──
-          //
-          // 这是"像剪映智能剪口播那样框选文字删掉"的后端落点。
-          // 客户端只传"第几段、哪几个字符"，时间由这里算 —— 因为文本是服务端拼接的，
-          // 让客户端算就得知道拼接规则，规则一变它算的秒数全错且不报错。
-          //
-          // textCuts 形如：
-          //   [{ segmentId: 2424, ranges: [{ from: 12, to: 20 }, ...] }]
-          let cutReport = { applied: 0, removedMs: 0, segments: 0, skipped: [] };
-          if (Array.isArray(textCuts) && textCuts.length) {
-            const liveRow = this.store.db
-              .prepare('SELECT asr_path FROM live_videos WHERE id = ?')
-              .get(project.live_video_id);
-            const transcript = loadTranscript(liveRow?.asr_path,
-              this.store.getHotwords(this._collectionOfLiveVideo(project.live_video_id)));
-            const bySegId = new Map(picked.filter((s) => s && s.id != null).map((s) => [Number(s.id), s]));
-
-            for (const tc of textCuts) {
-              const segId = Number(tc?.segmentId);
-              const seg = bySegId.get(segId);
-              if (!seg) { cutReport.skipped.push(`段#${segId} 不在本次重建范围`); continue; }
-              const srcStartMs = Number(seg.start_ms ?? seg.startMs ?? 0);
-              const srcEndMs = Number(seg.end_ms ?? seg.endMs ?? 0);
-              const editable = buildEditableText(transcript, srcStartMs / 1000, srcEndMs / 1000);
-              if (!editable.text) {
-                cutReport.skipped.push(`段#${segId} 没有可编辑文本（可能是实操教学段）`);
-                continue;
-              }
-              const segStart = Number(seg.startMs ?? seg.start_ms ?? 0);
-              const segEnd = Number(seg.endMs ?? seg.end_ms ?? 0);
-              const pieces = [];
-              for (const rg of (tc.ranges || [])) {
-                const hit = charRangeToTime(editable.sentences, editable.text, rg.from, rg.to, segStart);
-                if (!hit) continue;
-                // 跨句选区会散成多个子区间，逐个收
-                for (const p of (hit.pieces?.length ? hit.pieces : [hit])) {
-                  if (p.en <= p.st) continue;
-                  // 统一收口到段内：逐句稿的时间戳偶尔不准，
-                  // 补零长句时长也可能略微超出。不夹住的话 ffmpeg 会去剪
-                  // 一个不存在的位置，表现为这一段花屏或音画不同步。
-                  const st = Math.max(segStart, Math.min(p.st, segEnd));
-                  const en = Math.max(st, Math.min(p.en, segEnd));
-                  /*
-             * 最短切分 200ms。
-             *
-             * 另两条路径（_segmentsByIndex:838、clipper:833）都按 200ms 过滤，
-             * 只有这里放行了 1ms 的区间 —— 然后一路走到
-             * clipper 的 `clipSegment(... -t 0.001 -c copy)`，
-             * 产出的是一帧黑屏或空文件。
-             *
-             * 统一到同一个下限，三条路径口径一致。
-             */
-              const MIN_CUT_MS = 200;
-                  if (en - st >= MIN_CUT_MS) pieces.push({ st, en });
-                  else cutReport.skipped.push(`段#${segId} 有过短的删除（${en - st}ms < ${MIN_CUT_MS}ms），已忽略`);
-                }
-              }
-              if (!pieces.length) { cutReport.skipped.push(`段#${segId} 的选区没有落在有效时间内`); continue; }
-              const merged = normalizeRanges(pieces);
-              // 已有 cuts（上一轮剪过的）要一起合并，否则两次删除会嵌套
-              const all = normalizeRanges([...(seg.cuts || []), ...merged]);
-              const removed = all.reduce((n, r) => n + (r.en - r.st), 0);
-              const totalMs = Math.max(1, Number(seg.end_ms ?? seg.endMs ?? 0) - segStart);
-              // 剪掉超过 90% 这段就没了 —— 与其交给 ffmpeg 去切出黑帧，不如直接拒绝
-              if (removed >= totalMs * 0.9) {
-                cutReport.skipped.push(`段#${segId} 被删得太多（${Math.round((removed / totalMs) * 100)}%），整段跳过`);
-                continue;
-              }
-              /**
-               * cuts 必须存**原素材绝对时间**，不能用相对段首的时间。
-               *
-               * 下游（_segmentsByIndex 和 clipper.buildSegments）都按绝对时间收口：
-               * `st = Math.max(seg.startMs, c.st)`、`en = Math.min(seg.endMs, c.en)`。
-               * 所以存相对值（0..2000）会被算成 st=段首、en=2000，
-               * 接着被 `c.en - c.st >= 200` 那条过滤掉 —— cuts 凭空消失，
-               * 而回执却写着"已生效"。用户看到的是"删了半天，重剪完没区别"。
-               *
-               * 现存工程里的 cuts（如 live#174 的 {st:1750000,en:1765000}）也是绝对值，
-               * 这里保持同一约定，避免新旧数据混用时被 interpret 成两套含义。
-               */
-              seg.cuts = all.map((r) => ({ st: Math.round(r.st), en: Math.round(r.en) }));
-              cutReport.applied += merged.length;
-              cutReport.removedMs += merged.reduce((n, r) => n + (r.en - r.st), 0);
-              cutReport.segments++;
-            }
-            console.log(
-              `[Review] 文本删除：${cutReport.segments} 段生效，共 ${cutReport.applied} 处、` +
-              `${(cutReport.removedMs / 1000).toFixed(1)}s` +
-              (cutReport.skipped.length ? `；跳过 ${cutReport.skipped.length} 处：${cutReport.skipped.join('；')}` : '')
-            );
-          }
-
-          /*
-           * 打回的幂等：同一条意见 + 同一批被点名段，只允许生成一个新工程。
-           *
-           * 2026-10-05 修：原来完全没有去重。触发场景很日常：
-           *   - 用户双击了「打回重剪」
-           *   - 客户端超时后自动重试
-           * 每次都会走完 addReviewFeedback / markSegmentsRejected / addReviewLesson /
-           * createProject，于是留下两个内容几乎一样的新工程、两行反馈、两条教训，
-           * 而只有第二个 newProjectId 被返回 —— 界面上看着"成功了"，
-           * 项目库里却多出一条用户从没要求过的版本。
-           *
-           * 判据用 review_feedback：它本来就存了 clip_project_id + decision +
-           * comment + segment_ids 四要素，而这次打回在**建新工程之前**就会写它。
-           * 所以"已经有这行反馈"就等于"这次打回已经开始处理了"。
-           *
-           * 只在已完成一轮（存在由它建出的、未被作废的工程）时才短路返回，
-           * 避免"第一次打回写到一半崩了"之后再也打不回去。
-           */
-          const alreadyRecut = this.store.db
-            .prepare(`SELECT 1 AS x FROM review_feedback
-                       WHERE clip_project_id = ? AND decision = 'recut' AND comment = ?
-                         AND segment_ids = ? LIMIT 1`)
-            .get(id, comment, JSON.stringify(segmentIds || []));
-          if (alreadyRecut) {
-            const prior = this.store.db
-              .prepare(`SELECT id FROM clip_projects
-                         WHERE live_video_id = ?
-                           AND status != 'superseded'
-                           AND created_at >= (SELECT created_at FROM review_feedback
-                                               WHERE clip_project_id = ? AND decision = 'recut' AND comment = ?
-                                               AND segment_ids = ? LIMIT 1)
-                         ORDER BY id ASC LIMIT 1`)
-              .get(project.live_video_id, id, comment, JSON.stringify(segmentIds || []));
-            if (prior) {
-              console.log(`[Review] 工程#${id} 的这条打回已处理过，复用新工程 #${prior.id}，不重复建`);
-              return res.json({
-                ok: true,
-                projectId: id,
-                newProjectId: prior.id,
-                deduped: true,
-                message: '这次打回已经处理过了，没有重复建工程'
-              });
-            }
-          }
-
-          const result = await this.clipper.createProject(project.live_video_id, {
-            presetSegments: picked,
-            feedback: [comment], excludeSegmentIds: segmentIds || []
-          });
-          this.store.updateClipProject(id, { status: 'superseded' });
-
-          /*
-           * 记学习样本。
-           *
-           * 必须在 createProject **之后**：picked 里的 cuts 是原地改的，
-           * 记完再改的话存下来的时间区间和实际剪掉的不一致。
-           *
-           * 记三类（不只是删掉的）：
-           *   cut     —— 框选删掉的文字，避雷词
-           *   keep    —— 同一段里留下的文字，正样本
-           *   segment —— 用户勾选保留的整段，段落级内容逻辑
-           * 只记删除的话，下次找爆点只能学会"别说什么"，
-           * 学不到"该说什么" —— 而后者才是爆款的正向逻辑。
-           */
-          try {
-            /*
-             * 归档到"这条直播自己的 IP"，不是当前选中的。
-             * 理由同 _collectionOfLiveVideo：审片时用户可能已经切到别的老师了。
-             */
-            const col = this._collectionOfLiveVideo(project.live_video_id) ?? null;
-            /*
-             * transcript 只在上面的 textCuts 分支里加载过，而那个分支
-             * 是 `if (Array.isArray(textCuts) && textCuts.length)` ——
-             * 用户这次没删任何文字时它根本不存在。
-             * 直接用会抛 ReferenceError，被下面的 catch 吞掉，
-             * 表现为"打回成功但一条学习样本都没有"，而且日志只有一行看不出原因。
-             * 所以这里自己加载一次。
-             */
-            const learnLiveRow = this.store.db
-              .prepare('SELECT asr_path FROM live_videos WHERE id = ?')
-              .get(project.live_video_id);
-            const learnTranscript = loadTranscript(learnLiveRow?.asr_path,
-              this.store.getHotwords(this._collectionOfLiveVideo(project.live_video_id)));
-            const editableBySeg = new Map();
-            const segStartById = new Map();
-            for (const s of picked) {
-              if (!s || s.id == null) continue;
-              const st = Number(s.startMs ?? s.start_ms ?? 0);
-              const en = Number(s.endMs ?? s.end_ms ?? 0);
-              segStartById.set(Number(s.id), st);
-              editableBySeg.set(Number(s.id), buildEditableText(learnTranscript, st / 1000, en / 1000));
-            }
-            const rec = buildLearningRecord({
-              picked,
-              rejectedIds: segmentIds || [],
-              textCuts: textCuts || [],
-              /*
-               * 实际落库的 cuts（picked 是合并完成后的）。
-               * 学习记录必须拿它核对，否则被 90% 规则、200ms 下限、
-               * charRangeToTime 判空拒绝掉的选区，
-               * 照样会被记成"避雷词"注入下一次分析 —— 而那内容还在片子里。
-               */
-              appliedCutsBySeg: new Map(
-                picked
-                  .filter((s) => s && s.id != null && Array.isArray(s.cuts) && s.cuts.length)
-                  .map((s) => [Number(s.id), s.cuts])
-              ),
-              editableBySeg,
-              segStartById,
-              liveVideoId: project.live_video_id,
-              comment
-            });
-            const segById = new Map(picked.filter((s) => s && s.id != null).map((s) => [Number(s.id), s]));
-            const rows = [];
-            const base = { clipProjectId: result.projectId, liveVideoId: project.live_video_id, collection: col, reason: comment || '' };
-            for (const c of rec.cuts) {
-              const seg = segById.get(c.segmentId);
-              rows.push({
-                ...base, kind: 'cut', segmentId: c.segmentId,
-                role: seg?.role || null, themeName: seg?.themeName || null,
-                text: c.text, charFrom: c.fromChar, charTo: c.toChar,
-                startMs: c.startMs + (segStartById.get(c.segmentId) || 0),
-                endMs: c.endMs + (segStartById.get(c.segmentId) || 0),
-                score: seg?.hookQuality ?? null, by: 'edited'
-              });
-            }
-            for (const k of rec.keeps) {
-              const seg = segById.get(k.segmentId);
-              rows.push({
-                ...base, kind: 'keep', segmentId: k.segmentId,
-                role: seg?.role || null, themeName: seg?.themeName || null,
-                text: k.text,
-                startMs: k.startMs + (segStartById.get(k.segmentId) || 0),
-                endMs: k.endMs + (segStartById.get(k.segmentId) || 0),
-                score: seg?.hookQuality ?? null, by: 'edited'
-              });
-            }
-            // 整段保留：段落级的内容逻辑。by='picked' 表示用户勾选框认可，
-            // 和逐字的 'edited' 区分开 —— 信号来源不同，权重也不该一样。
-            for (const sg of rec.keptSegments) {
-              const seg = segById.get(sg.segmentId);
-              const ed = editableBySeg.get(sg.segmentId);
-              rows.push({
-                ...base, kind: 'segment', segmentId: sg.segmentId,
-                role: sg.role || null, themeName: sg.themeName || null,
-                // 段落级也存原文：结构判断要能对上具体内容，不然只有 role 太抽象
-                text: (ed?.text || '').slice(0, 600),
-                startMs: Number(seg?.startMs ?? seg?.start_ms ?? 0),
-                endMs: Number(seg?.endMs ?? seg?.end_ms ?? 0),
-                score: sg.hookQuality, by: 'picked'
-              });
-            }
-            const n = this.store.addReviewEdits(rows);
-            const sum = this.store.getEditStyleSummary(col);
-            console.log(
-              `[Review] 学习样本 +${n}（删 ${sum.cuts} / 留 ${sum.keeps} / 整段 ${sum.segments}）` +
-              ` → collection=${col || '通用'}`
-            );
-          } catch (err) {
-            // 记学习失败**不能**影响剪辑结果：粗剪已经重剪出来了，
-            // 因为写库失败就让整个请求 500，用户看到"提交失败"而实际已生效。
-            console.error('[Review] 写学习样本失败（不影响剪辑结果）:', err.message);
-          }
-
-          let clipped = null;
-          if (result.pendingQueries.length === 0) {
-            clipped = await this.clipper.clip(result.projectId);
-          }
-          this.glbBridge?.sync({ pull: false }).catch(() => {});
-          this._briefCache = null;
-          return res.json({ ok: true, newProjectId: result.projectId, pendingQueries: result.pendingQueries, clipped: !!clipped, cuts: cutReport });
-        }
-
-        return res.status(400).json({ error: 'decision 只能是 approve 或 recut' });
+        return res.status(400).json({ error: 'decision 只能是 approve' });
       } catch (err) {
         console.error('[Review] failed:', err.message);
         res.status(500).json({ error: err.message });
@@ -3935,7 +3449,7 @@ favorites: perf.favorites ?? null
    * 清理真冗余并返回清单。只删三类东西：
    *  1. upload/temp 里 24h 以上的残留（sherpa_* 空目录、*.part、*.wav）
    *  2. upload/ 里 1h 以上的 *.part（崩溃/中断残留；进行中的很新，不碰）
-   *  3. 已作废/失败项目的 draft 草稿目录（打回后重建了新版，旧的几个 GB 纯占地；
+   *  3. 已作废/失败项目的 draft 草稿目录（历史上打回后重建了新版，旧的几个 GB 纯占地；
    *     严格限定在 output/draftDir 内部，路径不对就跳过，绝不误删）
    *  4. 合成残留小文件（*.filelist.txt、*_raw_frame.jpg，1h 以上）
    * 源视频、成片、记忆库（data/hermes.db）一律不动。
@@ -3992,8 +3506,8 @@ favorites: perf.favorites ?? null
            * 源视频没了，但这条直播**还有粗剪在等着审**，也不能删。
            *
            * 实际踩过：live#174 的 3 小时转写缓存被删掉后，
-           * review-packet 里 15 段的 text 全变成空串 ——
-           * 文字精修界面"能框、但一个字符都没有"，
+           * 审片侧 15 段的 text 全变成空串 ——
+           * approve 分支学到的段落样本只剩 role/theme 没有正文，
            * 而且不报错（loadTranscript 读不到文件就返回 []）。
            *
            * 源视频删了 ≠ 这条直播没人管了：只要还有 clip_projects
@@ -4624,7 +4138,7 @@ body.embed{overflow-y:auto}body.embed main{max-width:none;padding:12px 14px 18px
 
 <div class="tabpage" id="page-projects">
 <div class="card"><h2>粗剪项目</h2>
-<p class="desc">粗剪片段可直接点开看（悬停按 <code>R</code> 切换倍速）。✅确认就包装字幕+标题+同款封面合成片；✏️不满意就勾段+写意见打回，意见自动记入记忆，下次剪自动遵守，越剪越懂你。<br>打回作废的旧草稿占地方时，点 <button class="btn ghost small" onclick="cleanup()">🗑 清理冗余</button>（先预览、你确认才删，源视频和成片不动）。</p>
+<p class="desc">粗剪片段可直接点开看（悬停按 <code>R</code> 切换倍速）。✅确认就包装字幕+标题+同款封面合成片，确认时的备注与段落编排会自动记入记忆，下次剪自动遵守，越剪越懂你。<br>作废项目的旧草稿占地方时，点 <button class="btn ghost small" onclick="cleanup()">🗑 清理冗余</button>（先预览、你确认才删，源视频和成片不动）。</p>
 <table><thead><tr><th>ID</th><th>来源直播</th><th>状态</th><th>片段</th><th>操作</th></tr></thead><tbody id="tb-projects"><tr><td colspan="5">加载中…</td></tr></tbody></table>
 </div></div>
 
@@ -5004,29 +4518,14 @@ async function loadProjects(){try{const d=await api('/api/projects');
   const prev=(p.clips&&p.clips.length)?'<div style="margin-top:6px"><video controls preload="metadata" style="max-width:280px" src="'+p.clips[0].url+'"></video><div style="font-size:11px;color:#8f95a3">'+p.clips.length+' 个可看版本（鼠标悬停+R 键倍速'+(p.clips.length>1?' · <a href="javascript:faststart('+p.id+')" style="color:#7cc4ff">⚡旧片点播慢点我修复</a>':'')+'）</div></div>':'<div style="font-size:11px;color:#8f95a3">暂无可看文件</div>';
   let act='';
   if(p.status==='reviewing'||p.status==='clipping'||p.status==='pending_review'){
-   act='<button class="btn small" onclick="reviewApprove('+p.id+')">✅ 确认粗剪</button> <button class="btn ghost small" onclick="toggleRecut('+p.id+')">✏️ 提意见打回</button> <button class="btn ghost small" onclick="viewFeedback('+p.id+')">📝 记录</button>'
-    +'<div id="recut-'+p.id+'" style="display:none;margin-top:8px;background:#191c24;padding:10px;border-radius:8px">'
-    +'<div style="font-size:12px;color:#8f95a3;margin-bottom:6px">点中不想要的段（可多选），再写一句意见，打回后自动按意见重剪并记入记忆：</div>'
-    +'<div>'+(p.selected_segments||[]).map((s,i)=>'<label style="display:inline-block;font-size:12px;margin:2px 6px 2px 0"><input type="checkbox" class="recut-seg-'+p.id+'" value="'+esc(s.segmentId)+'"> '+esc(s.themeName||('段'+(i+1)))+'</label>').join('')+'</div>'
-    +'<div style="margin:6px 0">'+window.CHIPS.map((c,i)=>'<button class="btn ghost small" style="margin:2px" data-act="chip" data-id="'+p.id+'" data-i="'+i+'">'+c+'</button>').join('')+'</div>'
-    +'<textarea id="recut-text-'+p.id+'" rows="2" style="width:100%;background:#191c24;color:#f3f4f8;border:1px solid #262a35;border-radius:6px;padding:6px" placeholder="例：第二段太水不要，整体再紧凑点"></textarea>'
-    +'<div style="margin-top:6px"><button class="btn small" onclick="reviewRecut('+p.id+')">↩️ 打回重剪</button></div></div>'
+   act='<button class="btn small" onclick="reviewApprove('+p.id+')">✅ 确认粗剪</button> <button class="btn ghost small" onclick="viewFeedback('+p.id+')">📝 记录</button>'
     +'<div id="fb-'+p.id+'" style="display:none;margin-top:6px;font-size:12px"></div>';
-  }else if(p.status==='approved'){act='<span style="color:#7cc4ff;font-size:12px">粗剪已确认（未生成成片）</span> <button class="btn small" onclick="gen('+p.id+')">🎬 生成成片</button> <button class="btn ghost small" onclick="toggleRecut('+p.id+')">✏️ 提意见打回</button> <button class="btn ghost small" onclick="viewFeedback('+p.id+')">📝 记录</button>'
-    +'<div id="recut-'+p.id+'" style="display:none;margin-top:8px;background:#191c24;padding:10px;border-radius:8px">'
-    +'<div style="font-size:12px;color:#8f95a3;margin-bottom:6px">点中不想要的段（可多选），再写一句意见，打回后自动按意见重剪并记入记忆：</div>'
-    +'<div>'+(p.selected_segments||[]).map((s,i)=>'<label style="display:inline-block;font-size:12px;margin:2px 6px 2px 0"><input type="checkbox" class="recut-seg-'+p.id+'" value="'+esc(s.segmentId)+'"> '+esc(s.themeName||('段'+(i+1)))+'</label>').join('')+'</div>'
-    +'<div style="margin:6px 0">'+window.CHIPS.map((c,i)=>'<button class="btn ghost small" style="margin:2px" data-act="chip" data-id="'+p.id+'" data-i="'+i+'">'+c+'</button>').join('')+'</div>'
-    +'<textarea id="recut-text-'+p.id+'" rows="2" style="width:100%;background:#191c24;color:#f3f4f8;border:1px solid #262a35;border-radius:6px;padding:6px" placeholder="例：第二段太水不要，整体再紧凑点"></textarea>'
-    +'<div style="margin-top:6px"><button class="btn small" onclick="reviewRecut('+p.id+')">↩️ 打回重剪</button></div></div>'
+  }else if(p.status==='approved'){act='<span style="color:#7cc4ff;font-size:12px">粗剪已确认（未生成成片）</span> <button class="btn small" onclick="gen('+p.id+')">🎬 生成成片</button> <button class="btn ghost small" onclick="viewFeedback('+p.id+')">📝 记录</button>'
     +'<div id="fb-'+p.id+'" style="display:none;margin-top:6px;font-size:12px"></div>';
-  }else if(p.status==='superseded'){act='<span style="color:#8f95a3;font-size:12px">已打回，有新版在上</span> ';}
+  }else if(p.status==='superseded'){act='<span style="color:#8f95a3;font-size:12px">已作废，有新版在上</span> ';}
   if(p.status==='pending_review')act+='<div style="color:#ffb020;font-size:12px;margin-top:4px">等你去 ❓ 页确认</div>';
   return '<tr><td>#'+p.id+'</td><td>'+esc(p.live_name||p.live_path||'-')+prev+'</td><td><span class="st '+esc(p.status)+'">'+esc(p.status)+'</span></td><td>'+(p.selected_segments?.length||0)+' 段</td><td>'+act+'</td></tr>'}).join(''):'<tr><td colspan="5" style="color:#8f95a3">暂无进行中的项目，分析完直播后自动创建 👆</td></tr>')+histHint(hidP,'个完结项目',5);
 }catch(e){document.getElementById('tb-projects').innerHTML=errRow(5,e.message);}}
-function toggleRecut(id){const el=document.getElementById('recut-'+id);el.style.display=el.style.display==='none'?'block':'none';}
-window.CHIPS=['钩子不够炸','太长了，剪短','太短了，讲不透','换个主题','节奏太平','不要这几段'];
-function addChip(id,i){const ta=document.getElementById('recut-text-'+id);const t=window.CHIPS[i]||'';ta.value=(ta.value?ta.value+'；':'')+t;}
 // 事件委托：所有带 data-act 的按钮统一走这里（避免把中文路径拼进 onclick 引号地狱）
 document.addEventListener('click',e=>{
  const b=e.target.closest?e.target.closest('[data-act]'):null;if(!b)return;
@@ -5035,12 +4534,11 @@ document.addEventListener('click',e=>{
   if(act==='analyzeHit')analyzeHit(decodeURIComponent(b.dataset.p||''));
   else if(act==='analyzeLive')analyzeLive(decodeURIComponent(b.dataset.p||''));
   else if(act==='sentenceCut')sentenceCut(decodeURIComponent(b.dataset.p||''));
-  else if(act==='answer')answer(parseInt(b.dataset.id),decodeURIComponent(b.dataset.a||''));
-  else if(act==='chip')addChip(parseInt(b.dataset.id),parseInt(b.dataset.i));
- }catch(err){alert(err.message);}
+   else if(act==='answer')answer(parseInt(b.dataset.id),decodeURIComponent(b.dataset.a||''));
+  }catch(err){alert(err.message);}
 });
 async function reviewApprove(id){if(!await askConfirm('确认这版粗剪OK？只锁定粗剪，不会自动生成成片（成片要点“生成成片”）。'))return;try{await api('/projects/'+id+'/review',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({decision:'approve'})},0);alert('粗剪已确认，要出成片请点 🎬 生成成片');loadAll();}catch(e){alert(e.message)}}
-async function reviewRecut(id){const boxes=[...document.querySelectorAll('.recut-seg-'+id+':checked')].map(b=>parseInt(b.value));const comment=document.getElementById('recut-text-'+id).value.trim();if(!comment){alert('写一句意见再打回（点快捷标签也行）');return;}try{const r=await api('/projects/'+id+'/review',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({decision:'recut',comment,segmentIds:boxes})},0);alert(r.pendingQueries?.length?'已按意见重建项目，去 ❓ 页回一句继续':'已按意见重剪，意见已记入记忆');loadAll();}catch(e){alert(e.message)}}
+
 async function viewFeedback(id){const box=document.getElementById('fb-'+id);if(box.style.display!=='none'){box.style.display='none';return;}try{const d=await api('/projects/'+id+'/feedback');box.innerHTML=(d.feedback.length?d.feedback.map(f=>'<div>【'+esc(f.decision)+'】'+esc(f.comment)+'</div>').join(''):'<div style="color:#8f95a3">暂无评审记录</div>')+(d.lessons.length?'<div style="margin-top:6px;color:#7cc4ff">已学会的经验：'+d.lessons.slice(-5).map(l=>esc(l.text)).join('；')+'</div>':'');box.style.display='block';}catch(e){alert(e.message)}}
 async function loadQueries(){try{const d=await api('/queries');const q=d.queries||[];
  const badge=document.getElementById('q-badge');badge.style.display=q.length?'inline-block':'none';badge.textContent=q.length;

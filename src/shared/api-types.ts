@@ -922,34 +922,23 @@ export interface StudioApi {
    */
   cancelDetect(filePath: string): Promise<{ ok: boolean; aborted: boolean }>;
   rerank(fileName: string, durationMode: "short" | "mid" | "long", candidates: ClipCandidate[]): Promise<{ candidates: ClipCandidate[]; summary: string }>;
-  /** 拉取审片包：粗剪路径 + 段映射（粗剪坐标 ↔ 原素材坐标）+ 历史意见 */
-  reviewPacket(projectId: number): Promise<ReviewPacket>;
   /**
-   * 提交审片结论。
+   * 提交审片结论：确认通过。
    *
-   * decision=approve 通过；recut 打回重剪（会把 comment 变成记忆，
-   * 下次找爆点时避开同样的问题）。
+   * 原来还有 decision=recut（打回重剪），那条链路连同 ReviewPanel 已删除。
+   * 保留 approve 是因为它喂的是"用户认可这版段落编排"的正样本，
+   * 是记忆闭环的一部分 —— 界面目前没有暴露这个入口，
+   * 但后端和记忆学习都还在用它，别顺手一起删。
    */
   submitReview(
     projectId: number,
     payload: {
-      decision: "approve" | "recut";
+      decision: "approve";
       comment?: string;
-      segmentIds?: number[];
-      /**
-       * 文本级删除：用户像编辑文档一样框选文字删掉的内容。
-       *
-       * 只传"第几段、哪几个字符"，时间由 Hermes 换算 —— 因为文本是那边拼接的，
-       * 让客户端算就得知道拼接规则，规则一变它算的秒数全错而且不报错。
-       * 支持跨段：一次框选可以横跨多段，每段各给一个区间。
-       */
-      textCuts?: Array<{ segmentId: number; ranges: Array<{ from: number; to: number }> }>;
     }
   ): Promise<{
     ok: boolean;
-    newProjectId?: number;
     status?: string;
-    cuts?: ReviewCutReport;
     /**
      * 实际写入的学习样本条数。
      *

@@ -1,7 +1,7 @@
 /**
- * clipper 的三处硬 bug 回归测试
+ * clipper 与 review 的硬 bug 回归测试
  *
- * 这三个都是"不报错、但功能整个是坏的"，所以只能靠断言锁住：
+ * 这些都是"不报错、但功能整个是坏的"，所以只能靠断言锁住：
  *
  * 1. createProject 里传了未定义的 totalDurationMs
  *    → 自动选段这条路 100% 抛 ReferenceError，调度器吞掉，界面上毫无异常。
@@ -11,6 +11,10 @@
  *       反过来把**重复的段写回库**，字幕错位 / 成片出现重复画面。
  * 3. createProject 的投影没带 cuts
  *    → clip() 从库里重读时 seg.cuts 恒为 undefined，逐句剔除运营话术整个空转。
+ * 4. review 的 approve 分支（保留的学习闭环）：作废工程不得复活、
+ *    三处写入去重、学习有没有写成要如实回传。
+ *
+ * 打回重剪（recut）与 review-packet 的几条断言已随该链路一并删除。
  *
  * @author 郭洛斌
  */
@@ -93,46 +97,13 @@ test('cuts 的时间单位是毫秒且必须是数字', () => {
   assert.match(src, /st: Number\(c\.st\), en: Number\(c\.en\)/);
 });
 
-test('review-packet 的粗剪时间轴必须按 cuts 累加，不能按整段', () => {
-  /*
-   * clip() 拼的是 cuts 的子区间，所以粗剪里的实际时长是 cuts 之和。
-   * 而 review-packet 以前用 end-start 累加 cursor ——
-   * 一个"中间删了 25 秒"的段在真实文件里只有 35 秒，却报成 60 秒，
-   * 后面所有段的粗剪位置全偏。
-   *
-   * 用户可见后果：审片台把播放中的画面标成错误的段、点行 seek 到错位置、
-   * 标题里的"粗剪 100.0s"其实只有 75s。generator 那边早就按 cuts 累加了，
-   * 只有这里没跟上。
-   */
-  const orch = readFileSync(join(process.cwd(), 'src/orchestrator/index.js'), 'utf8');
-  assert.match(orch, /Array\.isArray\(s\.cuts\) && s\.cuts\.length/);
-  assert.match(orch, /sum > 0 \? sum : Math\.max\(0, end - start\)/, 'cuts 全废时要退回整段，不能算出 0 时长');
-  assert.match(orch, /const dur = roughcutDur;/, 'cursor 必须按粗剪实际时长累加');
-});
 /*
- * 剩下四条：打回重剪丢删字 / 作废工程复活 / 学习样本重复写 / 1ms 切分。
- * 全在 orchestrator/index.js 里。
+ * 下面几条都在 orchestrator/index.js 里，且都属于**保留的 approve 学习闭环**：
+ * 作废工程复活 / 学习样本重复写 / 多区间切片识别 / 拼接失败报成功。
+ * （原先这里还有 review-packet 时间轴、打回重建带入旧 cuts、
+ *   打回幂等、学习记录只记生效删除几条 —— 全部只测已删除的打回链路，已随之删除。）
  */
 const orch = readFileSync(join(process.cwd(), 'src/orchestrator/index.js'), 'utf8');
-
-test('打回重剪必须把上一轮的 cuts 带入（否则用户删的内容复活）', () => {
-  /*
-   * 原来重建段列表时不传 cutsByIndex，于是 picked 里每段都没有 seg.cuts，
-   * 下一段 `normalizeRanges([...(seg.cuts || []), ...merged])`
-   * （注释写着"已有 cuts 要一起合并"）永远在合并空数组 —— 是死代码。
-   *
-   * 真实后果：第一轮删掉的几秒，第二轮重剪后原样复活，
-   * 而新的 review-packet 也看不出任何痕迹。
-   */
-  assert.match(orch, /prevCutsBySegId/, '必须先把旧 cuts 收集起来');
-  assert.match(
-    orch,
-    /_segmentsByIndex\(project\.live_video_id, keptIds, prevCutsBySegId\)/,
-    '重建时必须把旧 cuts 传进去'
-  );
-  // index 必须用 segmentId（live_segments.id），不是 segment_index
-  assert.match(orch, /index: Number\(seg0\.segmentId\)/);
-});
 
 test('作废的工程不许再被确认通过', () => {
   /*
@@ -167,31 +138,6 @@ test('通过必须如实回传学习有没有写成', () => {
   assert.match(orch, /learned,\s*\n\s*learnFailed/, '回执必须带上这两个字段');
 });
 
-test('重剪的切分下限与其他两条路径一致（200ms）', () => {
-  // 另两条路径（_segmentsByIndex、clipper）都按 200ms 过滤，
-  // 只有这里放行 1ms，然后一路走到 ffmpeg -t 0.001，产出黑帧或空文件
-  assert.match(orch, /MIN_CUT_MS = 200/);
-  assert.match(orch, /en - st >= MIN_CUT_MS/);
-});
-test('打回必须幂等：双击/重试不许造出两个新工程', () => {
-  /*
-   * 原来完全没有去重。双击「打回重剪」或客户端超时重试都会走完
-   * addReviewFeedback / markSegmentsRejected / addReviewLesson / createProject，
-   * 留下两个几乎一样的新工程、两行反馈、两条教训，
-   * 而只有第二个 newProjectId 被返回 —— 界面上看着"成功了"。
-   */
-  const o2 = readFileSync(join(process.cwd(), 'src/orchestrator/index.js'), 'utf8');
-  assert.match(o2, /alreadyRecut/, '必须有判重');
-  assert.match(o2, /deduped: true/);
-  assert.match(o2, /不重复建/);
-  // 判重必须在写反馈之后（靠反馈表判重）、建工程之前
-  const dedupAt = o2.indexOf('alreadyRecut');
-  const before = o2.lastIndexOf('addReviewFeedback({', dedupAt);
-  const after = o2.indexOf('createProject(project.live_video_id', dedupAt);
-  assert.ok(before > 0 && before < dedupAt, '判重要靠已写入的反馈');
-  assert.ok(dedupAt < after, '判重必须在建工程之前');
-});
-
 test('重建缺失粗剪时必须认多区间的切片文件', () => {
   /*
    * clipper 给"带 cuts 的段"产出 clip1_1.mp4 / clip1_2.mp4，
@@ -205,23 +151,6 @@ test('重建缺失粗剪时必须认多区间的切片文件', () => {
   // 排序必须按 (段号, 子区间号) 两个数字来，不能只按文件名。
   assert.doesNotMatch(gen.replace(/\/\*[\s\S]*?\*\//g, ""), /localeCompare/, "排序不能只按文件名");
   assert.match(gen, /ka\[0\] - kb\[0\] \|\| ka\[1\] - kb\[1\]/, '必须按两个数字排');
-});
-
-test('学习记录只能记真正生效的删除', () => {
-  /*
-   * buildLearningRecord 原来把客户端原始 textCuts 自己重算时间就算数，
-   * 而服务端落库的 cuts 要过：算不出时间就丢、夹到段边界、归一化合并、
-   * 删超过 90% 整段跳过、短于 200ms 忽略。
-   *
-   * 于是被规则拒绝的选区仍被记成 cut 样本 —— 那是"避雷词"，会注入下一次分析：
-   * 用户试删一句被拦下，那句话还在片子里，系统却已当成"用户讨厌的说法"学走。
-   * 反过来算不出时间的选区会让整段落进 keep，等于教系统"保留"用户想删的内容。
-   */
-  const rl = readFileSync(join(process.cwd(), 'src/analyzer/review-learning.js'), 'utf8');
-  assert.match(rl, /charRangesToTime\(tc\.ranges \|\| \[\], ed, segStart, p\.appliedCutsBySeg\?\.get\(id\)\)/);
-  assert.match(rl, /appliedCuts\.some/, '必须与实际落库的 cuts 核对');
-  // 没有 appliedCuts 时不能变成"全不过滤"或"全过滤"，保持旧行为
-  assert.match(rl, /Array\.isArray\(appliedCuts\) && appliedCuts\.length/);
 });
 
 test('粗剪拼接失败不能报成功', () => {

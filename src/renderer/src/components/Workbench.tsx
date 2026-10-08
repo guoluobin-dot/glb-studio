@@ -46,7 +46,6 @@ import { ReviewTextCutter as TextCutter } from "./ReviewTextCutter";
 import { Timeline } from "./Timeline";
 import { HotwordPanel } from "./HotwordPanel";
 import { TranscriptPanel } from "./TranscriptPanel";
-import { ReviewPanel as RoughcutReviewPanel } from "./ReviewPanel";
 import { HitVaultPanel } from "./HitVaultPanel";
 import type { ExportArtifacts } from "./ResultList";
 import { ShortcutHelp } from "./ShortcutHelp";
@@ -397,17 +396,12 @@ export function Workbench({ engine, onOpenSettings }: { engine: EngineSettings |
 const [leaveAskOpen, setLeaveAskOpen] = useState(false);
   const [showProjects, setShowProjects] = useState(false);
   const [showVault, setShowVault] = useState(false);
-  /**
-   * 审片状态。
-   *
-   * projectId 和 roughcutPath 都来自出片结果。以前粗剪只混在 files 里，
-   * 而 files 一旦有包装产物就被整个覆盖 —— 于是界面上永远看不到粗剪，
-   * "审片"这个环节根本不存在。现在单独存，审片才有得可审。
+  /*
+   * 原来这里还有审片那一套：clipProjectId / roughcutPath / showReview / reviewMsg。
+   * 粗剪审片（ReviewPanel.tsx，含给意见、点名打回、重剪）已删除，
+   * 这几个状态跟着一起走 —— 它们的唯一用途就是喂给那个面板，
+   * 留着就是没人读的死状态。approve 那条学习闭环在后端，不依赖它们。
    */
-  const [clipProjectId, setClipProjectId] = useState<number | null>(null);
-  const [roughcutPath, setRoughcutPath] = useState<string | null>(null);
-  const [showReview, setShowReview] = useState(false);
-  const [reviewMsg, setReviewMsg] = useState<{ tone: "ok" | "warn"; text: string } | null>(null);
   /** 当前用哪位老师的爆款记忆。null = 不指定(用库里的第一套) */
   const [memoryIpId, setMemoryIpId] = useState<string | null>(null);
   // 名字要从库里查,不能只存 id —— 按钮上要直接显示"用的是谁的记忆"
@@ -498,8 +492,7 @@ const [leaveAskOpen, setLeaveAskOpen] = useState(false);
     // 审片台打开时把键盘让出去：它自己接管 空格/[/]/,/./Esc。
     // 不让的话按空格暂停的是背后这个播放器，画面不动，像坏了；
     // 而 A/D 会误触全选/反选，把选片结果改掉。
-    enabled: !showReview,
-    onPlayToggle: () => playbackRef.current?.toggle(),
+onPlayToggle: () => playbackRef.current?.toggle(),
     onNext: () => moveFocus(1),
     onPrev: () => moveFocus(-1),
     onToggleCurrent: () => {
@@ -893,11 +886,12 @@ const runDetect = useCallback(async (): Promise<void> => {
         setArtifacts(
           result.files.length > 0 ? { files: result.files, outputDir: result.outputDir ?? "" } : null
         );
-        // 记住粗剪工程 id 和粗剪文件，审片要用。
-        // 以前粗剪只混在 files 里，包装一开就被交付物覆盖，界面上根本看不到。
-        if (result.projectId) setClipProjectId(result.projectId);
-        if (result.roughcutPath) setRoughcutPath(result.roughcutPath);
-        setReviewMsg(null);
+        /*
+          原来这里记住粗剪工程 id 和粗剪文件，是给粗剪审片用的。
+          审片已删，这三个 state 一起没了，所以这行也不需要了。
+          result.projectId / result.roughcutPath 后端仍照常返回 ——
+          那是粗剪工程本身的标识，别的地方（项目库）还要用，不动。
+        */
       } else {
         setExportMsg({ tone: "warn", text: result.error ?? "出片失败" });
         setArtifacts(null);
@@ -1414,27 +1408,9 @@ const runDetect = useCallback(async (): Promise<void> => {
         onCloseArtifacts={() => setArtifacts(null)}
         disabled={!candidates || candidates.length === 0}
         onOpenOptions={() => setShowOptions(true)}
-        onRunExport={runExport}
+onRunExport={runExport}
         onRerank={runRerank}
-        clipProjectId={clipProjectId}
-        onOpenReview={() => setShowReview(true)}
-        reviewHint={reviewMsg?.tone === "ok" ? "已提交" : null}
       />
-
-      {showReview && clipProjectId && (
-        <RoughcutReviewPanel
-          projectId={clipProjectId}
-          roughcutPath={roughcutPath}
-          fallbackPath={file.path}
-          onClose={() => setShowReview(false)}
-          onRecutDone={(newId, newRoughcutPath) => {
-            if (newId) setClipProjectId(newId);
-            // 也要换粗剪路径：工程换��、文件还是上一版的，
-            // 下次点开审片就会"审新工程、播旧粗剪"，点名也对不上画面。
-            setRoughcutPath(newRoughcutPath ?? null);
-          }}
-        />
-      )}
 
       {showHelp && <ShortcutHelp onClose={() => setShowHelp(false)} />}
 
@@ -1449,6 +1425,13 @@ const runDetect = useCallback(async (): Promise<void> => {
         />
       )}
 
+      {/*
+        候选卡审阅台（候选卡双击打开的那个 ReviewPanel，定义在本文件下方）。
+        注意它和刚删掉的"粗剪审片"（ReviewPanel.tsx）不是一回事：
+          这个 —— 改单个候选的标题/钩子/边界，逐句裁剪，保留
+          那个 —— 审整条粗剪、给意见/通过/打回重剪，已删除
+        两个都叫 ReviewPanel，名字撞过一次，别再搞混。
+      */}
       {reviewId !== null && candidates && (
         <ReviewPanel
           clip={candidates.find((c) => c.id === reviewId) ?? null}

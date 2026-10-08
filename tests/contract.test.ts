@@ -1145,11 +1145,21 @@ function store2(): string {
   return read("src/main/asset-store.ts");
 }
 
-describe("审片必须真的审", () => {
+/**
+ * 这个块现在只覆盖 **approve 学习闭环**：审片意见写没写进去、
+ * 重复意见会不会堆爆、失败有没有冒出来、作废工程怎么拒。
+ *
+ * 「粗剪审片」整条链路已下线（ReviewPanel.tsx 面板、TextCutter.tsx、
+ * 段映射 review-packet、打回/recut 重建、点名打回、出片台上的审片入口），
+ * 所以这里不再有 panel / dock 的顶层 read，也不再有打回相关断言。
+ *
+ * 注意别把「爆点候选打回」（/highlight/reject）一起当成粗剪审片删掉：
+ * 那是候选卡右侧的降权/避雷规则来源，不建工程、不重剪，
+ * 断言在「撤销/重做」和「记忆必须按 IP 隔离」两块里。
+ */
+describe("审片必须真的审（approve 学习闭环）", () => {
   const client = read("src/main/hermes-client.ts");
   const orch = read("../../GLB/Hermes/src/orchestrator/index.js");
-  const panel = read("src/renderer/src/components/ReviewPanel.tsx");
-  const dock = read("src/renderer/src/components/ExportDock.tsx");
   const wb = read("src/renderer/src/components/Workbench.tsx");
   const types = read("src/shared/api-types.ts");
   const main = read("src/main/index.ts");
@@ -1168,60 +1178,16 @@ describe("审片必须真的审", () => {
   });
 
   it("提交失败必须冒到界面", () => {
-    // 审片写了半天没写进去，用户却不知道 —— 比没有审片更糟
-    expect(panel).toMatch(/提交失败/);
+    // 审片意见写了半天没写进去，用户却不知道 —— 比没有审片更糟。
+    // 粗剪审片面板已删，所以这条现在只能从契约侧钉：
+    // 客户端不许自己 catch 掉（否则失败被当成成功），
+    // 服务端必须把失败原因如实回传（learnFailed / 409 + supersededBy）。
+    expect(client).not.toMatch(/async submitReview[\s\S]{0,800}catch\s*\(/);
+    expect(orch).toMatch(/learnFailed = err\.message/);
+    // 作废工程被再次确认时不能继续往下走，要回 409 并指明该用哪个工程
+    expect(orch).toMatch(/status\(409\)/);
+    expect(orch).toMatch(/supersededBy: cur\?\.id \?\? null/);
     expect(wb).not.toMatch(/api\.reviewFeedback[\s\S]{0,120}catch\(\(\) => undefined\)/);
-  });
-
-  it("打回必须强制写意见", () => {
-    // 空意见的记忆注入没有可执行内容，下次找爆点等于没打回
-    expect(panel).toMatch(/打回请写一句意见/);
-    expect(orch).toMatch(/打回请写一句意见/);
-  });
-
-  it("粗剪要能被看到", () => {
-    // 粗剪以前只混在 files 里，包装一开就被 deliver 整个覆盖，
-    // 于是界面上永远看不到粗剪，"审片"根本无从下手。
-    expect(types).toMatch(/roughcutPath\?: string/);
-    expect(types).toMatch(/projectId\?: number/);
-    expect(client).toMatch(/roughcutPath: rendered\?\.roughcutPath/);
-    expect(client).toMatch(/projectId,/);
-    // 不能再塞进 files 里被覆盖
-    expect(client).not.toMatch(/files\.push\(rendered\?\.roughcutPath\)/);
-  });
-
-  it("段映射由服务端算,不在桌面端复刻", () => {
-    // 粗剪时间轴从 0 开始，段落信息来自原素材，换算依赖
-    // "按 selected_segments 顺序累加" —— 两处实现早晚会漂移
-    expect(orch).toMatch(/review-packet/);
-    expect(orch).toMatch(/cursor \+= dur/);
-    expect(panel).toMatch(/roughcutStartSec/);
-    expect(panel).toMatch(/sourceStartSec/);
-  });
-
-  it("审片要同时给粗剪坐标和原素材坐标", () => {
-    // 只给一套坐标的话，用户点段落跳画面会跳错地方，
-    // 而且完全看不出是坐标系不对
-    expect(panel).toMatch(/正在看/);
-    expect(panel).toMatch(/粗剪 \{currentSeg\.roughcutStartSec/);
-    expect(panel).toMatch(/原素材 \{currentSeg\.sourceStartSec/);
-  });
-
-  it("粗剪没渲染出来时要回退并说清楚", () => {
-    // 静默播原素材会让用户以为审的是粗剪，实际坐标全对不上
-    expect(panel).toMatch(/粗剪还没渲染出来/);
-    expect(panel).toMatch(/fallbackPath/);
-  });
-
-  it("打回失败时不能把老工程弄丢", () => {
-    // 真实 bug：原来是先 updateClipProject(superseded) 再 createProject。
-    // 一旦重建失败（点名剔光后没有可用内容），老工程已经是 superseded、
-    // 新工程又没建成 —— 这条粗剪就凭空消失了，既没有能看的也没有错误提示。
-    const at = orch.indexOf("await this.clipper.createProject(project.live_video_id, {");
-    const sup = orch.indexOf("this.store.updateClipProject(id, { status: 'superseded' })");
-    expect(at, "找不到 recut 里的 createProject").toBeGreaterThan(-1);
-    expect(sup, "找不到归档老工程的调用").toBeGreaterThan(-1);
-    expect(sup, "必须先建新工程再归档老的").toBeGreaterThan(at);
   });
 
   it("相同意见不重复入库", () => {
@@ -1229,13 +1195,6 @@ describe("审片必须真的审", () => {
     // 记忆注入只取最近 20 条，重复意见会把别的老师的真实反馈挤出窗口。
     expect(orch).toMatch(/已有相同的通过意见，跳过重复入库/);
     expect(orch).toMatch(/comment = \? LIMIT 1/);
-  });
-
-  it("段映射要用 segmentId，不是 segmentIndex", () => {
-    // selected_segments 里存的是 segmentId（live_segments.id），没有 segment_index。
-    // 写 segmentIndex 会全变成 0：界面上每段都显示"第 0 段"，点名打回也指错段。
-    expect(orch).toMatch(/selected_segments 里存的是 segmentId/);
-    expect(orch).toMatch(/segmentId: s\.segmentId \?\? null/);
   });
 
   it("getClipProject 已把 JSON 解析成数组，别再 parse 一次", () => {
@@ -1260,49 +1219,18 @@ describe("审片必须真的审", () => {
   });
 
   it("找不到段时要说真话，不要甩锅给逐句剔除", () => {
-    // 报"勾选的分段一个都没匹配上"或"分段在库里都找不到了"，
-    // 而不是"逐句剔除后没有可用内容" —— 后者会把排查方向带到素材内容上，
-    // 而真实原因往往是 id 对不上（重分析换过段）。
+    // 报"勾选的分段 id 一个都没匹配上"，而不是"逐句剔除后没有可用内容" ——
+    // 后者会把排查方向带到素材内容上，而真实原因往往是 id 对不上（重分析换过段）。
     expect(orch).toMatch(/勾选的分段 id 一个都没匹配上/);
-    expect(orch).toMatch(/个分段在库里都找不到了/);
-    expect(orch).toMatch(/多半是重分析之后分段被换掉了/);
   });
 
-  it("打回要能按 id 回捞已作废的段", () => {
-    // 真实 bug：工程 99/100 引用的是 174 重分析之前的段（id 1065..2395，现已 superseded），
-    // 而 getLiveSegmentsByVideo 只返回 draft —— 于是用户在审旧粗剪、说"把开头那句去掉"，
-    // 却收到"这段素材没有可用内容"，等于逼他把两小时直播重新分析一遍。
-    // 源视频和起止时间都没变，应该按 id 回捞。
-    const store = readFileSync(hermesFile("src/memory/store.js"), "utf8");
-    expect(store).toMatch(/getLiveSegmentsByIds\(ids\)/);
-    expect(store).not.toMatch(/getLiveSegmentsByIds[\s\S]{0,400}status = 'draft'/);
-    expect(orch).toMatch(/getLiveSegmentsByIds\?\.\(absent\)/);
-    expect(orch).toMatch(/只补 draft 里没有的/);
-  });
-
-  it("审片包要用真实段序号，不能拿 segmentId 顶替", () => {
-    // segmentIndex 原来 fallback 到 segmentId，界面会显示成"第 1115 段"
-    expect(orch).toMatch(/indexById\.has\(Number\(s\.segmentId\)\)/);
-    expect(orch).not.toMatch(/Number\(s\.segmentIndex \?\? s\.segmentId \?\? 0\)/);
-  });
-
-  it("打回要基于原粗剪重建，不能从头自动重选", () => {
-    // 真实 bug：打回只传了 feedback/excludeSegmentIds，走 createProject 的自动路径。
-    // 后果有两层：① 用户审的是这一版、认可的也是这一版的编排，从头重选等于把他
-    // 点过头的段落全换掉，"打回"变成了"重做"；
-    // ② 自动路径重跑一遍逐句剔除，而这条粗剪本来就是从自动路径出来的，
-    // 对已作废旧段再剔一次会因零长/过短被判死，回一句"逐句剔除后没有可用内容"，
-    // 把排查方向指到素材内容上。
-    expect(orch).toMatch(/presetSegments: picked,\s*\n\s*feedback: \[comment\]/);
-    expect(orch).toMatch(/这条粗剪的段落被你全点名剔掉了/);
-    expect(orch).toMatch(/roleById/);
-  });
-
-  it("打回重建时要丢掉零长段", () => {
-    // 老工程里存着历史零长段（endMs == startMs），presetSegments 这条路不过滤，
-    // ffmpeg 切零长出黑帧，审片台点开就是一段黑。实测打回后的新工程带着 8 个。
+  it("presetSegments 重建时要丢掉零长段", () => {
+    // presetSegments 这条路还会带进历史零长段（endMs == startMs）：
+    // 自动选段在写库前已经滤过一次，可勾选/重建这条路是从库里按 id 取的，
+    // 混着零长段就会让 ffmpeg 切出黑帧。
+    // 所以这条防护是 presetSegments 所有调用方共用的，不是某条链路的专属。
     expect(clipper).toMatch(/丢弃零长段 #\$\{s\.id \?\? s\.segment_index\}/);
-    expect(clipper).toMatch(/打回的段落全是零长段/);
+    expect(clipper).toMatch(/全是零长段/);
   });
 
   it.skipIf(!hasE2E)("验证脚本导入素材只能追加，不能覆盖整个索引", () => {
@@ -1329,56 +1257,17 @@ describe("审片必须真的审", () => {
     expect(e2e).not.toMatch(/project_97/);
   });
 
-  it("点段落必须真的跳播放头", () => {
-    // 界面上写着"点行跳到该段"，实际 onClick 只 setActiveSeg，
-    // 而 activeSeg 只用于高亮 —— 按钮在骗人。而且行数常有上百条，
-    // 不能靠手动滚列表去对着画面。
-    expect(panel).toMatch(/const jumpTo = \(idx: number\)/);
-    expect(panel).toMatch(/seekTo\(s\.roughcutStartSec\)/);
-    expect(panel).toMatch(/onClick=\{\(\) => jumpTo\(idx\)\}/);
-    expect(panel).not.toMatch(/onClick=\{\(\) => setActiveSeg\(idx\)\}/);
-  });
-
-  it("跳转要能重复触发，不能靠 seekTo 的值变化", () => {
-    // seekTo 是 useEffect([seekTo])，值不变就不触发 —— 连点同一段时
-    // 第二次点击毫无反应，而"回听同一句话"恰恰是审片最高频的动作。
-    expect(panel).toMatch(/registerApi/);
-    expect(panel).toMatch(/pendingSeek/);
-    expect(panel).toMatch(/api\.seek\(pendingSeek\.current\)/);
-  });
-
-  it("高亮只能有一个来源：播放头位置", () => {
-    // 原来有 activeSeg(点击)和 currentSeg(播放头) 两套高亮，会互相打架：
-    // 点了 A 段高亮 A，播到 B 段"正在看"是 B，同屏两个都亮。
-    expect(panel).toMatch(/const currentIdx = useMemo/);
-    expect(panel).not.toMatch(/const \[activeSeg, setActiveSeg\]/);
-  });
-
-  it("播放头走到哪，当前行滚到哪", () => {
-    expect(panel).toMatch(/rowRefs/);
-    expect(panel).toMatch(/box\.scrollTo/);
-  });
-
-  it("审片台自己接管键盘，全局快捷键要让位", () => {
-    // 真实 bug：空格是全局的，审片台弹在工作台上面，
-    // 按空格暂停的是背后那个播放器，画面纹丝不动，像坏了。
-    // 而 A/D 会误触全选/反选改掉选片结果。
+  it("弹窗要让位全局快捷键时,这个开关必须每次现读", () => {
+    /*
+     * 原断言是"粗剪审片台自己接管键盘"，面板已删。
+     * 但 useShortcuts 的 enabled 逃生口还在（候选卡审阅台这类弹窗随时要用），
+     * 而且它有个很容易写错的点：effect 依赖是 []，
+     * 只在挂载时读一次的话，弹窗打开/关闭那一刻的快捷键行为就永远错下去。
+     */
     const sc = read("src/renderer/src/hooks/useShortcuts.ts");
     expect(sc).toMatch(/enabled\?: boolean/);
     expect(sc).toMatch(/if \(get\(\)\.enabled === false\) return;/);
     expect(sc, "enabled 不能只在挂载时读一次").toMatch(/get\(\)\.enabled/);
-    expect(wb).toMatch(/enabled: !showReview/);
-    expect(panel).toMatch(/case " ":[\s\S]{0,120}playback\.current\?\.toggle\(\)/);
-    expect(panel).toMatch(/case "\[":[\s\S]{0,120}stepSeg\(-1\)/);
-  });
-
-  it("打回后要换成新工程的粗剪，不能还播旧文件", () => {
-    // 审片台以 packet.roughcutPath 为准（它跟着工程走），
-    // prop 只作兜底；并且打回后要把新路径交回工作台，
-    // 否则下次开审片还是上一版的文件。
-    expect(panel).toMatch(/packet\?\.roughcutPath \|\| roughcutPath/);
-    expect(panel).toMatch(/onRecutDone\?\.\(r\.newProjectId, packetRef\.current\?\.roughcutPath\)/);
-    expect(wb).toMatch(/setRoughcutPath\(newRoughcutPath \?\? null\)/);
   });
 
   it("云端请求必须能走代理,否则在这台机器上永远连不上", () => {
@@ -1556,21 +1445,7 @@ describe("审片必须真的审", () => {
     expect(probe).toMatch(/<WindowedList/);
   });
 
-it("审片包必须带上可编辑原文,否则框选删除无从下手", () => {
-    // 审片台要"像编辑文本框一样框选几个字删掉"，
-    // 而 selected_segments 里只有主题名和时间轴 —— 没有文本就没有东西可选。
-    expect(orch).toMatch(/buildEditableText\(transcript, start, end\)/);
-    expect(orch).toMatch(/text: editable\.text/);
-    expect(orch).toMatch(/sentences: editable\.sentences/);
-    // 实操教学段（几乎没文字）要单独标记，界面才显示成时间区间块
-    expect(orch).toMatch(/textless: tl\.textless/);
-    // 已有剪辑区间要回传，界面才能显示删除线
-    expect(orch).toMatch(/cuts: Array\.isArray\(s\.cuts\)/);
-    // 但 live-result 绝对不能带原文：那是一次几百段的响应，会膨胀到几 MB
-    expect(orch).not.toMatch(/live-result[\s\S]{0,400}buildEditableText/);
-  });
-
-  it("秒/毫秒换算的括号不能错", () => {
+it("秒/毫秒换算的括号不能错", () => {
     // 隐蔽到只能靠真数据发现的 bug：
     // 写成 Math.max(a, toSec || 0) * 1000，会把已经换算成毫秒的 a 又乘一次 1000，
     // 于是 60 秒的范围变成 1750 秒 —— 命中 910 句（整场三分之一）、每段文本 6 万字。
@@ -1605,34 +1480,32 @@ it("审片包必须带上可编辑原文,否则框选删除无从下手", () => 
     expect(an).toMatch(/health\.grade = 'cancelled'/);
   });
 
-  it("API 三处必须齐全", () => {
-    // 少改一处就静默失效 —— 这是本项目反复踩的坑
-    for (const m of ["reviewPacket", "submitReview"]) {
+  it("approve 的桥必须三处齐全", () => {
+    // 少改一处就静默失效 —— 这是本项目反复踩的坑。
+    // 原来这里是 reviewPacket + submitReview 两个一起钉，
+    // 现在只剩 approve：reviewPacket 随粗剪审片一起删干净。
+    for (const m of ["submitReview"]) {
       expect(types, `StudioApi 缺 ${m}`).toMatch(new RegExp(`${m}\\(`));
       expect(preload, `preload 缺 ${m}`).toMatch(new RegExp(`${m}:`));
       expect(client, `hermes-client 缺 ${m}`).toMatch(new RegExp(`async ${m}\\(`));
     }
-    expect(main).toMatch(/"algo:reviewPacket"/);
     expect(main).toMatch(/"algo:submitReview"/);
+    // 反向也钉一下：审片包那条通道不许留半截残骸
+    // （声明还在、通道没了的话，调用点会以 undefined 静默失败）
+    expect(main).not.toMatch(/reviewPacket/);
+    expect(preload).not.toMatch(/reviewPacket:/);
+    expect(client).not.toMatch(/async reviewPacket\(/);
+    expect(types).not.toMatch(/reviewPacket\(/);
   });
 
-  it("点名打回要和『看』分开", () => {
-    // 勾选框的语义必须写清楚：勾了不代表在看，代表要拉黑
-    expect(panel).toMatch(/点名打回/);
-    expect(panel).toMatch(/已点名 \$\{rejectIds\.size\} 段/);
-  });
-
-  it("审片入口要给出片台常驻", () => {
-    // 以前只能去输出目录手动找粗剪文件
-    expect(dock).toMatch(/onOpenReview/);
-    expect(dock).toMatch(/审片/);
-    expect(wb).toMatch(/onOpenReview=\{\(\) => setShowReview\(true\)\}/);
-  });
-
-  it("审片历史要能看到", () => {
-    expect(types).toMatch(/export interface ReviewRecord/);
-    expect(types).toMatch(/export interface ReviewPacket/);
-    expect(panel).toMatch(/审片历史/);
+  it("粗剪审片下线后,接口不该再暴露它专用字段", () => {
+    // segmentIds / textCuts 是"点名打回"和"框选删字"才有的载荷，
+    // roughcutPath / newProjectId 那个返回形状跟着打回重建一起没了。
+    // 留着它们的话，下次接线的人会照着类型写出永远 404 的调用。
+    expect(types).not.toMatch(/textCuts/);
+    expect(types).not.toMatch(/newProjectId/);
+    expect(preload).not.toMatch(/textCuts|newProjectId/);
+    expect(client).not.toMatch(/textCuts|newProjectId/);
   });
 
   it("批注不能在 onChange 里就提交", () => {
@@ -2252,8 +2125,17 @@ describe("记忆必须按 IP 隔离(选谁学谁)", () => {
     // 回落会让"没设集合"看起来像"用了某套记忆",是假象
     const fns = ["getCollectionHooks", "getCollectionThemeKeywords", "getCollectionAvoidRules", "getCollectionHits"];
     for (const f of fns) {
-      const body = store.slice(store.indexOf(`${f}(`));
-      expect(body.slice(0, 220)).toMatch(/if \(!name\) return \[\]/);
+      /*
+        必须锚到**方法定义**上，不能用 indexOf(`${f}(`)。
+        原来那样写会在注释里先撞上：store.js 建表那段有一句
+        "approve 学习闭环与 getCollectionAvoidRules() 仍依赖它"，
+        于是截出来的 220 字符全是那句注释，函数体根本没进来 ——
+        测试变成在断言"注释内容"，函数真的删了它也照样绿。
+        `  ${f}(` 带两个前导空格才是方法定义的形状。
+      */
+      const at = store.indexOf(`  ${f}(`);
+      expect(at, `store.js 里找不到方法定义 ${f}`).toBeGreaterThan(-1);
+      expect(store.slice(at, at + 260)).toMatch(/if \(!name\) return \[\]/);
     }
   });
 
@@ -2527,29 +2409,30 @@ it("所有子进程都必须 windowsHide，否则会弹黑框抢焦点", () => {
     expect(asr).toMatch(/spawn\(cmd, args, \{ shell: false, windowsHide: true \}\)/);
 });
 
-it("「确认通过」不能静默丢掉待生效的文字删除", () => {
-  /*
-   * 以前 ReviewPanel 里 approve 分支直接把 textCuts 丢掉并 setTextCuts([])，
-   * 而底部说明写着"随打回一起生效"，且"确认通过"按钮就紧挨在"打回"旁边。
-   * 一次误点，框了半天选中的字全部消失，界面一个字都没提。
-   */
-  const rp = read("src/renderer/src/components/ReviewPanel.tsx");
-  expect(rp).toMatch(/confirmApproveWithCuts/);
-  expect(rp).toMatch(/确认通过会丢掉这些文字删除/);
-  // 必须给出"改用打回"这个出路，而不只是取消
-  expect(rp).toMatch(/改用「打回重剪」/);
-});
-
 it("通过回执必须如实反映学习有没有写成", () => {
   /*
    * 服务端把整个正样本写入包在 try 里，抛错时"通过"照样成立。
    * 界面以前无条件显示"下次找爆点会参考这次的意见" —— 失败时说的正好是反的。
+   *
+   * 原来这条断言的是面板里的三处文案（learnFailed / 没记进去 / supersededBy），
+   * 面板随粗剪审片一起删了。所以现在钉在契约链上：
+   * 失败原因和"该用哪个工程"必须从服务端一路透到桌面端的类型与客户端返回值，
+   * 否则调用方只能无条件显示"下次会参考这次的意见"——失败时说的正好是反的。
    */
-  const rp2 = read("src/renderer/src/components/ReviewPanel.tsx");
-  expect(rp2).toMatch(/r\.learnFailed/);
-  expect(rp2).toMatch(/这次的意见没记进去/);
-  // 作废工程被拒时不能继续往下走
-  expect(rp2).toMatch(/supersededBy/);
+  const orch2 = read("../../GLB/Hermes/src/orchestrator/index.js");
+  const types2 = read("src/shared/api-types.ts");
+  const preload2 = read("src/preload/index.ts");
+  const client2 = read("src/main/hermes-client.ts");
+  // 服务端：写入失败要带原因，作废工程要回 409 并指明该用哪个工程
+  expect(orch2).toMatch(/learnFailed = err\.message/);
+  expect(orch2).toMatch(/status\(409\)/);
+  expect(orch2).toMatch(/supersededBy: cur\?\.id \?\? null/);
+  // 三处声明都要能看到这两个字段，缺一处调用方就只剩"永远成功"这一种说法
+  for (const [name, src] of [["api-types", types2], ["preload", preload2], ["hermes-client", client2]] as const) {
+    expect(src, `${name} 缺 learnFailed`).toMatch(/learnFailed\?: string \| null/);
+    expect(src, `${name} 缺 learned`).toMatch(/learned\?: number/);
+  }
+  expect(types2).toMatch(/supersededBy\?: number \| null/);
 });
 
 it("UI 要能完成全流程:新建/重命名/删除/恢复/写入记忆/批量导入/撤回/删单条", () => {

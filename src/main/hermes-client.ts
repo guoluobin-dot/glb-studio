@@ -508,49 +508,6 @@ async cancelDetect(filePath: string): Promise<{ ok: boolean; aborted: boolean }>
   }
 
   /**
-   * 拉取审片包：粗剪路径 + 段映射 + 历史意见。
-   *
-   * 段映射必须由服务端算：粗剪时间轴从 0 开始，段落信息来自原素材，
-   * 两套坐标的换算依赖"按 selected_segments 顺序累加"，自己算早晚和这里不一致。
-   */
-  async reviewPacket(
-    projectId: number
-  ): Promise<{
-    projectId: number;
-    status: string;
-    liveVideoId: number;
-    roughcutPath: string;
-    totalSec: number;
-    segments: ClipSegmentMap[];
-    feedback: Array<{
-      id: number;
-      decision: string;
-      comment: string;
-      segmentIds: string | null;
-      createdAt: string;
-      collection: string | null;
-    }>;
-  }> {
-    return this.get<{
-      ok: boolean;
-      projectId: number;
-      status: string;
-      liveVideoId: number;
-      roughcutPath: string;
-      totalSec: number;
-      segments: ClipSegmentMap[];
-      feedback: Array<{
-        id: number;
-        decision: string;
-        comment: string;
-        segmentIds: string | null;
-        createdAt: string;
-        collection: string | null;
-      }>;
-    }>(`/projects/${projectId}/review-packet`);
-  }
-
-  /**
    * 提交审片结论。
    *
    * 断链修复：以前这里打的是 POST /projects/review（无此路由 → 404），
@@ -558,21 +515,22 @@ async cancelDetect(filePath: string): Promise<{ ok: boolean; aborted: boolean }>
    * 端点要的是 decision/comment/segmentIds + URL 里的 projectId）。
    * 于是每次审片都 404，异常又被界面 .catch 吞掉 ——
    * 桌面上从来没写进过一条 review_feedback，审片意见对下一次出片零影响。
+   *
+   * decision 现在只有 "approve"：打回/重剪（recut）那条链路连同
+   * ReviewPanel 已整体删除，界面不会再发 recut。approve 保留 ——
+   * 它是"用户认可这版段落编排"的正样本学习信号，还在喂 IP 记忆。
    */
   async submitReview(
     projectId: number,
     payload: {
-      decision: "approve" | "recut";
+      decision: "approve";
       comment?: string;
-      /** 被点名的段（live_segments.id 或 segment_index，Hermes 两种都认） */
-      segmentIds?: number[];
     }
-  ): Promise<{ ok: boolean; projectId?: number; newProjectId?: number; status?: string; pendingQueries?: unknown[] }> {
+  ): Promise<{ ok: boolean; projectId?: number; status?: string; learned?: number; learnFailed?: string | null }> {
     if (!projectId) throw new HermesError("缺少粗剪工程 id，无法提交审片结论");
     return this.call("POST", `/projects/${projectId}/review`, {
       decision: payload.decision,
-      comment: payload.comment ?? "",
-      segmentIds: payload.segmentIds ?? []
+      comment: payload.comment ?? ""
     });
   }
 

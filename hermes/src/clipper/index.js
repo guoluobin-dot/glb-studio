@@ -280,12 +280,13 @@ export class Clipper {
         viralOpening: Boolean(s._viralOpening)
       });
 
-      // 丢掉零长/反向段。
-      //
-      // 自动选段那条路在写库前已经过滤过一次，所以这里原本没事。
-      // 但打回重建走的是 presetSegments，带进来的是老工程里存的历史段，
-      // 其中混着零长段（endMs == startMs）—— ffmpeg 切零长会出黑帧，
-      // 审片台上点开就是一段黑。实测打回后新工程里带着 8 个。
+      /*
+       * 丢掉零长/反向段。
+       *
+       * 保留：presetSegments 这条路还有别的调用方（/pipeline/clip 的用户勾选路径），
+       * 不只是已删除的打回重建。而 ffmpeg 切零长段会出黑帧，
+       * 所以这个防护对所有 presetSegments 调用方都成立，不是打回专属。
+       */
       const usable = opts.presetSegments.filter((s) => {
         const a = Number(s.startMs ?? s.start_ms ?? 0);
         const b = Number(s.endMs ?? s.end_ms ?? 0);
@@ -296,7 +297,7 @@ export class Clipper {
 
       const selected = usable.map((s) => toRow(s, s.role || 'body'));
       if (!selected.length) {
-        throw new Error('打回的段落全是零长段（起止时间相同），没有可以剪出来的内容。请重新分析这场直播再审一次。');
+        throw new Error('所选段落全是零长段（起止时间相同），没有可以剪出来的内容。请重新分析这场直播再出一次粗剪。');
       }
       if (openingPlan.prepend) {
         selected.unshift(toRow(openingPlan.prepend, 'hook'));
@@ -369,7 +370,14 @@ export class Clipper {
       throw new Error(`该直播还没有可用分段（转写可能为空或主题分析失败），请先点“重新分析”，成功出现分段数后再粗剪`);
     }
 
-    // 打回意见：剔除用户明确不要的段
+    /*
+     * 剔除用户明确不要的段。
+     *
+     * 保留：打回重剪链路已下线，opts.excludeSegmentIds 现在没有新的调用方了
+     * （曾由 recut 分支传入）。但 _rejectedSegmentIds 读的是 review_feedback 里
+     * 历史写入的 segment_ids，库里已有数据还在，这层剔除仍然有意义；
+     * 删掉会让历史上被打回的段重新被选进来。故整段保留。
+     */
     const exclude = new Set([...(opts.excludeSegmentIds || []), ...this._rejectedSegmentIds(liveVideoId)]);
     if (exclude.size > 0) {
       const before = segments.length;
@@ -810,8 +818,8 @@ export class Clipper {
          * **重复的段写回库**。
          *
          * 后果全是静默的：generator 按数组下标累计字幕偏移，于是重复段的字幕
-         * 被放到画面已经切走之后（字幕整体错位）；review-packet 把同一段吐 3 遍、
-         * totalSec 虚高；resume-clip 会拿这份被污染的数组再切一遍，成片里出现重复画面。
+         * 被放到画面已经切走之后（字幕整体错位）；resume-clip 会拿这份被污染的数组
+         * 再切一遍，成片里出现重复画面。
          *
          * 判据必须是"这段的所有子区间都成功"，而不是"每成功一个子区间就记一次"。
          */

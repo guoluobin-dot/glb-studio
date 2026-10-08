@@ -1,13 +1,15 @@
 /**
- * 剪辑决策学习：样本抽取的回归测试
+ * 剪辑决策学习：记忆库落库与读取的回归测试
  *
- * 这里守的是整个学习系统最容易做错、且错了完全静默的一件事：
- * **只学删除、不学保留。**
+ * 打回重剪（recut）链路已下线，因此本文件里原先针对
+ * review-learning.js（splitByCuts / keptSegments / buildLearningRecord）
+ * 的那几组用例一并删除 —— 那个模块只被已删除的打回分支调用。
  *
- * 删除是显式动作，保留是默认动作。如果只把删掉的写进库，
- * 系统学到的只有"别说什么"，而"该说什么"—— 也就是爆款的正向逻辑 ——
- * 一条样本都没有。下次找爆点会得出反向结论：
- * 凡是用户删过的类型都别要，包括用户其实很喜欢的那些。
+ * 保留下来的是**保留 approve 学习闭环**需要的部分：
+ * approve 分支写 review_edits（segment + keep 正样本），
+ * 桌面端 /memory/edit-records 也走同一张表，
+ * 再由 getEditArchive / getEditStyleSummary 读回去注入下一次分析。
+ * 这里守的就是这条链路的两端：写得进、读得出、按 IP 隔离。
  *
  * @author 郭洛斌
  */
@@ -17,7 +19,6 @@ import assert from 'node:assert/strict';
 import { readFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import Database from 'better-sqlite3';
-import { splitByCuts, keptSegments, buildLearningRecord } from '../review-learning.js';
 
 /**
  * 最小 expect 垫片。
@@ -48,170 +49,11 @@ function expect(actual) {
   return api;
 }
 
-const PUNCT = /[，。！？、；：,.!?;]/;
-
-/** 与 charRangeToTime 同算法（review-learning.mapRange 的行为） */
-function mapRange(sentences, r, segStart) {
-  const spans = [];
-  let cursor = 0;
-  for (const s of sentences) {
-    const t = String(s.text || '');
-    spans.push({ from: cursor, to: cursor + t.length, text: t, startMs: s.startMs, endMs: s.endMs });
-    cursor += t.length + 1;
-  }
-  const text = sentences.map((s) => s.text).join(' ');
-  const from = Math.max(0, Math.min(text.length, Math.floor(r.from ?? 0)));
-  const to = Math.max(from, Math.min(text.length, Math.ceil(r.to ?? 0)));
-  if (to <= from) return null;
-  let st = Infinity;
-  let en = -Infinity;
-  for (const sp of spans) {
-    const a = Math.max(from, sp.from);
-    const b = Math.min(to, sp.to);
-    if (b <= a) continue;
-    const span = Math.max(0, sp.endMs - sp.startMs);
-    if (!(span > 0)) continue;
-    const spoken = Math.max(1, [...sp.text].filter((c) => !PUNCT.test(c)).length);
-    let w = 0;
-    for (let i = 0; i < a - sp.from; i++) w += PUNCT.test(sp.text[i] ?? '') ? 0.25 : 1;
-    let w2 = 0;
-    for (let i = 0; i < b - sp.from; i++) w2 += PUNCT.test(sp.text[i] ?? '') ? 0.25 : 1;
-    st = Math.min(st, segStart + sp.startMs + span * (w / spoken));
-    en = Math.max(en, segStart + sp.startMs + span * (w2 / spoken));
-  }
-  if (!Number.isFinite(st) || en <= st) return null;
-  return { st: Math.round(st), en: Math.round(en) };
-}
-
-const SENTENCES = [
-  { startMs: 0, endMs: 10000, text: '同学们欢迎大家来到我的直播间' },
-  { startMs: 10000, endMs: 20000, text: '今天我们来讲和弦的构成' },
-  { startMs: 20000, endMs: 30000, text: '首先按住这个根音' }
-];
-const TEXT = SENTENCES.map((s) => s.text).join(' ');
-
-describe('学习样本 · 删与留都要记', () => {
-  it('删第一句的话术，第二三句必须作为 keep 留下来', () => {
-    const cuts = [mapRange(SENTENCES, { from: 0, to: SENTENCES[0].text.length }, 0)];
-    const r = splitByCuts(SENTENCES, TEXT, cuts, 0);
-    expect(r.cuts.length).toBe(1);
-    expect(r.cuts[0].text).toContain('同学们欢迎');
-    // 这是最关键的一条断言：留存的比删掉的多得多
-    expect(r.keeps.length).toBeGreaterThan(0);
-    expect(r.keeps.map((k) => k.text).join('')).toContain('和弦的构成');
-  });
-
-  it('不删任何东西时，全部都是 keep（保留是默认动作，必须显式记）', () => {
-    const r = splitByCuts(SENTENCES, TEXT, [], 0);
-    expect(r.cuts.length).toBe(0);
-    expect(r.keeps.length).toBe(3);
-  });
-
-  it('删整句时该句不产生 keep（否则会把删掉的内容当成正样本）', () => {
-    const all = SENTENCES.map((s) => s.text).join(' ').length;
-    const r = splitByCuts(SENTENCES, TEXT, [mapRange(SENTENCES, { from: 0, to: all }, 0)], 0);
-    expect(r.keeps.length).toBe(0);
-    expect(r.cuts.length).toBe(3);
-  });
-
-  it('句内局部删除：切出来的 keep 拼回原文（不丢字、不重字）', () => {
-    const s0 = SENTENCES[0].text;
-    // 删"欢迎大家"四个字
-    const r = splitByCts(s0);
-    function splitByCts(t) {
-      const cuts = [mapRange(SENTENCES, { from: 3, to: 7 }, 0)];
-      return splitByCuts(SENTENCES, TEXT, cuts, 0);
-    }
-    const cutTxt = r.cuts.map((c) => c.text).join('');
-    const keepTxt = r.keeps.map((k) => k.text).join('');
-    expect(cutTxt.length + keepTxt.length).toBe(TEXT.replace(/ /g, '').length);
-    expect(keepTxt).toContain('同学们');
-  });
-
-  it('cut 带字符位置，能反查回原文（学习样本要能溯源）', () => {
-    const r = splitByCuts(SENTENCES, TEXT, [mapRange(SENTENCES, { from: 0, to: 3 }, 0)], 0);
-    const c = r.cuts[0];
-    expect(c.fromChar).toBe(0);
-    expect(c.toChar).toBe(3);
-    expect(TEXT.slice(c.fromChar, c.toChar)).toBe(c.text);
-  });
-
-  it('空句子列表不崩（实操段没有文本）', () => {
-    const r = splitByCts();
-    function splitByCts() { return splitByCuts([], '', [], 0); }
-    expect(r.cuts.length).toBe(0);
-    expect(r.keeps.length).toBe(0);
-  });
-});
-
-describe('学习样本 · 整段保留的内容逻辑', () => {
-  const picked = [
-    { id: 1, role: 'hook', themeName: '欢迎语', hookQuality: 0.9, startMs: 0, endMs: 15000 },
-    { id: 2, role: 'body', themeName: '和弦讲解', hookQuality: 0.7, startMs: 15000, endMs: 60000 },
-    { id: 3, role: 'cta', themeName: '关注引导', hookQuality: 0.5, startMs: 60000, endMs: 70000 }
-  ];
-
-  it('勾选的段全部记下来，带上角色（结构层信号）', () => {
-    const kept = keptSegments(picked, []);
-    expect(kept.length).toBe(3);
-    expect(kept.map((k) => k.role)).toEqual(['hook', 'body', 'cta']);
-    expect(kept[0].by).toBe('picked');
-  });
-
-  it('被点名打回的段不算"用户认可"（不能当正样本学）', () => {
-    const kept = keptSegments(picked, [1]);
-    expect(kept.length).toBe(2);
-    expect(kept.find((k) => k.segmentId === 1)).toBeUndefined();
-  });
-
-  it('只靠一个字段就能区分主动认可和默认保留', () => {
-    // by 必须有：用户没点勾选框的段只能算"没反对"，
-    // 当成"用户认为这段好"是过度解读，会把噪声学进去。
-    const kept = keptSegments(picked, []);
-    for (const k of kept) expect(k.by).toBe('picked');
-  });
-});
-
-describe('学习样本 · buildLearningRecord 汇总', () => {
-  it('同时产出 cut / keep / segment 三类', () => {
-    const editableBySeg = new Map([[1, { text: TEXT, sentences: SENTENCES }]]);
-    const rec = buildLearningRecord({
-      picked: [{ id: 1, role: 'hook', themeName: '开场', hookQuality: 0.8, startMs: 0, endMs: 30000 }],
-      rejectedIds: [],
-      textCuts: [{ segmentId: 1, ranges: [{ from: 0, to: 3 }] }],
-      editableBySeg,
-      segStartById: new Map([[1, 0]]),
-      liveVideoId: 1,
-      comment: '开场别念欢迎语'
-    });
-    expect(rec.cuts.length).toBe(1);
-    expect(rec.keeps.length).toBeGreaterThan(0);
-    expect(rec.keptSegments.length).toBe(1);
-  });
-
-  it('被点名打回的段，其文字取舍不算认可（不记 keep）', () => {
-    const editableBySeg = new Map([[1, { text: TEXT, sentences: SENTENCES }]]);
-    const rec = buildLearningRecord({
-      picked: [{ id: 1, role: 'body', themeName: 'x', hookQuality: 0.5, startMs: 0, endMs: 30000 }],
-      rejectedIds: [1],
-      textCuts: [{ segmentId: 1, ranges: [{ from: 0, to: 3 }] }],
-      editableBySeg,
-      segStartById: new Map([[1, 0]]),
-      liveVideoId: 1,
-      comment: ''
-    });
-    // 整段被否决 → 没有 keptSegments，文字样本也不该记成正样本
-    expect(rec.keptSegments.length).toBe(0);
-    expect(rec.keeps.length).toBe(0);
-  });
-});
-
 describe('记忆库 · review_edits 落库与读取', () => {
   const dbPath = 'data/hermes-test-edits.db';
   let store;
 
   before(async () => {
-    // \u5bfc\u51fa\u540d\u662f MemoryStore
     const { MemoryStore } = await import('../../memory/store.js');
     /*
      * 指向一次性库，绝不碰生产数据。
@@ -284,7 +126,6 @@ describe('IP 老师归档 · 每个老师的档案独立', () => {
   let store;
 
   before(async () => {
-    // \u5bfc\u51fa\u540d\u662f MemoryStore
     const { MemoryStore } = await import('../../memory/store.js');
     const dbPath = 'data/hermes-test-archive.db';
     const json = JSON.parse(readFileSync(join(process.cwd(), 'config', 'default.json'), 'utf8'));

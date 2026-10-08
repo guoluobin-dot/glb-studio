@@ -763,8 +763,7 @@ function registerIpc(): void {
   handle("algo:rerank", (fileName: string, mode: "short" | "mid" | "long", candidates: Parameters<StudioApi["rerank"]>[2]) =>
     hermes.rerank(fileName, mode, candidates)
   );
-  /* 审片 */
-  handle("algo:reviewPacket", (projectId: number) => hermes.reviewPacket(projectId));
+  /* 审片：打回/重剪链路已删，只留"确认通过"这一条学习信号 */
   handle(
     "algo:submitReview",
     (projectId: number, payload: Parameters<StudioApi["submitReview"]>[1]) =>

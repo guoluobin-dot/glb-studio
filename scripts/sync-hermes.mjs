@@ -27,7 +27,7 @@ const CHECK_ONLY = process.argv.includes('--check');
  *
  * 'scripts' 的理由和上面几项不同，单独说：
  * 它不是体积或密钥问题，是"诊断脚本不属于引擎"。那 11 个文件全是
- * diag-*/probe-*/reanalyze-*/test-zen 这类一次性排查工具，
+ * 那 11 个文件全是 diag-、probe-、reanalyze-、test-zen 这类一次性排查工具，
  * 依赖本机环境（路径写死 D:/GLB/Hermes、.py/.ps1/.cmd 混着），
  * 引擎跑起来一个都用不到。同步是"先 rmSync 清空 DST 再拷贝"的镜像同步，
  * 所以加了这一项，下次同步 hermes/scripts/ 会自动从快照里消失，

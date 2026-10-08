@@ -7,7 +7,7 @@
  * 记忆深找(让引擎按学过的爆款规律重排)放在这里,因为它同样是"决定选什么"的动作。
  */
 import { useState } from "react";
-import { LuBrain, LuCheck, LuEye, LuFolderOpen, LuLayers, LuScissors, LuSlidersHorizontal } from "react-icons/lu";
+import { LuBrain, LuCheck, LuFolderOpen, LuLayers, LuScissors, LuSlidersHorizontal } from "react-icons/lu";
 import type { ClipCandidate, EngineSettings } from "@shared/api-types";
 import { useSession } from "../stores/session-store";
 import { call } from "../lib/bridge";
@@ -32,10 +32,7 @@ export function ExportDock({
   disabled = false,
   onOpenOptions,
   onRunExport,
-  onRerank,
-  clipProjectId,
-  onOpenReview,
-  reviewHint
+  onRerank
 }: {
   engine: EngineSettings | null;
   message: { tone: "ok" | "warn"; text: string } | null;
@@ -45,11 +42,11 @@ export function ExportDock({
   /** 没有候选时禁用出片(参数仍可调) */
   disabled?: boolean;
   onOpenOptions: () => void;
-  /** 有粗剪可审时才显示 */
-  clipProjectId?: number | null;
-  onOpenReview?: () => void;
-  /** 审片按钮旁的提示，比如上次审到第几轮 */
-  reviewHint?: string | null;
+  /*
+    原来还有 clipProjectId / onOpenReview / reviewHint 三个 prop，
+    是给「审片」按钮用的。粗剪审片已删除，这三个一起走 ——
+    留着会让调用方以为还能传，实际上没有任何地方消费它们。
+  */
   onRunExport: () => Promise<void>;
   onRerank: (tier: TierId) => Promise<string>;
 }): React.JSX.Element {
@@ -209,37 +206,20 @@ export function ExportDock({
           </button>
         </div>
 
-        {/* 次级操作：两个并排，避免竖着堆两条同样的按钮 */}
-        <div className="grid grid-cols-2 gap-2">
-          <button
-            type="button"
-            onClick={onOpenOptions}
-            className="flex items-center justify-center gap-1.5 rounded-lg border border-line px-2 py-2 text-[11.5px] font-semibold text-mut transition-colors hover:border-mut/50 hover:text-fg"
-          >
-            <LuSlidersHorizontal className="h-3.5 w-3.5 shrink-0" />
-            全部选项
-          </button>
-          {/* 审片入口。出过片才有粗剪可审，所以按 projectId 是否存在来显示。
-              没有它的话用户只能去输出目录里手动找粗剪文件，
-              审片意见也就没法回流到记忆里。 */}
-          {clipProjectId ? (
-            <button
-              type="button"
-              onClick={onOpenReview}
-              title="看粗剪本体、逐段给意见、通过或打回"
-              className="flex items-center justify-center gap-1.5 rounded-lg border border-line px-2 py-2 text-[11.5px] font-semibold text-mut transition-colors hover:border-ember/60 hover:text-ember"
-            >
-              <LuEye className="h-3.5 w-3.5 shrink-0" />
-              审片
-              {reviewHint && <span className="truncate text-[10px] font-normal opacity-75">{reviewHint}</span>}
-            </button>
-          ) : (
-            <span className="flex items-center justify-center gap-1.5 rounded-lg border border-line/40 px-2 py-2 text-[11.5px] text-mut-2/60">
-              <LuEye className="h-3.5 w-3.5 shrink-0" />
-              审片
-            </span>
-          )}
-        </div>
+        {/*
+          次级操作：原来这里有两个并排 —— 「全部选项」和「审片」。
+          审片（粗剪审片：给意见、点名打回、重剪）已删除，
+          所以剩下一个按钮就占满整行 —— 留着半格空白更难看，
+          而半格宽的按钮点起来也不如整行好按。
+        */}
+        <button
+          type="button"
+          onClick={onOpenOptions}
+          className="mb-2 flex w-full items-center justify-center gap-1.5 rounded-lg border border-line px-2 py-2 text-[11.5px] font-semibold text-mut transition-colors hover:border-mut/50 hover:text-fg"
+        >
+          <LuSlidersHorizontal className="h-3.5 w-3.5 shrink-0" />
+          全部选项
+        </button>
         {stage === "exporting" ? (
           <div className="pt-0.5">
             <Progress percent={null} label="正在出片…" />
