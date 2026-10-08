@@ -1312,7 +1312,17 @@ const runDetect = useCallback(async (): Promise<void> => {
                       }}
                     />
                   ) : (
-                    <div className="flex h-full min-h-0 flex-col items-center justify-center gap-3 rounded-xl border border-line bg-panel-2/40 p-6 text-center">
+                    /*
+                     flex-1 不能少，和 TranscriptPanel 是同一个坑。
+                     父容器是 `flex` 行布局（`flex min-h-0 flex-1 overflow-hidden`），
+                     行布局下 stretch 只作用在交叉轴，主轴宽度按 flex-basis 算 ——
+                     不写 flex-1 就是"内容多宽算多宽"，这个占位卡片会比整栏窄一截，
+                     右边空出一条竖缝，而且下方逐句稿是满宽的，两块右边缘对不齐。
+
+                     为什么一直没被发现：候选项**存在**时走的是 CandidateList，
+                     它根节点带 flex-1，显示是满的。只有空状态/分析中才露出来。
+                   */
+                    <div className="flex h-full min-h-0 flex-1 flex-col items-center justify-center gap-3 rounded-xl border border-line bg-panel-2/40 p-6 text-center">
                       {detecting || transcribing ? (
                         <>
                           <LuLoaderCircle className="h-6 w-6 spin-slow text-ember" />

@@ -2821,6 +2821,37 @@ it("测试里不许再出现写死的本机路径", () => {
     expect(cl).toMatch(/flex min-h-0 flex-1 flex-col/);
   });
 
+  it("行布局容器里的直接子元素必须带 flex-1,否则窄一截", () => {
+    /*
+     * 把上一条从"逐句稿"推广成通则，因为同一个 bug 已经犯过两次：
+     *   1) TranscriptPanel 根节点（用户标出那条竖缝）
+     *   2) 候选列表的空状态占位（Workbench 里"还没有爆点候选"那块）
+     *
+     * 第 2 处藏得深：候选项**存在**时走 CandidateList，它根节点带 flex-1，
+     * 显示是满的；只有空状态/分析中才走那个占位 div，它缺 flex-1 就窄了。
+     * 所以按"有候选项"截图根本发现不了。
+     *
+     * 判据：凡是父容器写成 `flex min-h-0 ... overflow-hidden` 这种行布局的，
+     * 它的直接子元素根节点必须带 flex-1，否则主轴宽度按内容算，右边会空。
+     * flex-col 的父容器靠 stretch 撑满宽度，不需要 flex-1，不在此列。
+     */
+    const wb = read("src/renderer/src/components/Workbench.tsx");
+
+    // 候选列表包装层：flex min-h-0 flex-1 overflow-hidden
+    const wrapper = /<div className="flex min-h-0 flex-1 overflow-hidden">([\s\S]*?)\n\s*<\/div>\s*\n/.exec(wb);
+    expect(wrapper, "没找到候选列表包装层，正则可能要跟着结构调整").not.toBeNull();
+    const inner = wrapper?.[1] ?? "";
+    // 内部两个分支（有候选的 CandidateList / 空状态占位）都要满宽
+    expect(inner, "空状态占位缺 flex-1，右边会空出一条竖缝").toMatch(
+      /flex h-full min-h-0 flex-1 flex-col items-center justify-center/
+    );
+    expect(inner, "CandidateList 的用法应保持 flex-1 写法").toMatch(/<CandidateList/);
+
+    // 逐句稿包装层：flex min-h-[120px] shrink overflow-hidden
+    expect(wb).toMatch(/className="flex min-h-\[120px\] shrink overflow-hidden"/);
+    expect(wb).not.toMatch(/className="flex min-h-\[120px\][^"]*"[\s\S]{0,400}?<div className="flex h-full min-h-0 flex-col/);
+  });
+
 describe("出片台有出口,不吞掉分析成果", () => {
   const wb = read("src/renderer/src/components/Workbench.tsx");
   const dock = read("src/renderer/src/components/ExportDock.tsx");
