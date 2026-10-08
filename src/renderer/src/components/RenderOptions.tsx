@@ -8,6 +8,7 @@
 import { useState } from "react";
 import { LuChevronDown, LuLayers } from "react-icons/lu";
 import { Modal, cx } from "./ui";
+import { StylePresetBar } from "./StylePresetBar";
 import { AssetPicker } from "./AssetPicker";
 import { FontStylePanel } from "./FontStylePanel";
 import type { RenderOptions } from "@shared/api-types";
@@ -549,6 +550,12 @@ export function RenderOptionsPanel({
               <h3 className="text-[13px] font-bold text-fg">字幕与标题样式</h3>
               <span className="text-[10.5px] text-mut-2">字体 · 颜色 · 字号 · 位置 · 描边 · 阴影</span>
             </div>
+            <StylePresetBar
+              caption={options.captionFontStyle}
+              title={options.titleFontStyle}
+              onCaptionChange={(next) => onChange({ ...options, captionFontStyle: next })}
+              onTitleChange={(next) => onChange({ ...options, titleFontStyle: next })}
+            />
             <FontStylePanel
               caption={options.captionFontStyle}
               title={options.titleFontStyle}

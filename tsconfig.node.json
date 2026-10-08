@@ -37,6 +37,7 @@
     "tests/**/*",
     "src/renderer/src/lib/format.ts",
     "src/renderer/src/lib/text-layout.ts",
+    "src/renderer/src/lib/style-presets.ts",
     "src/renderer/src/stores/session-store.ts",
     // 只有真正被测试 import 的组件才列进来，列整个 components/ 会把整个渲染层
     // 拖进主进程项目，得不偿失。
