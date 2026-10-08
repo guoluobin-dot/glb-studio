@@ -93,7 +93,51 @@ export function ExportDock({
         <span className="text-[12px] font-extrabold tracking-wide">出片台</span>
       </div>
 
+      {/*
+        这个滚动区只放「出片之后才会出现」的临时内容：提示条、产物清单。
+
+        以前统计卡、记忆深找、引擎状态也都塞在这个 flex-1 里。
+        内容一短，flex-1 就把它撑到满高 —— 于是所有控件挤在顶部，
+        下面空出四五百像素的空洞（用户截图里就是那样）。
+        把静态控件移到下面的吸底块之后，空白留在控件上方，
+        视觉上就成了"标题栏与控件组之间的留白"，而不是"控件底下漏了一块"。
+
+        注意这里必须始终保留 flex-1：没有 message/产物时它自己会塌成 0，
+        但吸底块不能因此被顶回顶部 —— 那只是把空洞换个地方继续存在。
+      */}
       <div className="scroll-thin min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
+        {/*
+          文案为什么这么写（2026-10-06）：
+          原来叫"按记忆重找爆款"，而记忆库面板里有个"从历史爆款库同步"。
+          两个都带"爆款记忆"，方向却相反 —— 一个是读记忆来重排当前素材的
+          选段，一个是把分析结果写回记忆库。用户分不清哪个是哪个，
+          以为导入后没变化就是这个原因（实际记忆库要等分析完成才更新）。
+
+          所以这里明确成"用爆款记忆…"：读、用，都是针对当前这条素材。
+          写回记忆的那一步归记忆库面板管，而且它本来就该自动进行 ——
+          见 HitVaultPanel 的 syncFromHermes。
+        */}
+        {message && (
+          <div
+            role="status"
+            className={cx(
+              "pop-in whitespace-pre-line rounded-lg border px-2.5 py-2 text-[10.5px] leading-relaxed",
+              message.tone === "ok" ? "border-ok/30 bg-ok/8 text-ok/90" : "border-warn/30 bg-warn/8 text-warn"
+            )}
+          >
+            {message.text}
+          </div>
+        )}
+
+        {/* 产物清单:能直接看/开/定位,不用再去资源管理器翻 */}
+        <ResultList artifacts={artifacts ?? null} onClose={onCloseArtifacts ?? ((): void => undefined)} />
+      </div>
+
+      {/* ---------- 吸底控制组 ----------
+          静态控件全部收在这里，贴住主按钮。
+          排布顺序按"决策顺序"自上而下：现在选了多少 → 用记忆重挑 →
+          引擎状态 → 存哪 → 次级选项 → 出片。 */}
+      <div className="export-dock shrink-0 space-y-2.5 p-3">
         {/* 已选统计。
             这是整栏唯一的"当前状态"，所以给它最大字号、最强对比；
             时长作为次级读数靠右，进度条只用极细一条，避免和主数字抢注意力。 */}
@@ -135,36 +179,11 @@ export function ExportDock({
             </>
           )}
         </button>
-        {/*
-          文案为什么这么写（2026-10-06）：
-          原来叫"按记忆重找爆款"，而记忆库面板里有个"从历史爆款库同步"。
-          两个都带"爆款记忆"，方向却相反 —— 一个是读记忆来重排当前素材的
-          选段，一个是把分析结果写回记忆库。用户分不清哪个是哪个，
-          以为导入后没变化就是这个原因（实际记忆库要等分析完成才更新）。
-
-          所以这里明确成"用爆款记忆…"：读、用，都是针对当前这条素材。
-          写回记忆的那一步归记忆库面板管，而且它本来就该自动进行 ——
-          见 HitVaultPanel 的 syncFromHermes。
-        */}
-        {message && (
-          <div
-            role="status"
-            className={cx(
-              "pop-in whitespace-pre-line rounded-lg border px-2.5 py-2 text-[10.5px] leading-relaxed",
-              message.tone === "ok" ? "border-ok/30 bg-ok/8 text-ok/90" : "border-warn/30 bg-warn/8 text-warn"
-            )}
-          >
-            {message.text}
-          </div>
-        )}
-
-        {/* 产物清单:能直接看/开/定位,不用再去资源管理器翻 */}
-        <ResultList artifacts={artifacts ?? null} onClose={onCloseArtifacts ?? ((): void => undefined)} />
 
         {/* 引擎状态。
             原来是一整张带边框+说明文的卡片，在 288px 宽的栏里占了将近 100px，
-            却是几乎不变的信息 —— 主体节奏被它打断，下面就空出一大片。
-            改成一行状态：主次分明，不占地方，鼠标悬停才给完整说明。 */}
+            却是几乎不变的信息。改成一行状态：主次分明，不占地方，
+            鼠标悬停才给完整说明。 */}
         <div
           className="group flex items-center gap-1.5 px-0.5 text-[10.5px] text-mut-2"
           title={`本地 ${engine?.local.model ?? "qwen3:8b-chat"} · 长上下文 ${engine?.cloud.model ?? "gemini"}
@@ -174,14 +193,9 @@ export function ExportDock({
           <span className="font-bold tracking-[1.2px] group-hover:text-mut">引擎</span>
           <span className="truncate">按素材自动分派</span>
         </div>
-      </div>
 
-      {/* 吸底操作区。
-          设置项（输出目录 / 全部选项 / 审片）和主按钮放在一起：
-          它们都是"出片前最后一步要碰的东西"，而主按钮永远在同一个位置、吸底可见。 */}
-      <div className="export-dock shrink-0 p-3 pt-2">
         {/* 输出目录 */}
-        <div className="mb-2 flex items-center gap-1.5 rounded-lg border border-line bg-panel-2 px-2.5 py-2">
+        <div className="flex items-center gap-1.5 rounded-lg border border-line bg-panel-2 px-2.5 py-2">
           <LuFolderOpen className="h-3.5 w-3.5 shrink-0 text-mut" />
           <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-mut" title={outDir || undefined}>
             {outDir ? outDir.split(/[\\/]/).slice(-2).join("/") : "未设置输出目录"}
@@ -196,7 +210,7 @@ export function ExportDock({
         </div>
 
         {/* 次级操作：两个并排，避免竖着堆两条同样的按钮 */}
-        <div className="mb-2 grid grid-cols-2 gap-2">
+        <div className="grid grid-cols-2 gap-2">
           <button
             type="button"
             onClick={onOpenOptions}
@@ -227,14 +241,16 @@ export function ExportDock({
           )}
         </div>
         {stage === "exporting" ? (
-          <Progress percent={null} label="正在出片…" />
+          <div className="pt-0.5">
+            <Progress percent={null} label="正在出片…" />
+          </div>
         ) : (
           <>
             <button
               type="button"
               disabled={picked.length === 0 || busy !== null || disabled}
               onClick={() => void runExport()}
-              className="btn-export flex w-full items-center justify-center gap-2 rounded-xl px-4 py-3.5 text-[14px] font-extrabold text-white disabled:cursor-not-allowed"
+              className="btn-export mt-0.5 flex w-full items-center justify-center gap-2 rounded-xl px-4 py-3.5 text-[14px] font-extrabold text-white disabled:cursor-not-allowed"
             >
               {picked.length === 0 ? (
                 <>

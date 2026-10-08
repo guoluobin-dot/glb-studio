@@ -376,8 +376,15 @@ body {
   box-shadow: 0 0 0 1px rgba(255, 122, 61, 0.35), 0 6px 18px -8px rgba(255, 77, 46, 0.55);
 }
 
+/*
+   出片台吸底区的上沿渐隐。
+   原来只给主按钮那一条用，所以起点设在 28% —— 那时候吸底区只有按钮高。
+   现在统计卡、记忆深找、引擎、输出目录全都收进了吸底区，
+   它有三百多像素高，起点还留在 28% 会在中间划出一条突兀的横向色带，
+   看着像卡片被切开。所以把过渡拉长到覆盖整个吸底区。
+*/
 .export-dock {
-  background: linear-gradient(180deg, rgba(16, 18, 25, 0), var(--color-panel) 28%);
+  background: linear-gradient(180deg, rgba(16, 18, 25, 0), var(--color-panel) 42%);
 }
 
 /* ---- 骨架屏 ---- */

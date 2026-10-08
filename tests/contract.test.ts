@@ -2721,6 +2721,35 @@ describe("验证脚本不许污染用户数据", () => {
 
 describe("出片台有出口,不吞掉分析成果", () => {
   const wb = read("src/renderer/src/components/Workbench.tsx");
+  const dock = read("src/renderer/src/components/ExportDock.tsx");
+
+  it("静态控件不许放回滚动区,否则底下又会空一大块", () => {
+    /*
+     * 回归：出片台的滚动区是 flex-1，撑满整栏高度。
+     * 统计卡 / 记忆深找 / 引擎行以前都在这个滚动区里，内容一短
+     * 就被顶到上面、下面空出四五百像素 —— 用户截图里就是这么看着"比例不对"的。
+     *
+     * 关键不是"内容少"，而是 flex-1 一定会把滚动区撑满，
+     * 所以静态控件只要在里面，就必然产生空洞。
+     * 现在静态控件都在滚动区之后的吸底块里，空白留在上方当留白。
+     *
+     * 判据：滚动区的结束位置，必须早于统计卡出现的位置。
+     */
+    const scrollAt = dock.indexOf("scroll-thin min-h-0 flex-1");
+    const scrollEnd = dock.indexOf("\n      </div>", scrollAt);
+    const statAt = dock.indexOf("条已选");
+    expect(scrollAt).toBeGreaterThan(-1);
+    expect(scrollEnd).toBeGreaterThan(scrollAt);
+    expect(statAt).toBeGreaterThan(-1);
+    expect(statAt, "统计卡又回到滚动区里了，出片台底下会重新空一大块").toBeGreaterThan(scrollEnd);
+    // 引擎状态同样必须离开滚动区
+    expect(dock.indexOf("按素材自动分派")).toBeGreaterThan(scrollEnd);
+  });
+
+  it("出片台主按钮要贴住栏底,不能被挤到中间", () => {
+    // 吸底块在 <aside> 里必须是靠后的兄弟节点：滚动区 → 吸底块
+    expect(dock).toMatch(/flex-1 space-y-3 overflow-y-auto p-3[\s\S]*export-dock shrink-0/);
+  });
 
   it("出片台必须有明确的返回上传页入口", () => {
     /*
