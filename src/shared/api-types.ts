@@ -539,21 +539,16 @@ export interface HotwordRule {
   hits: number;
 }
 
-/** 文本级删除的生效情况（打回时回给界面，让用户知道哪些没剪成） */
-export interface ReviewCutReport {
-  /** 实际生效的删除处数 */
-  applied: number;
-  /** 共剪掉多少毫秒 */
-  removedMs: number;
-  /** 生效的段数 */
-  segments: number;
-  /** 没生效的地方及原因（实操段无文本、删太多、段不在本次重建范围…） */
-  skipped: string[];
-}
-
+/**
+ * 历史评审记录。
+ *
+ * 这里的 decision 不再只有"打回"一种：粗剪审片打回已下线，
+ * 但 approve（确认粗剪通过）和桌面端爆点候选否决仍在写这张表，
+ * 所以保留这个类型。
+ */
 export interface ReviewRecord {
   id: number;
-  /** approve=通过 / recut=打回重剪 */
+  /** approve=确认通过粗剪 / recut=否决某条爆点候选（粗剪打回已下线） */
   decision: string;
   comment: string;
   /** 被点名的段（JSON 字符串） */

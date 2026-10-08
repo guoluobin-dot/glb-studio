@@ -768,11 +768,9 @@ async cancelDetect(filePath: string): Promise<{ ok: boolean; aborted: boolean }>
       // 包装成功时只报交付物;包装没产出任何东西才退回粗剪列表
       files: wrapped.deliver.length > 0 ? wrapped.deliver : files,
       viralOpening: created.viralOpening ?? null,
-      // 审片要用：粗剪工程 id + 粗剪文件本身。
-      // 以前粗剪只混在 files 里，包装一开就被 deliver 整个覆盖，
-      // 于是界面上永远看不到粗剪，"审片"根本无从下手。
-      // 段映射不在这儿给：它依赖 selected_segments 的拼接顺序，
-      // 由审片端点现场算（reviewPacket），避免两处逻辑漂移。
+      // projectId / roughcutPath 仍然返回：粗剪工程本身是出片产物的一部分，
+      // 项目库那边还要用。审片面板已删，但删掉这两个字段会影响别的消费方，
+      // 所以只把指向已删方法的那句注释清掉。
       projectId,
       roughcutPath: rendered?.roughcutPath,
       error: undefined
