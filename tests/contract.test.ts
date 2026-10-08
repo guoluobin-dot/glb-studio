@@ -10,6 +10,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import ts from "typescript";
+import { DEPLOY_DIR, deployFile, hasDeployFiles, hermesFile, repoFile } from "./helpers/paths";
 
 const ROOT = join(__dirname, "..");
 const read = (p: string): string => readFileSync(join(ROOT, p), "utf8");
@@ -157,8 +158,8 @@ describe("预览取流", () => {
 
 describe("逐字逐句裁剪", () => {
   const client = read("src/main/hermes-client.ts");
-  const orchestrator = readFileSync("D:/GLB/Hermes/src/orchestrator/index.js", "utf8");
-  const clipper = readFileSync("D:/GLB/Hermes/src/clipper/index.js", "utf8");
+  const orchestrator = readFileSync(hermesFile("src/orchestrator/index.js"), "utf8");
+  const clipper = readFileSync(hermesFile("src/clipper/index.js"), "utf8");
 
   it("set-selection 必须能接收 cuts,否则界面改的边界会被丢掉", () => {
     expect(orchestrator).toMatch(/cutsByIndex/);
@@ -196,10 +197,10 @@ describe("逐字逐句裁剪", () => {
 
 describe("成片包装", () => {
   const client = read("src/main/hermes-client.ts");
-  const gen = readFileSync("D:/GLB/Hermes/src/generator/index.js", "utf8");
-  const orch = readFileSync("D:/GLB/Hermes/src/orchestrator/index.js", "utf8");
-  const clipper = readFileSync("D:/GLB/Hermes/src/clipper/index.js", "utf8");
-  const sherpa = readFileSync("D:/GLB/Hermes/src/analyzer/sherpa-asr.js", "utf8");
+  const gen = readFileSync(hermesFile("src/generator/index.js"), "utf8");
+  const orch = readFileSync(hermesFile("src/orchestrator/index.js"), "utf8");
+  const clipper = readFileSync(hermesFile("src/clipper/index.js"), "utf8");
+  const sherpa = readFileSync(hermesFile("src/analyzer/sherpa-asr.js"), "utf8");
 
   it("选项必须真的传到 /pipeline/generate(以前 RenderOptions 勾什么都没用)", () => {
     expect(client).toMatch(/"\/pipeline\/generate"/);
@@ -237,7 +238,7 @@ describe("成片包装", () => {
   });
 
   it("编排层必须把所有开关透传给 generator", () => {
-    const orch = readFileSync("D:/GLB/Hermes/src/orchestrator/index.js", "utf8");
+    const orch = readFileSync(hermesFile("src/orchestrator/index.js"), "utf8");
     const h = orch.slice(orch.indexOf("'/pipeline/generate'"), orch.indexOf("'/pipeline/generate'") + 1800);
     for (const opt of ["vertical", "captionStyle", "coldOpen", "titleCard", "autoZoom",
       "watermark", "bgmPath", "bgmVolume", "duckBgm", "sfx"]) {
@@ -361,19 +362,38 @@ describe("成片包装", () => {
   it("worker 的兜底切片长度必须同样 <= 15 秒", () => {
     // 曾写 || 60,主线程那次导入一旦失败就静默退回 60s 分块,
     // 正好踩上限,整场转写全空且无任何报错。
-    const worker = readFileSync("D:/GLB/Hermes/src/analyzer/sherpa-worker.js", "utf8");
+    const worker = readFileSync(hermesFile("src/analyzer/sherpa-worker.js"), "utf8");
     const m = worker.match(/const CHUNK_SECONDS = SHERPA_CHUNK_SECONDS \|\| (\d+)/);
     expect(m).not.toBeNull();
     expect(Number(m?.[1])).toBeLessThanOrEqual(15);
   });
 });
 
-describe("启动脚本可靠性", () => {
-  const start = readFileSync("D:/GLB/start-glb.cmd", "utf8");
+/*
+ * 启动脚本这组断言依赖 start-glb.cmd 和 hermes-guard.js ——
+ * 两个都是本机部署文件（D:\GLB 下），仓库里没有，也不该有：
+ * 它们写死了 Ollama 路径和本机目录，收进仓库等于重新泄漏本机结构。
+ *
+ * 所以默认跳过，用 GLB_DEPLOY_DIR 指过去就能跑：
+ *   GLB_DEPLOY_DIR=D:\GLB npm test
+ *
+ * 这里必须说清楚"为什么跳过"，不能悄悄跳过 —— 仓库里 MISSING_SCRIPTS
+ * 那段注释写过同样的道理：假装通过比不跑更糟，因为没人知道它没在守。
+ */
+describe.skipIf(!hasDeployFiles)("启动脚本可靠性（需 GLB_DEPLOY_DIR）", () => {
+  /*
+   * 这两个必须惰性读取：describe.skipIf 只是不执行用例，
+   * describe 回调本身照样会跑 —— 在回调顶层 readFileSync 的话，
+   * 没配 GLB_DEPLOY_DIR 时整个文件在收集阶段就 ENOENT 崩掉，
+   * 连带后面 460 多个用例一起跑不起来。
+   */
+  const startText = (): string => readFileSync(deployFile("start-glb.cmd"), "utf8");
+  const guardText = (): string => readFileSync(deployFile("hermes-guard.js"), "utf8");
 
   it("必须在界面就绪检查之前拉起 Ollama 与 Hermes", () => {
     // 曾经的 bug:"已在运行"分支直接 exit,导致只有界面活着、服务全挂,
     // 表现是能打开但什么都做不了
+    const start = startText();
     const guardIdx = start.indexOf("hermes-guard");
     const firstCheck = start.indexOf('tasklist /fi "imagename eq GLB Studio.exe"');
     const ollamaIdx = start.indexOf("Ollama\\ollama.exe");
@@ -386,17 +406,17 @@ describe("启动脚本可靠性", () => {
   });
 
   it("必须等两个服务都就绪才算 ready", () => {
-    expect(start).toMatch(/11434\/api\/tags/);
-    expect(start).toMatch(/%HERMES_PORT%\/health/);
+    expect(startText()).toMatch(/11434\/api\/tags/);
+    expect(startText()).toMatch(/%HERMES_PORT%\/health/);
   });
 
   it("脚本必须纯 ASCII(控制台代码页是 GBK,中文注释会破坏解析)", () => {
-    const bad = start.split("\n").filter((l) => Buffer.from(l, "utf8").some((b) => b > 127));
+    const bad = startText().split("\n").filter((l) => Buffer.from(l, "utf8").some((b) => b > 127));
     expect(bad).toEqual([]);
   });
 
   it("守护脚本必须语法正确(改坏过,残留大括号导致静默不启动)", () => {
-    const guard = readFileSync("D:/GLB/hermes-guard.js", "utf8");
+    const guard = guardText();
     // 括号配平:这是最廉价的语法自检,能挡住手滑残留
     const open = (guard.match(/\{/g) || []).length;
     const close = (guard.match(/\}/g) || []).length;
@@ -405,7 +425,7 @@ describe("启动脚本可靠性", () => {
 });
 
 describe("主题分类污染", () => {
-  const analyzer = readFileSync("D:/GLB/Hermes/src/analyzer/live-analyzer.js", "utf8");
+  const analyzer = readFileSync(hermesFile("src/analyzer/live-analyzer.js"), "utf8");
 
   it("提示词不得把'指定开头'当主题教给模型", () => {
     // 原写法要求 theme_name 就写这四个字 + hook 给 0.95,
@@ -472,8 +492,8 @@ describe("主题分类污染", () => {
 });
 
 describe("LLM 可用性", () => {
-  const ollama = readFileSync("D:/GLB/Hermes/src/llm/ollama.js", "utf8");
-  const orch = readFileSync("D:/GLB/Hermes/src/orchestrator/index.js", "utf8");
+  const ollama = readFileSync(hermesFile("src/llm/ollama.js"), "utf8");
+  const orch = readFileSync(hermesFile("src/orchestrator/index.js"), "utf8");
 
   it("视觉调用必须关掉 thinking,否则 content 恒为空", () => {
     // qwen3 默认开 thinking,输出全在 thinking 字段。
@@ -503,8 +523,8 @@ describe("LLM 可用性", () => {
 });
 
 describe("爆款开头前置", () => {
-  const clipper = readFileSync("D:/GLB/Hermes/src/clipper/index.js", "utf8");
-  const orch = readFileSync("D:/GLB/Hermes/src/orchestrator/index.js", "utf8");
+  const clipper = readFileSync(hermesFile("src/clipper/index.js"), "utf8");
+  const orch = readFileSync(hermesFile("src/orchestrator/index.js"), "utf8");
   const client = read("src/main/hermes-client.ts");
   const opts = read("src/renderer/src/components/RenderOptions.tsx");
 
@@ -640,10 +660,10 @@ describe("界面稳定性", () => {
     const api = read("src/shared/api-types.ts");
     expect(api).toMatch(/cancelDetect\(filePath: string\)/);
 
-    const h = readFileSync("D:/GLB/Hermes/src/orchestrator/index.js", "utf8");
+    const h = readFileSync(hermesFile("src/orchestrator/index.js"), "utf8");
     expect(h).toMatch(/app\.post\('\/pipeline\/analyze-cancel'/);
     expect(h).toMatch(/this\._liveAbort\.set\(key, ctl\)/);
-    const an = readFileSync("D:/GLB/Hermes/src/analyzer/live-analyzer.js", "utf8");
+    const an = readFileSync(hermesFile("src/analyzer/live-analyzer.js"), "utf8");
     expect(an, "analyze 不认 signal，取消等于没发生").toMatch(/throwIfAborted/);
     // 取消不能算失败，否则会被调度器重新排队白跑一遍
     expect(an).toMatch(/err\?\.userCancelled/);
@@ -1134,8 +1154,8 @@ describe("审片必须真的审", () => {
   const types = read("src/shared/api-types.ts");
   const main = read("src/main/index.ts");
   const preload = read("src/preload/index.ts");
-  const clipper = readFileSync("D:/GLB/Hermes/src/clipper/index.js", "utf8");
-  const gemini = readFileSync("D:/GLB/Hermes/src/llm/gemini.js", "utf8");
+  const clipper = readFileSync(hermesFile("src/clipper/index.js"), "utf8");
+  const gemini = readFileSync(hermesFile("src/llm/gemini.js"), "utf8");
   const app = read("src/renderer/src/App.tsx");
 
   it("审片意见不能打 404 端点", () => {
@@ -1253,7 +1273,7 @@ describe("审片必须真的审", () => {
     // 而 getLiveSegmentsByVideo 只返回 draft —— 于是用户在审旧粗剪、说"把开头那句去掉"，
     // 却收到"这段素材没有可用内容"，等于逼他把两小时直播重新分析一遍。
     // 源视频和起止时间都没变，应该按 id 回捞。
-    const store = readFileSync("D:/GLB/Hermes/src/memory/store.js", "utf8");
+    const store = readFileSync(hermesFile("src/memory/store.js"), "utf8");
     expect(store).toMatch(/getLiveSegmentsByIds\(ids\)/);
     expect(store).not.toMatch(/getLiveSegmentsByIds[\s\S]{0,400}status = 'draft'/);
     expect(orch).toMatch(/getLiveSegmentsByIds\?\.\(absent\)/);
@@ -1366,9 +1386,8 @@ describe("审片必须真的审", () => {
     // fetch 只认环境变量里的代理、不读系统代理设置 —— 于是所有云端请求都在直连，
     // 表现是"API 用不了"，实际是连都没连上（连服务端的 401 都拿不到）。
     // 排查时最容易误判成 key 失效，白白反复换 key。
-    const proxy = readFileSync("D:/GLB/Hermes/src/llm/proxy.js", "utf8");
-    const hermesMain = readFileSync("D:/GLB/Hermes/src/hermes.js", "utf8");
-    const guard = readFileSync("D:/GLB/hermes-guard.js", "utf8");
+    const proxy = readFileSync(hermesFile("src/llm/proxy.js"), "utf8");
+    const hermesMain = readFileSync(hermesFile("src/hermes.js"), "utf8");
 
     // 优先级：手填 > 环境变量 > Windows 系统代理
     expect(proxy).toMatch(/cfg\?\.llm\?\.proxy \?\? cfg\?\.gemini\?\.proxy/);
@@ -1382,13 +1401,21 @@ describe("审片必须真的审", () => {
     expect(hermesMain).toMatch(/applyProxyEnv\(config\)/);
     expect(hermesMain).toMatch(/Outbound proxy:/);
 
-    // NODE_USE_ENV_PROXY 只在进程启动时解析一次，运行期再设无效 —— 必须由启动器带上
-    expect(guard).toMatch(/NODE_USE_ENV_PROXY: '1'/);
-    expect(guard).toMatch(/env: \{ \.\.\.process\.env, NODE_USE_ENV_PROXY/);
+    // NODE_USE_ENV_PROXY 只在进程启动时解析一次，运行期再设无效 —— 必须由启动器带上。
+    // 依赖 guard 的只有这两行，所以拆成单独的门控用例（见下）。
+    // 不能整个 it 一起门控：上面 proxy.js / hermes.js 读的是仓库里的文件，
+    // 换台机器也该照跑 —— 那是这次重构最想保住的部分。
 
     // 三处 fetch 都要走诊断版，别留一处裸 fetch
     expect(gemini).not.toMatch(/(?<![\w.])fetch\(/);
     expect(gemini).toMatch(/fetchWithDiagnostics/);
+  });
+
+  // hermes-guard.js 是本机部署文件，仓库里没有，默认跳过；给了 GLB_DEPLOY_DIR 才跑。
+  it.skipIf(!hasDeployFiles)("启动守卫必须设 NODE_USE_ENV_PROXY（需 GLB_DEPLOY_DIR）", () => {
+    const guard = readFileSync(deployFile("hermes-guard.js"), "utf8");
+    expect(guard).toMatch(/NODE_USE_ENV_PROXY: '1'/);
+    expect(guard).toMatch(/env: \{ \.\.\.process\.env, NODE_USE_ENV_PROXY/);
   });
 
   it("代理探测优先级要和 Hermes 一致,否则界面说连上了实际连不上", () => {
@@ -1478,23 +1505,23 @@ describe("审片必须真的审", () => {
     //   ③ 本机 8B 跑一个 chunk 要几十秒到几分钟 —— LLM 客户端用自己的
     //      AbortController，和用户的取消完全无关
     // 结果：用户点了取消，CPU 还在满载、分析状态一直停在 analyzing。
-    const sh = readFileSync("D:/GLB/Hermes/src/analyzer/sherpa-asr.js", "utf8");
+    const sh = readFileSync(hermesFile("src/analyzer/sherpa-asr.js"), "utf8");
     expect(sh).toMatch(/signal\.addEventListener\('abort', onAbort/);
     expect(sh, "取消时不 terminate，Worker 里的 native 解码会继续跑").toMatch(/worker\.terminate\(\)/);
     expect(sh).toMatch(/checkAbort\(\)/);
 
-    const ah = readFileSync("D:/GLB/Hermes/src/analyzer/asr-helper.js", "utf8");
+    const ah = readFileSync(hermesFile("src/analyzer/asr-helper.js"), "utf8");
     expect(ah).toMatch(/sherpa\.transcribe\(videoPath, null, opts\.signal \?\? null\)/);
     expect(ah).toMatch(/static killAll\(\)/);
     expect(ah).toMatch(/taskkill/);
 
-    const ol = readFileSync("D:/GLB/Hermes/src/llm/ollama.js", "utf8");
+    const ol = readFileSync(hermesFile("src/llm/ollama.js"), "utf8");
     expect(ol, "LLM 调用没接 signal，取消后整场分析还在跑").toMatch(/options\.signal\.addEventListener\('abort', onExternalAbort/);
     // OOM 重试也要能被取消打断，不能单独建 AbortSignal.timeout
     expect(ol).not.toMatch(/signal: AbortSignal\.timeout\(Math\.max\(60_000, options\.timeout/);
 
     // 取消不能被"这一块没结果"的 catch 吞掉
-    const an = readFileSync("D:/GLB/Hermes/src/analyzer/live-analyzer.js", "utf8");
+    const an = readFileSync(hermesFile("src/analyzer/live-analyzer.js"), "utf8");
     expect(an).toMatch(/_isAbort\(err\)/);
     expect(an).toMatch(/if \(this\._isAbort\(err\)\) throw err;/);
   });
@@ -1548,7 +1575,7 @@ it("审片包必须带上可编辑原文,否则框选删除无从下手", () => 
     // 写成 Math.max(a, toSec || 0) * 1000，会把已经换算成毫秒的 a 又乘一次 1000，
     // 于是 60 秒的范围变成 1750 秒 —— 命中 910 句（整场三分之一）、每段文本 6 万字。
     // 数学上"看起来"没问题，单元测试用小数据也发现不了。
-    const et = readFileSync("D:/GLB/Hermes/src/analyzer/editable-text.js", "utf8");
+    const et = readFileSync(hermesFile("src/analyzer/editable-text.js"), "utf8");
     expect(et).not.toMatch(/Math\.max\(a, Number\(toSec\) \|\| 0\) \* 1000/);
     expect(et).toMatch(/Math\.max\(a, \(Number\(toSec\) \|\| 0\) \* 1000\)/);
     // 再加一道防线：范围离谱就直接拒绝，宁可不给也不要整场文本
@@ -1559,7 +1586,7 @@ it("审片包必须带上可编辑原文,否则框选删除无从下手", () => 
   it("无/少文本的实操教学段要能识别出来", () => {
     // 教学直播里大量片段是现场演示、弹琴、唱歌，ASR 只能识别零星几个字。
     // 这种段恰恰通常是要保留的爆点核心，给它一个空文本框用户只会以为功能坏了。
-    const et = readFileSync("D:/GLB/Hermes/src/analyzer/editable-text.js", "utf8");
+    const et = readFileSync(hermesFile("src/analyzer/editable-text.js"), "utf8");
     expect(et).toMatch(/export function describeTextless/);
     expect(et).toMatch(/多半是现场演示/);
     expect(et).toMatch(/density < 4/);
@@ -1571,10 +1598,10 @@ it("审片包必须带上可编辑原文,否则框选删除无从下手", () => 
     // 这一轮的体检记录整个报废（grade/error/降级原因全丢）。
     // 而调度器判断该不该重跑、"重新分析"提示、以及排查"结果可不可信"，
     // 全都读这个字段。记录没了就只能瞎猜。
-    const st = readFileSync("D:/GLB/Hermes/src/memory/store.js", "utf8");
+    const st = readFileSync(hermesFile("src/memory/store.js"), "utf8");
     expect(st).toMatch(/typeof data\.analysisHealth === 'string' \? data\.analysisHealth : JSON\.stringify\(data\.analysisHealth\)/);
     expect(st).not.toMatch(/\? String\(data\.analysisHealth\)/);
-    const an = readFileSync("D:/GLB/Hermes/src/analyzer/live-analyzer.js", "utf8");
+    const an = readFileSync(hermesFile("src/analyzer/live-analyzer.js"), "utf8");
     expect(an).toMatch(/health\.grade = 'cancelled'/);
   });
 
@@ -2099,7 +2126,7 @@ describe("撤销/重做", () => {
     // 那时桌面端还没和 activeCollection 联动,所以所有意见都落 collection=NULL,
     // 而 getCollectionAvoidRules 只按集合查 —— 用户明明说过"钩子不够炸",
     // 分析时却完全不生效。
-    const orch = readFileSync("D:/GLB/Hermes/src/orchestrator/index.js", "utf8");
+    const orch = readFileSync(hermesFile("src/orchestrator/index.js"), "utf8");
     const handler = orch.slice(orch.indexOf("'/highlight/reject'"), orch.indexOf("'/highlight/reject'") + 3000);
     // 打回与指定开头两个分支都要带
     const hits = handler.match(/collection: this\.store\.activeCollection \|\| null/g);
@@ -2117,7 +2144,7 @@ describe("撤销/重做", () => {
      * 继续用 activeCollection,案例老师的口播删减会被记到李老师名下,
      * 而且不报错,错误规则会持续累积。
      */
-    const store = readFileSync("D:/GLB/Hermes/src/memory/store.js", "utf8");
+    const store = readFileSync(hermesFile("src/memory/store.js"), "utf8");
     const ownerIdx = store.indexOf("_ownerOfLive(liveVideoId) {");
     expect(ownerIdx).toBeGreaterThan(-1);
     // 必须先查素材自身的 collection
@@ -2138,7 +2165,7 @@ describe("撤销/重做", () => {
   it("避雷规则与指令类意见必须分开", () => {
     // "指定新开头重找"是指令,由 isRevocation 单独处理;
     // 混进 avoid 会让模型把它当成"不要重找开头",完全反了。
-    const live = readFileSync("D:/GLB/Hermes/src/analyzer/live-analyzer.js", "utf8");
+    const live = readFileSync(hermesFile("src/analyzer/live-analyzer.js"), "utf8");
     expect(live).toMatch(/mem\.avoid = mem\.feedback\.filter/);
     expect(live).toMatch(/不要\|别\|避免\|太慢\|不好\|没人看/);
   });
@@ -2203,8 +2230,8 @@ describe("撤销/重做", () => {
 });
 
 describe("记忆必须按 IP 隔离(选谁学谁)", () => {
-  const store = readFileSync("D:/GLB/Hermes/src/memory/store.js", "utf8");
-  const live = readFileSync("D:/GLB/Hermes/src/analyzer/live-analyzer.js", "utf8");
+  const store = readFileSync(hermesFile("src/memory/store.js"), "utf8");
+  const live = readFileSync(hermesFile("src/analyzer/live-analyzer.js"), "utf8");
 
   it("必须有按集合取记忆的入口", () => {
     // 以前 getStyleProfile() 返回 user_style_profile 全表,
@@ -2250,7 +2277,7 @@ describe("记忆必须按 IP 隔离(选谁学谁)", () => {
     // active-collection 设对了 != 分析时真的换了记忆,中间隔着注入逻辑。
     // 而 Hermes 的 stdout 不落盘,翻日志验不了 —— 只能让服务把
     // "现在真正会注入什么"摊出来。
-    const orch = readFileSync("D:/GLB/Hermes/src/orchestrator/index.js", "utf8");
+    const orch = readFileSync(hermesFile("src/orchestrator/index.js"), "utf8");
     expect(orch).toMatch(/'\/api\/memory-snapshot'/);
     const h = orch.slice(orch.indexOf("'/api/memory-snapshot'"), orch.indexOf("'/api/llm-status'"));
     expect(h).toMatch(/getCollectionHooks/);
@@ -2267,7 +2294,7 @@ describe("爆款记忆库", () => {
   const panel = read("src/renderer/src/components/HitVaultPanel.tsx");
 const picker = read("src/renderer/src/components/IpPicker.tsx");
   const wb = read("src/renderer/src/components/Workbench.tsx");
-  const orch = readFileSync("D:/GLB/Hermes/src/orchestrator/index.js", "utf8");
+  const orch = readFileSync(hermesFile("src/orchestrator/index.js"), "utf8");
 
   it("每个 IP 必须是独立文件夹", () => {
     // 用户明确要求"区分每一个 IP 老师单独一个文件夹"
@@ -2418,7 +2445,7 @@ it("每条爆款素材都要能看到爆款预测，且必须标出是估的", (
     const types3 = read("src/shared/api-types.ts");
     const panel3 = read("src/renderer/src/components/HitVaultPanel.tsx");
     // 查预测的 SQL 在 Hermes 侧的 orchestrator 里，不在 clipper
-    const orch = readFileSync("D:/GLB/Hermes/src/orchestrator/index.js", "utf8");
+    const orch = readFileSync(hermesFile("src/orchestrator/index.js"), "utf8");
     expect(orch).toMatch(/FROM hit_predictions WHERE hit_video_id/);
     // 预测不能塞进 metrics：那边是回流真实数，混起来用户会当参考
     expect(types3).toMatch(/prediction\?: \{/);
@@ -2492,8 +2519,8 @@ it("所有子进程都必须 windowsHide，否则会弹黑框抢焦点", () => {
     // 代理查询那处本来就有，一并锁住
     expect(main).toMatch(/encoding: "utf8",\s*\n\s*windowsHide: true/);
 
-    const ff = readFileSync("D:/GLB/Hermes/src/analyzer/ffmpeg-helper.js", "utf8");
-    const asr = readFileSync("D:/GLB/Hermes/src/analyzer/asr-helper.js", "utf8");
+    const ff = readFileSync(hermesFile("src/analyzer/ffmpeg-helper.js"), "utf8");
+    const asr = readFileSync(hermesFile("src/analyzer/asr-helper.js"), "utf8");
     // 主 spawn（不是 taskkill）必须有 windowsHide
     expect(ff).toMatch(/spawn\(cmd, args, \{ shell: false, windowsHide: true \}\)/);
     expect(ff).toMatch(/\{ shell: false, windowsHide: true \}/);
@@ -2687,7 +2714,7 @@ describe("验证脚本不许污染用户数据", () => {
     // 在库里堆了几十个测试 clip_project。成片列表按 id 倒序,
     // 这些记录正好排在最前面 —— 用户打开界面看到的第一批全是测试视频,
     // 其中 21KB 那个还是彩条测试图,看起来像程序坏了。
-    const orch = readFileSync("D:/GLB/Hermes/src/orchestrator/index.js", "utf8");
+    const orch = readFileSync(hermesFile("src/orchestrator/index.js"), "utf8");
     const h = orch.slice(orch.indexOf("'/api/outputs'"), orch.indexOf("'/api/system'"));
     expect(h).toMatch(/test-live\|_vo_test\|_mv_test/);
     expect(h).toMatch(/\.filter\(/);
@@ -2721,7 +2748,33 @@ describe("验证脚本不许污染用户数据", () => {
   });
 });
 
-it("Hermes 快照不能再把诊断脚本同步进来", () => {
+it("测试里不许再出现写死的本机路径", () => {
+    /*
+     * 回归：这些断言原来把路径写死成 D:/GLB/Hermes/... 和 D:/GLB-NEW/...。
+     * 代价有两层，都很实际：
+     *  1) 换台机器 clone 下来跑测试直接 ENOENT，满屏红但跟代码对错无关
+     *  2) 更糟的是它验证的是"本机运行版"，而对外发布的是 hermes/ 快照 ——
+     *     两者一旦漂移，测试照样全绿，等于守了个空
+     *
+     * 现在统一走 tests/helpers/paths.ts：默认读仓库快照，
+     * GLB_HERMES_ROOT / GLB_DEPLOY_DIR 可以指到运行版。
+     *
+     * 注释里允许出现这些路径 —— 那是给人看的说明（"需要 GLB_DEPLOY_DIR=D:\GLB"），
+     * 所以先剥掉注释再断言。
+     */
+    const helper = read("tests/helpers/paths.ts");
+    expect(helper, "路径解析模块不见了，测试会退回到写死路径").toMatch(/GLB_HERMES_ROOT/);
+    expect(helper).toMatch(/GLB_DEPLOY_DIR/);
+
+    const offenders: string[] = [];
+    for (const f of readdirSync(join(ROOT, "tests")).filter((n) => /\.(ts|tsx)$/.test(n))) {
+      const code = read(join("tests", f)).replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+      if (/[A-Za-z]:[\\/]GLB/.test(code)) offenders.push(f);
+    }
+    expect(offenders, "这些测试文件里又写死了本机盘符路径").toEqual([]);
+  });
+
+  it("Hermes 快照不能再把诊断脚本同步进来", () => {
     /*
      * 回归：hermes/ 是公开仓库里的引擎快照，由 scripts/sync-hermes.mjs 生成。
      * 那 11 个 scripts/diag-*、probe-*、reanalyze-*、test-zen 全是一次性排查工具，
@@ -2925,7 +2978,7 @@ describe("工作区归属", () => {
 describe("Hermes 爆点分析契约", () => {
   const client = read("src/main/hermes-client.ts");
   const analyzer = readFileSync(
-    "D:/GLB/Hermes/src/analyzer/live-analyzer.js",
+    hermesFile("src/analyzer/live-analyzer.js"),
     "utf8"
   );
 

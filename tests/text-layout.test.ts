@@ -5,14 +5,15 @@
  * 两边公式一旦漂移，预览就成了骗人的东西 —— 用户照着预览调，
  * 出片发现位置不对，而这种问题他自己查不出来（预览"看着挺对"）。
  *
- * 所以下面每条断言都对着服务端 D:\GLB\Hermes\src\generator\index.js
+ * 所以下面每条断言都对着服务端 hermes 快照的 src/generator/index.js
  * 的实际公式写，不是对着"看起来合理"写。
  */
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
+import { hermesFile, repoFile } from "./helpers/paths";
 import { REF_HEIGHT, titleTopPx, captionBottomPx, layoutFor } from "../src/renderer/src/lib/text-layout";
 
-const hermesGenerator = readFileSync("D:/GLB/Hermes/src/generator/index.js", "utf8");
+const hermesGenerator = readFileSync(hermesFile("src/generator/index.js"), "utf8");
 
 describe("字幕 / 标题位置几何", () => {
   it("参照高度是 1920，和服务端一致", () => {
@@ -134,7 +135,7 @@ describe("字幕 / 标题位置几何", () => {
      * 判据：预览容器和两个样式面板必须是**兄弟**（flex 的左右两列），
      * 而且预览那一列要 sticky，否则控件一长预览照样会被顶走。
      */
-    const src = readFileSync("D:/GLB-NEW/src/renderer/src/components/FontStylePanel.tsx", "utf8");
+    const src = readFileSync(repoFile("src/renderer/src/components/FontStylePanel.tsx"), "utf8");
 
     // 左右分栏。
     // 这里刻意不写死 gap 的具体数值：分栏间距调过好几轮，
@@ -179,7 +180,7 @@ describe("字幕 / 标题位置几何", () => {
      * 而这类错误只有在渲染那一刻才暴露 —— 测试全绿、应用起不来。
      * 所以这里直接对源码做检查。
      */
-    const src = readFileSync("D:/GLB-NEW/src/renderer/src/components/FontStylePanel.tsx", "utf8");
+    const src = readFileSync(repoFile("src/renderer/src/components/FontStylePanel.tsx"), "utf8");
 
     const start = src.indexOf("function TextLayoutPreview(");
     expect(start).toBeGreaterThan(-1);
