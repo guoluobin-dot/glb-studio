@@ -7,7 +7,7 @@
  * 这里把契约钉死:字段名一改,测试立刻红。
  */
 import { describe, it, expect } from "vitest";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import ts from "typescript";
 
@@ -2721,7 +2721,34 @@ describe("验证脚本不许污染用户数据", () => {
   });
 });
 
-it("逐句稿必须满宽,不能比上面的候选列表窄一截", () => {
+it("Hermes 快照不能再把诊断脚本同步进来", () => {
+    /*
+     * 回归：hermes/ 是公开仓库里的引擎快照，由 scripts/sync-hermes.mjs 生成。
+     * 那 11 个 scripts/diag-*、probe-*、reanalyze-*、test-zen 全是一次性排查工具，
+     * 路径写死 D:/GLB/Hermes、还混着 .py/.ps1/.cmd，引擎运行一个都用不到。
+     * 公开后等于对外公告本地磁盘结构。
+     *
+     * 只删仓库里的文件没用：同步是"先 rmSync 清空 DST 再拷贝"的镜像同步，
+     * SKIP_DIRS 里没有 scripts 的话，下跑一次同步它们就全回来了。
+     * 所以真正要锁的是 SKIP_DIRS，不是文件列表。
+     */
+    const sync = read("scripts/sync-hermes.mjs");
+    const skipLine = sync.match(/const SKIP_DIRS = new Set\(\[([^\]]*)\]/)?.[1] ?? "";
+    expect(skipLine, "sync-hermes.mjs 的 SKIP_DIRS 声明没找到，格式可能变了").toContain("'scripts'");
+
+    // 快照里确实不该再有 scripts 目录。
+    // 注意用 existsSync 先判：目录"不存在"才是期望状态，
+    // 直接 readdirSync 会抛 ENOENT，把通过的情况判成失败。
+    const snapDir = join(ROOT, "hermes", "scripts");
+    if (existsSync(snapDir)) {
+      const files = readdirSync(snapDir, { withFileTypes: true })
+        .filter((e) => e.isFile())
+        .map((e) => e.name);
+      expect(files, "hermes/scripts/ 又回来了：SKIP_DIRS 没生效，或有人手工加回来").toEqual([]);
+    }
+  });
+
+  it("逐句稿必须满宽,不能比上面的候选列表窄一截", () => {
     /*
      * 回归：逐句稿根节点原来缺 flex-1。
      * 它的父容器是 `flex` 行布局，主轴宽度按 flex-basis 算，
