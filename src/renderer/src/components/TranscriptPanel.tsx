@@ -115,9 +115,20 @@ export function TranscriptPanel({ transcript, currentTime, onSeek }: Props): Rea
     }
   }, [activeIndex]);
 
+/*
+     flex-1 不能少，下面两个根节点都要。
+     父容器是 `flex` 行布局，主轴宽度按 flex-basis 算，
+     不带 flex-1 就等于"多宽算多宽" —— 逐句稿是文本，
+     算出来比整栏窄一截，右边就空出一条竖向空隙，
+     而同一栏上方的候选列表是满宽的，两块对不齐（用户截图里标的就是这条缝）。
+     CandidateList 的根节点同样带 flex-1，两边保持一致。
+
+     对比 HotwordPanel：它的父容器是 flex-col，
+     宽度靠 align-items:stretch 自动撑满，所以不需要 flex-1。
+  */
   if (segments.length === 0) {
     return (
-      <div className="flex h-full min-h-0 flex-col items-center justify-center gap-2.5 rounded-xl border border-line bg-panel-2/50 p-6 text-center">
+      <div className="flex h-full min-h-0 flex-1 flex-col items-center justify-center gap-2.5 rounded-xl border border-line bg-panel-2/50 p-6 text-center">
         <LuFileText className="h-6 w-6 text-mut-2" />
         <p className="text-[11.5px] leading-relaxed text-mut-2">
           逐句稿为空。
@@ -129,7 +140,7 @@ export function TranscriptPanel({ transcript, currentTime, onSeek }: Props): Rea
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-xl border border-line bg-panel-2/50">
+    <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-line bg-panel-2/50">
       <div className="flex h-8 shrink-0 items-center gap-2 border-b border-line/70 px-3">
         <LuFileText className="h-3.5 w-3.5 shrink-0 text-mut-2" />
         <span className="shrink-0 text-[10.5px] font-bold tracking-wide text-mut-2">逐句稿</span>

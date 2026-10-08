@@ -1776,9 +1776,11 @@ describe("工作台布局不能重叠", () => {
   });
 
   it("逐句稿的包装层也要是 flex 容器", () => {
-    // TranscriptPanel 根元素是 h-full，父层不是 flex 时 h-full 同样会跑偏
+    // TranscriptPanel 根元素是 h-full，父层不是 flex 时 h-full 同样会跑偏。
+    // 根节点上还有 flex-1（横向占满整栏，见下面那条用例），
+    // 这里用宽松写法匹配，不断言类的排列顺序。
     expect(wb).toMatch(/className="flex min-h-\[120px\] shrink overflow-hidden"/);
-    expect(tp).toMatch(/className="flex h-full min-h-0 flex-col overflow-hidden/);
+    expect(tp).toMatch(/className="flex h-full min-h-0 flex-1 flex-col/);
   });
 
   it("逐句稿不能用 height 百分比 + shrink-0", () => {
@@ -2718,6 +2720,26 @@ describe("验证脚本不许污染用户数据", () => {
     expect(draft).toMatch(/continue;/);
   });
 });
+
+it("逐句稿必须满宽,不能比上面的候选列表窄一截", () => {
+    /*
+     * 回归：逐句稿根节点原来缺 flex-1。
+     * 它的父容器是 `flex` 行布局，主轴宽度按 flex-basis 算，
+     * 不带 flex-1 就是"多宽算多宽" —— 文本算出来比整栏窄，
+     * 右边空出一条竖向空隙，而同一栏上方的候选列表是满宽的，
+     * 两块对不齐（用户截图里标出来的就是这条缝）。
+     *
+     * 注意和 HotwordPanel 的区别：它的父容器是 flex-col，
+     * 宽度靠 align-items:stretch 自动撑满，所以不需要 flex-1。
+     * 这里只断言逐句稿，别顺手给不需要的地方也加。
+     */
+    const tp = read("src/renderer/src/components/TranscriptPanel.tsx");
+    const cl = read("src/renderer/src/components/CandidateList.tsx");
+    // 逐句稿的正常态和空状态两个根节点都要是满宽
+    expect((tp.match(/flex h-full min-h-0 flex-1 flex-col/g) ?? []).length).toBe(2);
+    // 和候选列表保持同一套写法
+    expect(cl).toMatch(/flex min-h-0 flex-1 flex-col/);
+  });
 
 describe("出片台有出口,不吞掉分析成果", () => {
   const wb = read("src/renderer/src/components/Workbench.tsx");
