@@ -18,7 +18,7 @@ function TextLayoutPreview({
   caption,
   title,
   frameHeight,
-  width = 176
+  width = 200
 }: {
   caption: CaptionStyle;
   title: TitleStyle;
@@ -34,25 +34,39 @@ function TextLayoutPreview({
 
   const capColor = caption.color ?? "#FFFFFF";
   const ttlColor = title.color ?? "#FFFFFF";
-  const capText = "同学们看这里，字会出现在这个位置";
-  const ttlText = "标题出现在这里";
+  // 样例文案要短：框只有 200px 宽，句子一长就折三行，
+  // 反而看不出字幕"一行压在底部"是什么样子。
+  const capText = "字落在这个位置";
+  const ttlText = "标题落在这里";
 
   return (
     <div>
-      <div className="mb-1.5 flex items-center gap-1.5">
+      <div className="mb-2 flex items-center gap-1.5">
         <LuEye className="h-3.5 w-3.5 shrink-0 text-mut-2" />
         <span className="text-[11.5px] font-bold text-fg">位置示意</span>
+        <span className="tabular ml-auto font-mono text-[9.5px] text-mut-2/70">
+          {W}×{H}
+        </span>
       </div>
 
+      {/*
+        画面框。
+        原来是一个纯渐变空矩形，看起来像一块没做完的占位图 ——
+        用户看不出"这是一个视频画面"，于是那三条参考线也没有参照物。
+        现在给它压暗 + 内描边 + 底部渐隐，读起来才像一帧视频，
+        字落在上面才有"落在画面里"的感觉。比例锁死 9:16，不随内容变。
+      */}
       <div
-        className="relative mx-auto overflow-hidden rounded-lg border border-line bg-gradient-to-b from-panel-2 to-panel"
+        className="relative mx-auto overflow-hidden rounded-xl border border-line/80 bg-gradient-to-b from-panel-2 via-panel to-black/45 shadow-[0_2px_14px_rgba(0,0,0,0.28)] ring-1 ring-inset ring-white/[0.04]"
         style={{ height: H, width: W }}
         aria-label="字幕与标题位置示意"
       >
-        {/* 三条参考线：顶部/中间/底部，方便判断"居中"到底偏不偏 */}
-        <div className="pointer-events-none absolute inset-x-0 top-0 border-t border-dashed border-line/60" />
-        <div className="pointer-events-none absolute inset-x-0 top-1/2 border-t border-dashed border-line/40" />
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 border-t border-dashed border-line/60" />
+        {/* 三条参考线：顶部/中间/底部，方便判断"居中"到底偏不偏。
+            线用 white/12 而不是 line/60 —— 线是叠在画面上的，
+            跟边框同色就等于看不见，"居中偏不偏"这件事就又只能靠猜。 */}
+        <div className="pointer-events-none absolute inset-x-0 top-0 border-t border-dashed border-white/12" />
+        <div className="pointer-events-none absolute inset-x-0 top-1/2 border-t border-dashed border-white/12" />
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 border-t border-dashed border-white/12" />
 
         {/* 标题 */}
         <div
@@ -115,7 +129,11 @@ function TextLayoutPreview({
         </div>
       </div>
 
-      <p className="mt-1.5 text-[9.5px] leading-relaxed text-mut-2/80">
+      {/* 底部渐隐：让框的下沿有"画面在继续"的层次，
+          而不是一条生硬的边框线收尾。 */}
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-black/35 to-transparent" />
+
+      <p className="mt-2 text-[9.5px] leading-relaxed text-mut-2/80">
         按素材画面 {Math.round(frameHeight)}p 等比缩放 · 与成片一致。虚线是画面顶部 / 中间 / 底部。
       </p>
     </div>
@@ -157,10 +175,13 @@ const FONTS = [
   "Impact"
 ];
 
+/* 标签列宽。
+   原来 52px，"底部底条"这种四字标签会被压着或折行。
+   60px 在两列布局下也还稳，右侧控件还剩 376px，滑块够用。 */
 function Row({ label, children }: { label: string; children: React.ReactNode }): React.JSX.Element {
   return (
     <div className="flex items-center gap-2">
-      <span className="w-[52px] shrink-0 text-[10.5px] font-semibold text-mut-2">{label}</span>
+      <span className="w-[60px] shrink-0 text-[10.5px] font-semibold text-mut-2">{label}</span>
       <div className="min-w-0 flex-1">{children}</div>
     </div>
   );
@@ -182,7 +203,7 @@ function Swatches({
           title={c.label}
           onClick={() => onChange(c.v)}
           className={cx(
-            "h-5 w-5 rounded border transition-transform hover:scale-110",
+            "h-5 w-5 rounded-full border transition-transform hover:scale-110",
             value?.toLowerCase() === c.v.toLowerCase() ? "border-ember ring-1 ring-ember/50" : "border-line"
           )}
           style={{ background: c.v }}
@@ -257,25 +278,29 @@ export function FontStylePanel({
      *
      * 所以左边一列固定（sticky），右边控件随便滚，永远能同时看见两边。
      */
-    <div className="flex items-start gap-3">
-      <div className="w-[176px] shrink-0 self-sticky top-0">
+    <div className="flex items-start gap-4">
+      <div className="w-[200px] shrink-0 self-sticky top-0">
         <TextLayoutPreview caption={c} title={t} frameHeight={previewHeight ?? REF_HEIGHT} />
       </div>
 
-      <div className="grid min-w-0 flex-1 gap-2.5">
-      {/* ---------- 字幕 ---------- */}
-      <section className="rounded-xl border border-line bg-panel-2/40 p-3">
+      <div className="grid min-w-0 flex-1 content-start gap-3">
+      {/* ---------- 字幕 ----------
+          卡片去掉了边框和底色，改成纯留白 + 小标题分隔。
+          原来三块卡片都带边框，在这个已经很满的弹窗里就变成"框套框"，
+          层级全糊在一起。 */}
+      <section className="px-0.5">
         <div className="mb-2.5 flex items-center gap-2">
-          <LuCaptions className="h-3.5 w-3.5 text-mut-2" />
+          <LuCaptions className="h-3.5 w-3.5 shrink-0 text-mut-2" />
           <span className="text-[12px] font-bold text-fg">字幕样式</span>
-          <span className="ml-auto text-[10px] text-mut-2">字号按 1080p 基准自动缩放</span>
+          <span className="h-px flex-1 bg-line/60" />
+          <span className="shrink-0 text-[10px] text-mut-2/80">按 1080p 基准缩放</span>
         </div>
-        <div className="flex flex-col gap-2">
+        <div className="flex flex-col gap-2.5">
           <Row label="字体">
             <select
               value={c.font ?? ""}
               onChange={(e) => setC({ font: e.target.value || undefined })}
-              className="w-full rounded border border-line bg-panel px-2 py-1 text-[11.5px] text-fg outline-none focus:border-ember/60"
+              className="w-full rounded-lg border border-line bg-panel-2 px-2.5 py-1.5 text-[11.5px] text-fg outline-none transition-colors focus:border-ember/60"
             >
               <option value="">默认（微软雅黑）</option>
               {FONTS.map((f) => (
@@ -288,9 +313,18 @@ export function FontStylePanel({
           <Row label="颜色">
             <Swatches value={c.color} onChange={(v) => setC({ color: v })} />
           </Row>
-          <Row label="字号">
-            <Slider value={c.size ?? 28} min={14} max={72} onChange={(v) => setC({ size: v })} />
-          </Row>
+          {/* 字号和描边并排。
+              这一栏原本是 6 行竖排，比左边预览框还高出一截，
+              弹窗被迫长滚动，预览下面就空一大块 —— 视觉重心全歪在右边。
+              成对的两个滑块并成两列，右栏高度直接砍掉一行。 */}
+          <div className="grid grid-cols-2 gap-x-3">
+            <Row label="字号">
+              <Slider value={c.size ?? 28} min={14} max={72} onChange={(v) => setC({ size: v })} />
+            </Row>
+            <Row label="描边">
+              <Slider value={c.outline ?? 3} min={0} max={10} step={0.5} onChange={(v) => setC({ outline: v })} />
+            </Row>
+          </div>
           <Row label="位置">
             <Slider
               value={c.marginV ?? 60}
@@ -300,9 +334,6 @@ export function FontStylePanel({
               suffix="px"
               onChange={(v) => setC({ marginV: v })}
             />
-          </Row>
-          <Row label="描边">
-            <Slider value={c.outline ?? 3} min={0} max={10} step={0.5} onChange={(v) => setC({ outline: v })} />
           </Row>
           <Row label="阴影">
             <Slider value={c.shadow ?? 1} min={0} max={10} step={0.5} onChange={(v) => setC({ shadow: v })} />
@@ -342,25 +373,26 @@ export function FontStylePanel({
       </section>
 
       {/* ---------- 标题 ---------- */}
-      <section className="rounded-xl border border-line bg-panel-2/40 p-3">
+      <section className="px-0.5 pt-1">
         <div className="mb-2.5 flex items-center gap-2">
-          <LuHeading className="h-3.5 w-3.5 text-mut-2" />
+          <LuHeading className="h-3.5 w-3.5 shrink-0 text-mut-2" />
           <span className="text-[12px] font-bold text-fg">标题样式</span>
+          <span className="h-px flex-1 bg-line/60" />
           <button
             type="button"
             onClick={onReset}
-            className="ml-auto flex items-center gap-1 rounded-md px-1.5 py-1 text-[10px] font-semibold text-mut-2 transition-colors hover:text-ember"
+            className="shrink-0 rounded-md px-1.5 py-1 text-[10px] font-semibold text-mut-2 transition-colors hover:text-ember"
           >
             <LuRotateCcw className="h-3 w-3" />
-            恢复默认
+            <span className="ml-1">恢复默认</span>
           </button>
         </div>
-        <div className="flex flex-col gap-2">
+        <div className="flex flex-col gap-2.5">
           <Row label="字体">
             <select
               value={t.font ?? ""}
               onChange={(e) => setT({ font: e.target.value || undefined })}
-              className="w-full rounded border border-line bg-panel px-2 py-1 text-[11.5px] text-fg outline-none focus:border-ember/60"
+              className="w-full rounded-lg border border-line bg-panel-2 px-2.5 py-1.5 text-[11.5px] text-fg outline-none transition-colors focus:border-ember/60"
             >
               <option value="">默认（微软雅黑）</option>
               {FONTS.map((f) => (
@@ -373,9 +405,21 @@ export function FontStylePanel({
           <Row label="颜色">
             <Swatches value={t.color} onChange={(v) => setT({ color: v })} />
           </Row>
-          <Row label="字号">
-            <Slider value={t.size ?? 36} min={16} max={120} onChange={(v) => setT({ size: v })} />
-          </Row>
+          <div className="grid grid-cols-2 gap-x-3">
+            <Row label="字号">
+              <Slider value={t.size ?? 36} min={16} max={120} onChange={(v) => setT({ size: v })} />
+            </Row>
+            <Row label="微调">
+              <Slider
+                value={t.offsetY ?? 0}
+                min={-400}
+                max={400}
+                step={10}
+                suffix="px"
+                onChange={(v) => setT({ offsetY: v })}
+              />
+            </Row>
+          </div>
           <Row label="位置">
             <div className="flex gap-1">
               {(
@@ -390,7 +434,7 @@ export function FontStylePanel({
                   type="button"
                   onClick={() => setT({ position: p.k })}
                   className={cx(
-                    "flex-1 rounded border px-2 py-1 text-[11px] font-semibold transition-colors",
+                    "flex-1 rounded-lg border px-2 py-1 text-[11px] font-semibold transition-colors",
                     (t.position ?? "top") === p.k
                       ? "border-ember/50 bg-ember/8 text-fg"
                       : "border-line text-mut hover:bg-panel-2/60"
@@ -401,16 +445,6 @@ export function FontStylePanel({
               ))}
             </div>
           </Row>
-          <Row label="微调">
-            <Slider
-              value={t.offsetY ?? 0}
-              min={-400}
-              max={400}
-              step={10}
-              suffix="px"
-              onChange={(v) => setT({ offsetY: v })}
-            />
-          </Row>
           <Row label="阴影">
             <Slider value={t.shadow ?? 0} min={0} max={10} step={0.5} onChange={(v) => setT({ shadow: v })} />
           </Row>
@@ -419,7 +453,7 @@ export function FontStylePanel({
               <select
                 value={t.boxColor ?? "#FF6B35"}
                 onChange={(e) => setT({ boxColor: e.target.value })}
-                className="min-w-0 flex-1 rounded border border-line bg-panel px-2 py-1 text-[11.5px] text-fg outline-none focus:border-ember/60"
+                className="min-w-0 flex-1 rounded-lg border border-line bg-panel-2 px-2.5 py-1.5 text-[11.5px] text-fg outline-none transition-colors focus:border-ember/60"
               >
                 <option value="">不加底板</option>
                 {COLORS.map((c2) => (

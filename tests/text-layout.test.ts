@@ -136,12 +136,26 @@ describe("字幕 / 标题位置几何", () => {
      */
     const src = readFileSync("D:/GLB-NEW/src/renderer/src/components/FontStylePanel.tsx", "utf8");
 
-    // 左右分栏
-    expect(src).toMatch(/<div className="flex items-start gap-3">/);
-    // 预览列固定宽度 + 粘在顶部
-    expect(src).toMatch(/w-\[176px\] shrink-0 self-sticky top-0/);
+    // 左右分栏。
+    // 这里刻意不写死 gap 的具体数值：分栏间距调过好几轮，
+    // 写死会让"改个间距"变成一次测试红灯，而设计意图（并排）并没变。
+    expect(src).toMatch(/<div className="flex items-start gap-\d+">/);
+    // 预览列固定宽度 + 粘在顶部。同样不锁死具体像素。
+    expect(src).toMatch(/w-\[\d+px\] shrink-0 self-sticky top-0/);
     // 控件列占据剩余空间
     expect(src).toMatch(/min-w-0 flex-1/);
+
+    /* 列宽和预览自身的默认宽度必须一致。
+       这两个数字分处组件的两头（外层列 wrapper 和 TextLayoutPreview 的 props 默认值），
+       以前只改了其中一个，预览就会溢出列或者缩在列中间 —— 界面不报错，
+       只是"位置示意"看着比实际窄一截。所以在这里钉住它们相等。 */
+    const colWidth = src.match(/w-\[(\d+)px\] shrink-0 self-sticky top-0/)?.[1];
+    const previewDefault = src.match(/width = (\d+)/)?.[1];
+    expect(colWidth).toBeDefined();
+    expect(previewDefault).toBeDefined();
+    expect(colWidth, "预览列宽和 TextLayoutPreview 默认宽度不一致，预览会溢出或缩窄").toBe(
+      previewDefault
+    );
 
     // 预览不许再出现在两个 section 之前（那正是原来"叠在上方"的写法）
     const previewAt = src.indexOf("<TextLayoutPreview");
