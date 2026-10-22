@@ -469,6 +469,21 @@ async function projectOpen(id: string): Promise<{ project: ProjectSummary; check
   const project = projects.find((p) => p.id === id);
   if (!project) return null;
   const checkpoint = await readCheckpoint(id);
+  // 2026-10-21：liveVideoId 回填。老项目的 checkpoint 落库在 liveVideoId 机制之前
+  // （或当时分析还没建工程），一旦为 null,出片入口会直接 warn 拒绝——
+  // 素材明明分析过。现在打开项目时顺手用视频路径反查一次,
+  // 反查命中就立刻落库,界面无需任何操作。
+  if (checkpoint && checkpoint.liveVideoId == null && checkpoint.file?.path) {
+    try {
+      const row = await hermes.fetchLiveResult(checkpoint.file.path);
+      if (row?.liveVideoId != null) {
+        checkpoint.liveVideoId = row.liveVideoId;
+        void projectSave(id, checkpoint).catch(() => {});
+      }
+    } catch {
+      /* 反查失败不拦打开 */
+    }
+  }
   const next = projects.map((p) => (p.id === id ? { ...p, lastOpenedAt: new Date().toISOString() } : p));
   await writeIndex(next);
   activeProjectId = id;
@@ -783,6 +798,11 @@ function registerIpc(): void {
     hermes.addHotword(payload)
   );
   handle("algo:removeHotword", (id: number) => hermes.removeHotword(id));
+
+  // 2026-10-21：AI 文案套装（标题候选/简介/标签），失败信息原样给界面
+  handle("algo:copySuggest", (payload: { transcript: string; titleText?: string; durationSec?: number }) =>
+    hermes.copySuggest(payload)
+  );
 
   /* 出片 */
   handle("export:run", async (request_: ExportRequest) => {

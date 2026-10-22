@@ -777,6 +777,35 @@ async cancelDetect(filePath: string): Promise<{ ok: boolean; aborted: boolean }>
     };
   }
 
+  /**
+   * 2026-10-21：AI 文案套装。把勾选片段的字幕文本发给 Hermes 的 /pipeline/copy-suggest,
+   * 由本地 LLM 生成标题候选/简介/话题标签。失败原样抛给界面(文案失败不该拦出片)。
+   */
+  async copySuggest(payload: {
+    transcript: string;
+    titleText?: string;
+    durationSec?: number;
+  }): Promise<{
+    ok: boolean;
+    titles: string[];
+    desc?: string;
+    tags?: string[];
+    hook?: string;
+    model?: string;
+    error?: string;
+  }> {
+    return this.call(
+      "POST",
+      "/pipeline/copy-suggest",
+      {
+        transcript: String(payload?.transcript ?? ""),
+        titleText: payload?.titleText ? String(payload.titleText) : "",
+        durationSec: Number(payload?.durationSec) || 45
+      },
+      150_000
+    );
+  }
+
 
 
   /** POST /pipeline/generate,返回交付物与输出目录 */
@@ -819,6 +848,9 @@ async cancelDetect(filePath: string): Promise<{ ok: boolean; aborted: boolean }>
         ...(opts?.bgmVolume !== undefined ? { bgmVolume: opts.bgmVolume } : {}),
         ...(opts?.duckBgm !== undefined ? { duckBgm: opts.duckBgm } : {}),
         ...(opts?.sfx !== undefined ? { sfx: opts.sfx } : {}),
+        // 2026-10-21：响度标准化与界面同语义——"没填"视为开（!== false），
+        // 若不在这里显式传,undefined 让 Hermes 侧落到默认关、界面开着实际没开
+        audioNormalize: opts?.audioNormalize !== false,
 
         // 字幕 / 标题样式
         ...(opts?.captionFontStyle ? { captionFontStyle: opts.captionFontStyle } : {}),

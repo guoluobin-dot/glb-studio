@@ -115,6 +115,9 @@ const api: StudioApi = {
     ipcRenderer.invoke("algo:listHotwords", collection ?? null) as Promise<HotwordRule[]>,
   addHotword: (payload) => ipcRenderer.invoke("algo:addHotword", payload) as Promise<{ ok: boolean; id: number; updated: boolean }>,
   removeHotword: (id: number) => ipcRenderer.invoke("algo:removeHotword", id) as Promise<{ ok: boolean }>,
+  /** AI 文案套装:本地 LLM 生成标题候选/简介/标签 */
+  copySuggest: (payload) =>
+    ipcRenderer.invoke("algo:copySuggest", payload) as Promise<import("@shared/api-types").CopySuggestResult>,
   /** 纯文本替换，与 Hermes 侧算法一致；渲染层自己也能用，不必回主进程 */
   applyHotwordsToTranscript: (transcript, rules) => applyTranscript(transcript, rules),
 

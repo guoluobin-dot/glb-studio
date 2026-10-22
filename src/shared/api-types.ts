@@ -138,6 +138,27 @@ export interface DetectionStats {
 
 /** ---------- 出片 ---------- */
 
+/** AI 文案套装的入参。transcript 是已拼接好的字幕文本(Hermes 直接喂本地 LLM) */
+export interface CopySuggestRequest {
+  transcript: string;
+  /** 已有标题草稿时传入,模型往这个方向收 */
+  titleText?: string;
+  /** 目标成片长度(秒),默认 45 */
+  durationSec?: number;
+}
+
+/** AI 文案套装的出参。titles 是 3 条标题候选,点选即填入标题框 */
+export interface CopySuggestResult {
+  ok: boolean;
+  titles: string[];
+  desc?: string;
+  tags?: string[];
+  hook?: string;
+  /** 实际生成用的引擎/模型,界面上可选展示 */
+  model?: string;
+  error?: string;
+}
+
 export interface RenderOptions {
   vertical: boolean;
   /** 字幕样式: auto=默认描边 / bold=加粗立体边框(短剧知识类更醒目) */
@@ -198,6 +219,11 @@ export interface RenderOptions {
   bgmVolume?: number;
   /** 人声出现时自动压低 BGM(不压的话人声会被音乐盖住) */
   duckBgm?: boolean;
+  /**
+   * 响度标准化(loudnorm):把成片音轨拉齐到 -16 LUFS。
+   * "没填"视为开 —— 界面开着而字段还没落库的旧项目,不会被静默降级。
+   */
+  audioNormalize?: boolean;
   /** 冷开场时长(秒),仅 coldOpen=true 时用 */
   coldOpenSeconds?: number;
   /** 标题卡停留时长(秒),仅 titleCard=true 时用 */
@@ -984,6 +1010,12 @@ export interface StudioApi {
     transcript: T | null,
     rules: HotwordRule[]
   ): T | null;
+
+  /**
+   * AI 文案套装：把勾选片段的字幕文本交给 Hermes 的本地 LLM，
+   * 生成标题候选/简介/话题标签/开场钩子。失败不拦出片，错误原样带回。
+   */
+  copySuggest(payload: CopySuggestRequest): Promise<CopySuggestResult>;
 
   /* 出片 */
   export(request: ExportRequest): Promise<ExportResult>;
