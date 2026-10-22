@@ -11,12 +11,13 @@ import { fileURLToPath } from 'url';
 // 最后一个元素哪怕只差一个引号也会被整条丢掉）。下面保留同名的薄封装，
 // 调用点一处不用改，但修复能力提升；详见 utils/json-repair.js 头部说明。
 import { repairJson as _repairJson } from '../utils/json-repair.js';
+import { readJsonFile } from '../utils/read-config.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function loadConfig() {
   const configPath = join(__dirname, '..', '..', 'config', 'default.json');
-  return JSON.parse(readFileSync(configPath, 'utf-8'));
+  return readJsonFile(configPath);
 }
 
 export class OllamaClient {

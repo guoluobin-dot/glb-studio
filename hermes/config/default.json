@@ -14,7 +14,8 @@
     "maxTokens": 4096
   },
   "llm": {
-    "provider": "auto"
+    "provider": "auto",
+    "relay": []
   },
   "deepseek": {
     "baseUrl": "https://api.deepseek.com",
@@ -105,7 +106,30 @@
     "keyframeThreshold": 0.3,
     "minSegmentDurationMs": 30000,
     "maxSegmentDurationMs": 180000,
-    "termCorrect": true
+    "termCorrect": true,
+    "cloudAsr": {
+      "_comment": "云端语音识别：长直播（1~4小时）转写主力。本地 sherpa 一场几小时且准确率有限。见 src/analyzer/cloud-asr.js",
+      "enabled": true,
+      "_comment2": "auto = 按地址自动判断；openai = /audio/transcriptions（OpenAI/Groq/多数中转）；gemini = 原生 inlineData",
+      "provider": "gemini",
+      "_comment3": "不填则继承 gemini 那一份（同一把 key/地址），多数中转同时开 chat 和 audio",
+      "baseUrl": "https://api.apimart.ai/v1",
+      "apiKey": "{env:CLOUD_ASR_API_KEY}",
+      "_comment4": "音频模型名，注意和聊天模型不是同一个：OpenAI=whisper-1，Groq=whisper-large-v3",
+      "model": "gemini-3.5-flash-lite",
+      "language": "zh",
+      "_comment5": "单片秒数。opus 24kbps → 600秒≈1.8MB；Gemini inline 有 20MB 限制，建议 ≤300",
+      "chunkSeconds": 300,
+      "concurrency": 2,
+      "_comment6": "单场上限（分钟），0=不限。防手滑把整个库送上去烧钱",
+      "maxMinutesPerRun": 0,
+      "_comment7": "before-local=先云端失败再本地；after-local=先本地",
+      "priority": "before-local",
+      "fallbackToLocal": true,
+      "inherit": false,
+      "timeoutMs": 300000,
+      "retries": 2
+    }
   },
   "clipper": {
     "minHookQuality": 0.6,

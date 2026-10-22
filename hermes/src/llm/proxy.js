@@ -198,23 +198,42 @@ export function describeHttpFailure(status, statusText, bodyText) {
 /**
  * 带超时的 fetch，并把超时/连接错误翻译成能指方向的话。
  *
- * AbortError 无法区分是"超时"还是"用户主动取消"，这里统一按超时处理 ——
- * 本项目没有取消外部请求的入口，所以这个歧义不会造成实际问题。
+ * 2026-10-21 修复：原来这里把 AbortError 一律翻译成中文"连接 xxx 超时"，
+ * name 也跟着丢了 —— 上游（gemini.js `err.name === 'AbortError'` 取消分支、
+ * router.js 取消判断）从此再也认不出"用户主动取消"，会把它当故障
+ * 退避重试两轮，最后一手上报"超时"把云端链路拉黑 10 分钟。
+ * 现在：makeRequestController 会在 controller 上记 _abortedBy（user/timeout），
+ * 这里按原因分流：用户取消 → 保留 name='AbortError' + userCancelled=true；
+ * 真超时 → name='TimeoutError'，文案不变（依然按超时重试）。
  */
 export async function fetchWithDiagnostics(url, init = {}, timeoutMs = 15000) {
   try {
     return await fetch(url, { ...init, signal: init.signal || AbortSignal.timeout(timeoutMs) });
   } catch (err) {
     const name = err?.name || "";
+    const by = init.signal ? init.signal._abortedBy : null;
+    if (name === "AbortError" && by !== "timeout") {
+      // 用户主动取消（或无标记的裸 AbortController 中止）：保留"取消"身份原样上抛
+      const e = new Error(
+        (by === "user"
+          ? `已取消：请求被调用方终止（${new URL(url).host}）。这是正常停止，不是故障。`
+          : `请求被中止（${new URL(url).host}，无取消标记）。`)
+      );
+      e.name = "AbortError";
+      e.userCancelled = true;
+      throw e;
+    }
     if (name === "TimeoutError" || name === "AbortError") {
       const proxy = resolveProxy(cachedCfg);
-      throw new Error(
+      const e = new Error(
         `连接 ${new URL(url).host} 超时（${Math.round(timeoutMs / 1000)}s）。`
         + (proxy
           ? `已配置代理 ${proxy} 但仍超时 —— 检查代理软件是否在运行、端口是否变了。`
           : `当前是直连。如果这台机器开了代理（Clash/v2ray 等），`
             + `请在「引擎」面板把代理地址填上（形如 http://127.0.0.1:4780）。`)
       );
+      e.name = "TimeoutError"; // 超时别再顶着 AbortError 的壳，让上游能分辨
+      throw e;
     }
     throw new Error(
       `连不上 ${(() => { try { return new URL(url).host; } catch { return url; } })()}：${err?.message || err}`

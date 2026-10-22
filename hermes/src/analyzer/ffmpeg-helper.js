@@ -88,6 +88,40 @@ export function killAllFfmpeg() {
   return n;
 }
 
+/*
+ * 2026-10-21：定向杀进程。
+ *
+ * 以前 /pipeline/analyze-cancel 取消「一条」素材时调的是 killAllFfmpeg + ASRHelper.killAll，
+ * 是**全局**的 —— 一条视频点取消，会把调度器此刻正在跑的别的素材的
+ * 转写切片/转码 process 一起杀掉，无功而返还把别人的任务弄失败。
+ *
+ * killForFile 只杀"命令行里含该视频名/stem"的进程：
+ * spawn 的时候把完整命令行存在 child._argsStr 上（run() 与 getEnergyCurve 各登记一次），
+ * 抽音/转码/探测的参数里都会带 -i <videoPath>，因此按名字命中足够准。
+ */
+export function killForFile(pathOrName) {
+  const norm = String(pathOrName || '').toLowerCase().replace(/\\/g, '/');
+  if (!norm) return 0;
+  const base = norm.split('/').pop();        // 'xxx.mp4'
+  const stem = base.replace(/\.[^.]+$/, ''); // 'xxx'（抽出来的 wav/切片沿用这个stem）
+  let n = 0;
+  for (const child of [...ACTIVE_CHILDREN]) {
+    try {
+      if (child.killed || child.exitCode !== null) continue;
+      const cmdline = String(child._argsStr || '').toLowerCase().replace(/\\/g, '/');
+      if (!cmdline || (!cmdline.includes(base) && (stem.length < 3 || !cmdline.includes(stem)))) continue;
+      if (process.platform === 'win32' && child.pid) {
+        spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { shell: false, windowsHide: true });
+      } else {
+        child.kill('SIGKILL');
+      }
+      n++;
+    } catch { /* ignore */ }
+  }
+  if (n) console.log(`[FFmpeg] 已按文件定向终止 ${n} 个进程（${base}）`);
+  return n;
+}
+
 function sanitizeColor(c, fallback) {
   const s = String(c || fallback || 'white').trim().slice(0, 32);
   if (/^#[0-9a-fA-F]{6}(@0\.[0-9]+)?$/.test(s)) return s;
@@ -113,7 +147,7 @@ export class FFmpegHelper {
       'C:/ffmpeg/bin/ffmpeg.exe',
       'C:/Program Files/ffmpeg/bin/ffmpeg.exe',
       'C:/ProgramData/chocolatey/bin/ffmpeg.exe',
-      '<GLB_ROOT>/GLB/resources/app.asar.unpacked/node_modules/ffmpeg-static/ffmpeg.exe',
+      'D:/GLB/GLB/resources/app.asar.unpacked/node_modules/ffmpeg-static/ffmpeg.exe',
     ];
 
     const ffprobeCandidates = [
@@ -122,7 +156,7 @@ export class FFmpegHelper {
       'C:/ffmpeg/bin/ffprobe.exe',
       'C:/Program Files/ffmpeg/bin/ffprobe.exe',
       'C:/ProgramData/chocolatey/bin/ffprobe.exe',
-      '<GLB_ROOT>/GLB/resources/app.asar.unpacked/node_modules/@ffprobe-installer/win32-x64/ffprobe.exe',
+      'D:/GLB/GLB/resources/app.asar.unpacked/node_modules/@ffprobe-installer/win32-x64/ffprobe.exe',
     ];
 
     for (const p of candidates) {
@@ -163,6 +197,8 @@ export class FFmpegHelper {
         return;
       }
       ACTIVE_CHILDREN.add(child);
+      // 登记命令行指纹，killForFile 按文件名定向杀的时候用（2026-10-21）
+      child._argsStr = [cmd, args].flat().filter(Boolean).join(' ');
       const deregister = () => ACTIVE_CHILDREN.delete(child);
       let stdout = '';
       let stderr = '';
@@ -474,21 +510,61 @@ export class FFmpegHelper {
    * 用途：找到音量情绪高点（高潮/喝彩/强调），辅助爆点判断。不需要任何模型。
    * @returns {Promise<Array<{t:number, db:number}>>} 每秒平均响度（LUFS，越大越响）；无音轨返回 []
    */
-  async getEnergyCurve(videoPath) {
+  /**
+   * 音频能量曲线（不需要模型）。
+   *
+   * 2026-10-12 三处加固：
+   *   1) 登记进 ACTIVE_CHILDREN —— 以前这里是裸 spawn，不受登记表管，
+   *      于是"用户点取消"和"进程退出收尾"两件事都够不着它，
+   *      ffmpeg 会在界面上已显示"已取消"之后继续满负荷跑。
+   *   2) 收 signal —— 取消能真正打断，不用等 10 分钟的 self-timeout。
+   *   3) stderr 加封顶 —— ebur128 framelog=info 会逐秒输出一行，
+   *      3 小时直播累计约 9MB 字符串，而这里原来无上限地往内存里堆。
+   */
+  async getEnergyCurve(videoPath, opts = {}) {
     if (!this.ffmpegPath) throw new Error('ffmpeg not found');
-    const stderr = await new Promise((resolve) => {
+    const signal = opts.signal || null;
+    const stderr = await new Promise((resolve, reject) => {
       // framelog 必须是 info：quiet 会把逐帧响度行吞掉，下游正则一行都匹配不到，
       // 能量峰记忆永远为空（线上 retention_signals=0 就是这么来的）
       const child = spawn(this.ffmpegPath, [
         '-i', videoPath, '-map', 'a', '-af', 'ebur128=framelog=info', '-f', 'null', '-'
         // windowsHide：见 run() 里的说明。漏了就会每条素材弹一个黑框并抢焦点。
       ], { shell: false, windowsHide: true });
+      // 登记：取消端点与进程退出收尾都靠这个集合
+      ACTIVE_CHILDREN.add(child);
+      child._argsStr = [this.ffmpegPath, '-i', videoPath, '-af', 'ebur128'].join(' ');
+      let settled = false;
+      const finish = (fn, val) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener?.('abort', onAbort);
+        ACTIVE_CHILDREN.delete(child);
+        fn(val);
+      };
       let err = '';
       // 兜底超时：超长直播误走此路时不至于永远挂起
       const timer = setTimeout(() => { try { child.kill(); } catch { /* ignore */ } }, 600000);
-      child.on('error', () => { clearTimeout(timer); resolve(''); });
-      child.stderr.on('data', d => { err += d.toString(); });
-      child.on('close', () => { clearTimeout(timer); resolve(err); });
+      function onAbort() {
+        try {
+          if (process.platform === 'win32' && child.pid) {
+            spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { shell: false, windowsHide: true });
+          } else child.kill('SIGKILL');
+        } catch { /* ignore */ }
+        finish(reject, Object.assign(new Error('已取消'), { name: 'AbortError', userCancelled: true }));
+      }
+      if (signal?.aborted) { onAbort(); return; }
+      signal?.addEventListener?.('abort', onAbort, { once: true });
+      // 9MB 起步的输出必须有上限，否则长时间运行会把内存吃满
+      const STDERR_CAP = 4 * 1024 * 1024;
+      child.on('error', (e) => finish(resolve, ''));
+      child.stderr.on('data', d => {
+        if (err.length >= STDERR_CAP) return;
+        err += d.toString();
+        if (err.length > STDERR_CAP) err = err.slice(0, STDERR_CAP) + '\n[stderr 已截断]';
+      });
+      child.on('close', () => finish(resolve, err));
     });
     // 行格式（ffmpeg 6.x）：[Parsed_ebur128_0 @ ...] t: 12.3  TARGET:-23 LUFS    M: -23.5  S: ... I: ... LRA: ...
     // 注意 t: 与 M: 之间隔着 TARGET 段，旧正则 /t:..M:/ 跨不过去导致永远 0 行——必须按行分别提取

@@ -22,16 +22,18 @@
  */
 
 import { readFileSync } from 'fs';
+import { makeRequestController } from './abort.js';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { repairJson } from '../utils/json-repair.js';
 import { fetchWithDiagnostics, describeHttpFailure, resolveProxy, proxySource } from './proxy.js';
+import { readJsonFile } from '../utils/read-config.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function loadConfig() {
 	const configPath = join(__dirname, '..', '..', 'config', 'default.json');
-	return JSON.parse(readFileSync(configPath, 'utf-8'));
+	return readJsonFile(configPath);
 }
 
 /** apiKey 支持三种写法:直接值、{env:NAME} 占位、环境变量兜底 */
@@ -94,6 +96,20 @@ export class GeminiClient {
 		this.spent = 0;
 		this._availableModels = [];
 		this._visionWarned = false;
+		/** 模型列表的缓存有效期：失败不写缓存，超时后重试 */
+		this._modelsFetched = false;
+		this._modelsFetchedAt = 0;
+		this.MODELS_TTL_MS = 5 * 60 * 1000;
+		/**
+		 * 实际被改用过的模型（404 兜底换的）。
+		 *
+		 * 2026-10-12：以前兜底会 `this.model = alt` 直接写死到实例上，
+		 * 于是 health() 之后一直报"配置里的模型 X 服务商没有"——
+		 * 用户明明已经换过一次了，界面还在报原来那个错。
+		 * 现在配置里的 model 是配置里的事，实际用哪个记到 _effectiveModel 上，
+		 * 两者分开，排查时能同时看到"配的是什么"和"实际跑的是什么"。
+		 */
+		this._effectiveModel = null;
 	}
 
 	resetBudget() {
@@ -267,12 +283,75 @@ export class GeminiClient {
 	}
 
 	/**
+	 * 拉一次服务商的模型列表（带缓存，失败返回空数组）。
+	 *
+	 * 用于"配置里的模型名服务商那边没有"的兜底 —— 中转站的模型改名/下架很常见，
+	 * 而模型名是写死在配置里的。以前只能等每次调用 404 才发现，
+	 * 一次长直播分析会连着几十次 404，整轮白跑。
+	 */
+	async _fetchModels() {
+		/*
+		 * 2026-10-12 修：失败不再被永久缓存。
+		 *
+		 * 原来 `this._modelsFetched = true` 写在 try **之前**，
+		 * 于是任何一次网络抖动之后，本进程内"模型列表"就永久是空的 ——
+		 * 404→换模型的兜底从此失效，后面每个分片都照样 404。
+		 *
+		 * 现在只有真拿到列表（或明确拿到空列表）才记成功，失败走 TTL 重试。
+		 */
+		const now = Date.now();
+		if (this._modelsFetched && now - (this._modelsFetchedAt || 0) < this.MODELS_TTL_MS) {
+			return this._availableModels || [];
+		}
+		try {
+			const { url, headers } = this._request('models');
+			const res = await fetchWithDiagnostics(url, { headers }, 10000);
+			if (!res.ok) return this._availableModels || []; // 不改 _modelsFetched，允许重试
+			const data = this._unwrapEnvelope(await res.json());
+			const isOai = this.protocol === 'openai-compatible';
+			this._availableModels = isOai
+				? (data?.data || []).map((m) => String(m?.id ?? '')).filter(Boolean)
+				: (data?.models || []).map((m) => String(m?.name ?? '').replace(/^models\//, '')).filter(Boolean);
+			this._modelsFetched = true;
+			this._modelsFetchedAt = now;
+			if (this._availableModels.length) {
+				console.log(`[Gemini] 服务商可用模型 ${this._availableModels.length} 个：${this._availableModels.slice(0, 12).join('、')}${this._availableModels.length > 12 ? ' …' : ''}`);
+			}
+			return this._availableModels;
+		} catch {
+			return [];
+		}
+	}
+
+	/**
+	 * 配置里的模型名不存在时，挑一个最接近的顶上。
+	 *
+	 * 挑选顺序：同族前缀（gemini/claude/gpt…）→ 含 flash/pro/lite 等特征词 → 第一个。
+	 * 只在"确实列出了模型列表且配置的名字不在里面"时才换，
+	 * 绝不静默改成别的模型 —— 会同时打一行明确的日志，
+	 * 让人一眼看到"配置写的是 X，实际发出去的是 Y"。
+	 *
+	 * @returns {Promise<string|null>} 可用的模型名；没法兜就返回 null
+	 */
+	async _resolveModelFallback(configured) {
+		const models = await this._fetchModels();
+		if (!models.length) return null;
+		if (models.includes(configured)) return configured;
+		const base = String(configured).split('-')[0].toLowerCase();
+		const family = models.filter((m) => m.toLowerCase().startsWith(base));
+		const pool = family.length ? family : models;
+		const prefer = pool.find((m) => /flash/i.test(m)) || pool[0];
+		return prefer || null;
+	}
+
+	/**
 	 * @param {Array<{role:string, content:string}>} messages
 	 * @returns {Promise<string>} 模型回复文本
 	 */
 	async chat(messages, options = {}) {
 		const { systemInstruction, contents } = this._toContents(messages);
-		const model = options.model || this.model;
+		const configuredModel = options.model || this.model;
+		let model = configuredModel;
 		const maxTokens = options.maxTokens ?? this.maxTokens;
 		const temperature = options.temperature ?? this.temperature;
 
@@ -304,8 +383,9 @@ export class GeminiClient {
 			};
 		if (!isOai && systemInstruction) body.systemInstruction = systemInstruction;
 
-		const controller = new AbortController();
-		const timeoutId = setTimeout(() => controller.abort(), options.timeout || this.timeout);
+		// 外部取消信号接进来（2026-10-12）：以前只看自己的超时，
+		// 用户点"取消"时云端请求根本断不掉。
+		const { controller, detach } = makeRequestController(options.signal, options.timeout || this.timeout);
 		this.spent++;
 		try {
 			const { url, headers } = this._request(
@@ -323,6 +403,38 @@ export class GeminiClient {
 			);
 			if (!res.ok) {
 				const errText = await res.text().catch(() => '');
+				/*
+				 * 404 "找不到指定的模型" 是可以自愈的一类错误：
+				 * 中转站改名/下架模型之后，配置里那个名字就永远 404，
+				 * 而一场长直播会连着打几十次 —— 每次都失败，整轮分析白跑。
+				 * 这里换成一个服务商确实提供的模型重试一次，
+				 * 并明确记一行"配置写的是 X，实际用的是 Y"，让人自己去改配置。
+				 */
+				if (res.status === 404 && /找不到指定的模型|model[\s_-]?not[\s_-]?found|NOT_FOUND[\s\S]{0,40}model/i.test(errText)) {
+					const alt = await this._resolveModelFallback(model);
+					if (alt && alt !== model) {
+						console.warn(`[Gemini] 配置里的模型 "${model}" 服务商没有，实际改用 "${alt}"（请把设置里的模型名改成后者）`);
+						// 不改写 this.model：那是被配置读进来的，health() 还靠它回报
+						// "配置里的模型 X 服务商没有"。改了它就永远看不到这条提示了。
+						this._effectiveModel = alt;
+						model = alt;
+						if (isOai) body.model = alt;
+						const retry = await fetchWithDiagnostics(
+							url,
+							{ method: 'POST', headers, body: JSON.stringify(body), signal: controller.signal },
+							options.timeout || this.timeout
+						);
+						if (retry.ok) {
+							const retryData = this._parseBody(await retry.text());
+							const retryText = this._extractText(retryData);
+							if (retryText) {
+								const u = this._usage(retryData);
+								if (u?.total) this.lastUsage = u;
+								return retryText;
+							}
+						}
+					}
+				}
 				// 分级报错：401 是 key 的问题、404 是地址/协议的问题、超时是代理的问题，
 				// 三者处理办法完全不同。以前一律报"连接失败"，用户只能靠猜。
 				throw new Error(`${describeHttpFailure(res.status, res.statusText, errText)}（协议：${this.protocol}）`);
@@ -339,7 +451,7 @@ export class GeminiClient {
 			if (u?.total) this.lastUsage = u;
 			return text;
 		} finally {
-			clearTimeout(timeoutId);
+			detach();
 		}
 	}
 
@@ -368,11 +480,27 @@ export class GeminiClient {
 		const maxRetry = options.maxRetry ?? 2;
 		let text = '';
 		for (let i = 0; i <= maxRetry; i++) {
+			/*
+			 * 2026-10-12：每次重试**之前**都查额度。
+			 *
+			 * 原来只在 router 层调一次 budgetLeft()，而 generate 内部最多重试 3 次 ——
+			 * 也就是说一次逻辑调用能把 cloudBudgetPerRun 整个额度吃穿。
+			 * 一场 3 小时直播几十个分片下来，实际花掉的钱可能是预算的数倍，
+			 * 而界面上"额度还剩 8"看着一切正常。
+			 */
+			if (typeof this.budgetLeft === 'function' && this.budgetLeft() <= 0) {
+				throw new Error(
+					`云端额度已用完（本轮上限 ${this.budget}，已发 ${this.spent} 次请求），本次不再重试`
+				);
+			}
 			try {
 				text = await this.chat(messages, options);
 				break;
 			} catch (err) {
 				const msg = String(err?.message || err);
+				// 取消/额度用尽不该退避重试
+				if (err?.name === 'AbortError' || err?.userCancelled) throw err;
+				if (/额度已用完/.test(msg)) throw err;
 				const retryable = this._isRetryable(msg);
 				if (!retryable || i === maxRetry) throw err;
 				// 指数退避 + 上限，避免把限流打得更狠
@@ -397,6 +525,19 @@ export class GeminiClient {
 	 */
 	_isRetryable(msg) {
 		if (/HTTP (429|500|502|503)\b/.test(msg)) return true;
+		/*
+		 * 2026-10-12 补：超时/中止也要算"可能重试"。
+		 *
+		 * proxy.js 把 AbortError/TimeoutError 翻译成中文的"连接 xxx 超时（600s）"，
+		 * 而旧正则只认 ETIMEDOUT/fetch failed 这些英文串 ——
+		 * 中文"超时"一个字都不匹配，于是设计说明里"超时 → 退避重试"这条永远不触发，
+		 * 一次 600 秒超时会直接判整块失败。
+		 */
+		if (/超时|timeout|timed out|aborted|已取消/i.test(msg)) {
+			// 但用户主动取消不能重试 —— 那不是故障
+			if (/已取消/.test(msg)) return false;
+			return true;
+		}
 		if (/fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|请求过于频繁|服务暂时不可用|网关错误/i.test(msg)) return true;
 		// 明确的不可重试：key / 余额 / 权限 / 模型名 / 参数
 		if (/HTTP (400|401|402|403|404)\b/.test(msg)) return false;
@@ -442,8 +583,7 @@ export class GeminiClient {
 				body = { contents: [{ role: 'user', parts }] };
 			}
 
-			const controller = new AbortController();
-			const timeoutId = setTimeout(() => controller.abort(), options.timeout || this.timeout);
+			const { controller, detach } = makeRequestController(options.signal, options.timeout || this.timeout);
 			this.spent++;
 			try {
 				const { url, headers } = this._request(
@@ -472,7 +612,7 @@ export class GeminiClient {
 				const out = this._extractText(data);
 				return out || null;
 			} finally {
-				clearTimeout(timeoutId);
+				detach();
 			}
 		} catch (err) {
 			if (!this._visionWarned) {

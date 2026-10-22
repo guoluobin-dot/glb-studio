@@ -15,8 +15,58 @@ import { fileURLToPath } from 'url';
 import { FFmpegHelper } from './ffmpeg-helper.js';
 import { ASRHelper } from './asr-helper.js';
 import { normalizeThemeName, themeTaxonomyHint } from './theme-taxonomy.js';
+import { countWords } from '../utils/count-words.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// 结构段允许的类型（提示词与 DB 枚举共用一份，别再各写各的）
+const SEGMENT_TYPES = ['hook_opening', 'tension_build', 'peak_moment', 'resolution_cta', 'outro'];
+
+/**
+ * 归一化 LLM 返回的结构段。
+ *
+ * 2026-10-11 修的真 bug：直接 `seg.segment_type` 往 NOT NULL 列里插，
+ * 于是模型偶尔不吐这个字段（或者写成 type/segmentType）时，
+ * **整条素材的分析全部作废** —— SQLite 抛 NOT NULL constraint failed，
+ * 被 catch 成 status=failed，前面已经算好的标题/要点/主题一并丢掉。
+ * 实测 15 条爆款里就有 1 条这样没了，而界面只显示"分析失败"。
+ *
+ * 一段结构坏掉不该毁掉整条素材，所以：
+ *   - 类型缺失/不认识 → 按时长与位置兜底推断（开头=钩子，中段=峰值，结尾=收尾）
+ *   - 时间缺失/倒挂 → 返回 null，丢这一段而不是写一行脏数据
+ *   - 数值越界 → 夹取，并保留强度到 0~1
+ * 主题名那边已经有同款兜底（normalizeThemeName），这里是它的姊妹篇。
+ */
+function normalizeStructureSegment(seg, totalDurSec = 0) {
+  if (!seg || typeof seg !== 'object') return null;
+  const rawType = String(seg.segment_type ?? seg.segmentType ?? seg.type ?? '').trim().toLowerCase();
+  let type = SEGMENT_TYPES.includes(rawType) ? rawType : '';
+  if (!type) {
+    const s = Number(seg.start_seconds ?? seg.start_sec ?? seg.start ?? NaN);
+    const e = Number(seg.end_seconds ?? seg.end_sec ?? seg.end ?? NaN);
+    if (Number.isFinite(s) && Number.isFinite(e)) {
+      const atStart = s <= Math.max(1, totalDurSec * 0.15);
+      const atEnd = Number.isFinite(totalDurSec) && totalDurSec > 0 && e >= totalDurSec * 0.85;
+      type = atStart ? 'hook_opening' : (atEnd ? 'outro' : 'tension_build');
+    } else {
+      type = 'tension_build';
+    }
+  }
+  const startMs = Math.round(Number(seg.start_seconds ?? seg.start_sec ?? seg.start) * 1000);
+  const endMs = Math.round(Number(seg.end_seconds ?? seg.end_sec ?? seg.end) * 1000);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return null;
+  const intensity = Number(seg.intensity);
+  return {
+    segmentType: type,
+    startMs,
+    endMs,
+    durationMs: endMs - startMs,
+    description: String(seg.description ?? '').slice(0, 500),
+    keyText: String(seg.key_text ?? seg.keyText ?? '').slice(0, 500),
+    emotionTag: String(seg.emotion_tag ?? seg.emotionTag ?? '').slice(0, 40),
+    intensity: Number.isFinite(intensity) ? Math.min(1, Math.max(0, intensity)) : 0.5,
+  };
+}
 
 const SYSTEM_PROMPT = `You are Hermes Video Analytics AI. You analyze short viral video transcripts to extract the creator's structural patterns, emotional arcs, and content themes.
 
@@ -129,14 +179,23 @@ export class HitAnalyzer {
    * @param {string} videoPath - full path to the video
    * @returns {Promise<{hitVideoId: number, analysis: Object}>}
    */
-  async analyze(videoPath) {
+  async analyze(videoPath, opts = {}) {
     this._inflight = this._inflight || new Map();
     const key = String(videoPath);
     if (this._inflight.has(key)) {
       console.warn(`[HitAnalyzer] ${basename(videoPath)} 已在分析中，复用同一次分析（避免并发抢显存）`);
       return this._inflight.get(key);
     }
-    const task = this._analyzeOne(videoPath);
+    /*
+     * 2026-10-12 加 opts.signal：以前 analyze() 根本不接收取消信号，
+     * 于是点"取消"之后这条素材要一路跑完 ——
+     * sherpa 转写只能等它自己的硬超时（3 小时素材 = 60 分钟），
+     * LLM 调用因为不传 signal 也断不掉。用户的"已取消"和实际状态完全脱节。
+     *
+     * 去重锁的语义：复用同一次分析时，第二个调用方的 signal 不接管
+     * （一次分析只认一个取消源，两个 signal 打架反而谁都取消不掉）。
+     */
+    const task = this._analyzeOne(videoPath, opts);
     this._inflight.set(key, task);
     try {
       return await task;
@@ -146,19 +205,57 @@ export class HitAnalyzer {
   }
 
   /**
+   * 清掉一条爆款素材的上一次拆解（结构/主题/能量峰/话术样本）。
+   *
+   * 只在分析**成功之后**、写子表之前调用（2026-10-12 从 _analyzeOne 开头挪到这里）。
+   * 一条结构段写不进去不该让整条素材的上一次学习数据陪葬，所以放在最后的关口。
+   */
+  _purgeOldHitAnalysis(hitVideoId, videoRecordId) {
+    try {
+      this.store.db.prepare('DELETE FROM hit_structure WHERE hit_video_id = ?').run(hitVideoId);
+      this.store.db.prepare('DELETE FROM hit_themes WHERE hit_video_id = ?').run(hitVideoId);
+    } catch (err) {
+      console.warn(`[HitAnalyzer] 清理旧结构/主题失败: ${err.message}`);
+    }
+    try {
+      this.store.db.prepare('DELETE FROM retention_signals WHERE video_id = ?').run(videoRecordId);
+    } catch (err) {
+      console.warn(`[HitAnalyzer] 清理旧能量峰失败: ${err.message}`);
+    }
+    try {
+      this.store.db.prepare('DELETE FROM copywriting_patterns WHERE video_id = ?').run(videoRecordId);
+    } catch (err) {
+      console.warn(`[HitAnalyzer] 清理旧话术样本失败: ${err.message}`);
+    }
+  }
+
+  /**
    * Main entry: analyze a hit video file.
    * @param {string} videoPath - full path to the video
    * @returns {Promise<{hitVideoId: number, analysis: Object}>}
    */
-  async _analyzeOne(videoPath) {
+  async _analyzeOne(videoPath, opts = {}) {
+    /*
+     * 取消上下文：**每次运行一份局部变量**，不挂在实例上。
+     * （live-analyzer 把它挂在 this._abortSignal 上，并发分析会互相覆盖 ——
+     *   A 场的 signal 被 B 场清掉后就永远断不了。那边的坑不要再犯一遍。）
+     */
+    const signal = opts.signal || null;
+    const throwIfAborted = () => {
+      if (signal?.aborted) {
+        const e = new Error('已取消');
+        e.name = 'AbortError';
+        e.userCancelled = true;
+        throw e;
+      }
+    };
+    throwIfAborted();
     const videoName = basename(videoPath);
-    const videoId = this.store.upsertHitVideo(videoPath, {
+    const hitId = this.store.upsertHitVideo(videoPath, {
       videoName,
       analysisStatus: 'analyzing'
     });
-    // 幂等：重分析先清掉旧拆解，避免重复累积
-    this.store.db.prepare('DELETE FROM hit_structure WHERE hit_video_id = ?').run(videoId);
-    this.store.db.prepare('DELETE FROM hit_themes WHERE hit_video_id = ?').run(videoId);
+    const videoId = hitId;
 
     // Also register in video_records for FK compatibility (copywriting_patterns references video_records)
     const videoRecordId = this.store.upsertVideo(videoPath, {
@@ -166,16 +263,21 @@ export class HitAnalyzer {
       sourceType: 'hit',
       genre: null
     });
-    // 幂等：能量峰(retention)也清掉。以前只清 structure/themes，每次重试都多插 8 条，
-    // 线上已攒出 232 条重复（同一视频 40 条）。
-    try {
-      this.store.db.prepare('DELETE FROM retention_signals WHERE video_id = ?').run(videoRecordId);
-    } catch { /* 旧库无表时忽略，_init 会建 */ }
-    // 话术模式同理：以前只清 structure/themes/retention，copywriting_patterns 每次重分析都翻倍
-    // （同一条素材点 3 次"重新分析"就是 3 倍话术样本，直接带偏相似度与学习权重）。
-    try {
-      this.store.db.prepare('DELETE FROM copywriting_patterns WHERE video_id = ?').run(videoRecordId);
-    } catch { /* 同上 */ }
+
+    /*
+     * 2026-10-12 改：四张子表原来在**这里**（任何计算开始之前）就 DELETE 了。
+     *
+     * 后面是转写 + 抽帧 + 一次 600 秒超时的 LLM 调用（还带重试），
+     * 失败概率并不低。一旦失败 → status 置 failed，
+     * 而 upsertHitVideo 是 merge 语义（标题/全文稿/爆点都保留上一次的结果），
+     * 于是库里变成"素材看着还是好的、状态是失败的、结构/主题/话术样本全没了"，
+     * 界面既没法解释也没法恢复 —— 上一次辛辛苦苦拆出来的学习数据直接蒸发。
+     *
+     * live-analyzer 早就因为同样的问题改过（见那边 purgeOldSegments 的注释，
+     * 2026-09-30，"我们就这么丢过一次"），这次把同样的顺序搬到 hit 侧。
+     *
+     * 清库统一放到所有计算成功之后、写子表之前（见本文件 _purgeOldHitAnalysis）。
+     */
 
     console.log(`[HitAnalyzer] Analyzing hit video: ${videoName} (id=${videoId})`);
 
@@ -206,7 +308,8 @@ export class HitAnalyzer {
 
       // Step 2: ASR transcript
       console.log(`[HitAnalyzer] Getting transcript...`);
-      asrResult = await this.asr.getTranscript(videoPath);
+      throwIfAborted();
+      asrResult = await this.asr.getTranscript(videoPath, { signal });
       if (asrResult.transcript.length === 0) {
         console.warn(`[HitAnalyzer] No transcript available for ${videoName}`);
         const silent = !!asrResult.silent;
@@ -248,7 +351,8 @@ export class HitAnalyzer {
       let energyPeaks = [];
       if (this.ffmpeg.isAvailable) {
         try {
-          const curve = await this.ffmpeg.getEnergyCurve(videoPath);
+          throwIfAborted();
+          const curve = await this.ffmpeg.getEnergyCurve(videoPath, { signal });
           energyPeaks = this._topEnergyPeaks(curve, 8);
           for (const p of energyPeaks) {
             this.store.addRetentionSignal({
@@ -271,7 +375,7 @@ export class HitAnalyzer {
       let visual = { notes: '', onScreenTexts: [], expressions: [], coverSec: null, coverReason: '' };
       if (keyframeFiles.length > 0) {
         try {
-          visual = await this._describeKeyframes(keyframeFiles);
+          visual = await this._describeKeyframes(keyframeFiles, signal);
           if (visual.notes) console.log(`[HitAnalyzer] Visual notes: ${String(visual.notes).slice(0, 120)}...`);
           if (visual.onScreenTexts?.length) console.log(`[HitAnalyzer] 画面标题 ${visual.onScreenTexts.length} 条`);
         } catch (err) {
@@ -283,7 +387,8 @@ export class HitAnalyzer {
       console.log(`[HitAnalyzer] Running Ollama analysis...`);
       // Ollama 偶发 fetch failed（显存紧张/模型刚切走/服务瞬时没响应），直接判失败太亏：
       // 前期的转写+抽帧+视觉全白跑了。网络类错误最多重试 2 次，其余错误立即放弃。
-      analysisResult = await this._analyzeWithRetry(asrResult.transcript, metadata, { energyPeaks, visualNotes: visual.notes });
+      throwIfAborted();
+      analysisResult = await this._analyzeWithRetry(asrResult.transcript, metadata, { energyPeaks, visualNotes: visual.notes }, 2, signal);
       console.log(`[HitAnalyzer] Analysis complete: ${analysisResult.genre}, ${analysisResult.themes?.length || 0} themes`);
 
       // Step 4b: 记忆维度落库
@@ -338,19 +443,30 @@ export class HitAnalyzer {
       });
       console.log(`[HitAnalyzer] 记忆维度：标题=${analysisResult.video_title || '-'} · 要点${(analysisResult.viral_points || []).length}条 · 画面字${onScreen.length}条 · 情绪段${(analysisResult.emotion_curve || []).length} · 全文${fullText.length}字${coverFrame ? ' · 封面已存' : ''}`);
 
+      /*
+       * 到这里分析已经成功，旧拆解才可以清（先算后写，2026-10-12）。
+       * 之前是在 _analyzeOne 开头就删，失败一次就把上一次的学习数据全毁了。
+       *
+       * 结构/主题/能量峰/话术样本四张表一起清：不清的话每重分析一次就翻倍，
+       * （线上曾攒出同一视频 40 条重复能量峰，话术样本翻倍会直接带偏相似度与学习权重）
+       */
+      this._purgeOldHitAnalysis(videoId, videoRecordId);
+
       // Store structure segments
       if (analysisResult.structure) {
         for (const seg of analysisResult.structure) {
+          const norm = normalizeStructureSegment(seg, Number(analysisResult.total_duration_seconds) || 0);
+          if (!norm) continue;
           this.store.addHitStructure({
             hitVideoId: videoId,
-            segmentType: seg.segment_type,
-            startMs: Math.round(seg.start_seconds * 1000),
-            endMs: Math.round(seg.end_seconds * 1000),
-            durationMs: Math.round((seg.end_seconds - seg.start_seconds) * 1000),
-            description: seg.description,
-            keyText: seg.key_text,
-            emotionTag: seg.emotion_tag,
-            intensity: seg.intensity,
+            segmentType: norm.segmentType,
+            startMs: norm.startMs,
+            endMs: norm.endMs,
+            durationMs: norm.durationMs,
+            description: norm.description,
+            keyText: norm.keyText,
+            emotionTag: norm.emotionTag,
+            intensity: norm.intensity,
             keyframePath: keyframesDir || null // 该视频的关键帧目录（%04d.png），供后续封面/人工回顾用
           });
         }
@@ -407,6 +523,16 @@ export class HitAnalyzer {
       return { hitVideoId: videoId, analysis: analysisResult };
 
     } catch (err) {
+      // 用户取消不是失败：以前这里一锅端写 'failed'（带 failedAt 进退避黑名单），
+      // 界面还显示成"分析失败"。取消要落 'cancelled'，自动队列不复活它。
+      if (err?.userCancelled || err?.name === 'AbortError') {
+        console.log(`[HitAnalyzer] ${videoName} 已被用户取消`);
+        this.store.updateHitVideo(videoId, {
+          analysisStatus: 'cancelled',
+          lastError: '用户取消',
+        });
+        throw err;
+      }
       console.error(`[HitAnalyzer] Analysis failed for ${videoName}:`, err.message);
       this.store.updateHitVideo(videoId, {
         analysisStatus: 'failed',
@@ -439,11 +565,13 @@ export class HitAnalyzer {
    * 但重摇一次通常就能拿到正常 JSON —— 它本质上是输出格式的运气问题，
    * 和"这条素材真的分析不了"不是一回事。所以单列出来一起重试。
    */
-  async _analyzeWithRetry(transcript, metadata, extra = {}, maxRetry = 2) {
+  async _analyzeWithRetry(transcript, metadata, extra = {}, maxRetry = 2, signal = null) {
     let lastErr = null;
     for (let i = 0; i <= maxRetry; i++) {
       try {
-        return await this._analyzeWithLLM(transcript, metadata, extra);
+        // 取消优先于重试：用户已经点了取消，就别再发起下一次 generate
+        if (signal?.aborted) throw Object.assign(new Error('已取消'), { name: 'AbortError', userCancelled: true });
+        return await this._analyzeWithLLM(transcript, metadata, extra, signal);
       } catch (err) {
         lastErr = err;
         const msg = String(err?.message || err);
@@ -461,7 +589,7 @@ export class HitAnalyzer {
   /**
    * Call Ollama to analyze transcript structure.
    */
-  async _analyzeWithLLM(transcript, metadata, extra = {}) {
+  async _analyzeWithLLM(transcript, metadata, extra = {}, signal = null) {
     const fullText = ASRHelper.transcriptToText(transcript);
     const duration = metadata.format?.duration || 0;
 
@@ -470,7 +598,14 @@ export class HitAnalyzer {
     const maxInputWords = 3000;
     const maxInputChars = 12000;
     let textForAnalysis = ASRHelper.transcriptToTimestampedText(transcript);
-    if (fullText.split(/\s+/).length > maxInputWords || fullText.length > maxInputChars) {
+    /*
+     * 词数用 countWords 数，不写 fullText.split(/\s+/).length。
+     *
+     * split 会为了拿一个数字，把整篇稿子切成上万个字符串的数组 ——
+     * 这一行的瞬时内存是全文稿的好几倍，而这只是个阈值判断。
+     * （asr-helper 里的 chunkTranscript 也是同样写法。）
+     */
+    if (countWords(fullText) > maxInputWords || fullText.length > maxInputChars) {
       const chunks = ASRHelper.chunkTranscript(transcript, 800);
       // Take first chunk, middle chunk, last chunk for a representative sample
       const sample = [
@@ -509,7 +644,7 @@ Please output the analysis as the specified JSON structure.`;
         const repaired = await this.ollama.generate(
           '你是 JSON 整理器。只输出 JSON 对象，不要输出任何解释、前言或 markdown。结构：{"genre":"string","total_duration_seconds":number,"structure":[{"segment_type":"hook_opening|tension_build|peak_moment|resolution_cta|outro","start_seconds":number,"end_seconds":number,"description":"string","key_text":"string","emotion_tag":"string","intensity":number}],"themes":[{"theme_name":"string","confidence":number,"keywords":[],"related_segment_indices":[]}],"hook_patterns":[{"hook_text":"string","hook_type":"string","effectiveness":number}],"video_title":"string","opening_script":"string","viral_points":[{"point":"string","evidence":"string","weight":number}],"on_screen_texts":[{"time_seconds":number,"text":"string","type":"title|caption|sticker|cta"}],"cover_candidate":{"time_seconds":number,"reason":"string","suggested_text":"string"},"emotion_curve":[{"start_seconds":number,"end_seconds":number,"emotion":"string","facial_expression":"string","voice_tone":"string","intensity":number}],"rhythm_analysis":{"pace":"fast|medium|slow","speech_density":"high|medium|low","key_moment_interval_seconds":number,"energy_curve":"rising|steady|wave|drop_then_rise"},"copywriting_patterns":[{"pattern_type":"hook|transition|urgency|cta|soft_cta|objection|social_proof|value_prop|trust","text":"string","context":"string","effectiveness":number}]}',
           `将以下视频分析文本整理成上述 JSON 结构（按内容合理归纳，不要空数组凑数）：\n---\n${String(result).slice(0, 6000)}`,
-          { maxTokens: 4096, temperature: 0.1, parseJson: true, timeout: 600000 }
+          { maxTokens: 4096, temperature: 0.1, parseJson: true, timeout: 600000, signal }
         );
         if (repaired && typeof repaired === 'object' && !Array.isArray(repaired)) {
           console.log('[HitAnalyzer] Repair pass succeeded');
@@ -645,7 +780,7 @@ Please output the analysis as the specified JSON structure.`;
    * 8G 显存吃不下 1080p 原图的上万 visual tokens，先压到 480p 再送。
    * 模型未下载时 ollama.describe 返回 null，直接跳过。
    */
-  async _describeKeyframes(files) {
+  async _describeKeyframes(files, signal = null) {
     if (!files.length) return { notes: '', onScreenTexts: [], expressions: [] };
     // 均匀采样（原来只取首/中/尾 3 帧，画面标题出现位置不确定，容易漏）。
     // 上限 4 帧：试过 6 帧，8G 显存送完视觉再切文本模型容易 fetch failed，得不偿失。
@@ -678,7 +813,7 @@ Please output the analysis as the specified JSON structure.`;
     const sys = '你是视频画面解读器。只看图，不联想。只输出 JSON：{"frames":[{"sec":数字或null,"on_screen_text":"画面大字原文，没有填空字符串","scene":"画面主体","expression":"人物表情或肢体状态","mood":"色调氛围"}],"cover_sec":数字或null,"cover_reason":"理由"}。要求：sec 填你估计的出现秒数（不确定填 null）；on_screen_text 必须是画面上真实可见的文字，没有就填空字符串；禁止输出解释、禁止把字段名当内容。';
     const txt = await this.ollama.describe(images,
       sys + '\n共 ' + images.length + ' 帧，按时间顺序。sec 填你估计的出现秒数（不知道填 null）。',
-      { timeout: 300000 });
+      { timeout: 300000, signal });
     let parsed = null;
     try {
       const jb = txt ? txt.match(/\{[\s\S]*\}/) : null;

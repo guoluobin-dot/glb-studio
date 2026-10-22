@@ -20,9 +20,11 @@ import { Orchestrator } from './orchestrator/index.js';
 import { createLlmClient } from './llm/router.js';
 import { applyProxyEnv, resolveProxy, proxySource } from './llm/proxy.js';
 import { MemoryStore } from './memory/store.js';
-import { readFileSync, appendFileSync, mkdirSync, existsSync, statSync, renameSync } from 'fs';
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync, statSync, renameSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { readJsonFile } from './utils/read-config.js';
+import { applyDesktopEngineSettings } from './utils/engine-settings.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -46,7 +48,7 @@ function loadLocalSecrets() {
   if (!existsSync(file)) return 0;
   let obj;
   try {
-    obj = JSON.parse(readFileSync(file, 'utf-8'));
+    obj = readJsonFile(file);
   } catch (err) {
     console.warn(`[Secrets] 读取 ${file} 失败（已忽略）: ${err.message}`);
     return 0;
@@ -62,6 +64,83 @@ function loadLocalSecrets() {
   if (n) console.log(`[Secrets] 已从 secrets.local.json 载入 ${n} 项`);
   return n;
 }
+
+/**
+ * 把 config/default.json 里的明文密钥挪进 config/secrets.local.json（2026-10-11）。
+ *
+ * 为什么必须做：.gitignore 里明明白白写着
+ *   "config/default.json 里只用 {env:NAME} 占位符，真实值放这个被忽略的文件"
+ * 而桌面端「引擎」面板保存时是直接把 key 明文写进 default.json 的
+ * （app.asar 的 syncHermesEngineConfig：cfg.gemini.apiKey = s.cloud.apiKey）。
+ * 也就是说用户正常用一次面板，密钥就跟着一个要进版本库的文件走了 ——
+ * 一次 git add 就可能把它推到远端。
+ *
+ * 这里做一次自愈迁移：明文 key → secrets.local.json（已被 .gitignore 忽略），
+ * default.json 还原成 {env:GEMINI_API_KEY} 占位符。
+ * 运行时完全等价（resolveApiKey 认占位符，loadLocalSecrets 会把值灌进 env），
+ * 但密钥不再躺在受版本管理的文件里。
+ *
+ * 只在"确实检测到明文"时才动文件，且写 secrets 成功之后才改配置；
+ * 任何一步失败都保持原样，宁可不动也不能把 key 弄丢。
+ */
+function migratePlaintextKeysToSecrets(configPath) {
+  if (!existsSync(configPath)) return 0;
+  let cfg;
+  try {
+    cfg = readJsonFile(configPath);
+  } catch (err) {
+    console.warn(`[Secrets] 跳过密钥迁移（配置读不出来）: ${err.message}`);
+    return 0;
+  }
+  // provider -> 环境变量名。约定与 resolveApiKey/各客户端一致。
+  const targets = [
+    ['gemini', 'apiKey', 'GEMINI_API_KEY'],
+    ['deepseek', 'apiKey', 'DEEPSEEK_API_KEY'],
+    ['zen', 'apiKey', 'OPENCODE_ZEN_API_KEY'],
+    ['gemini', 'proxy', null],
+  ];
+  let moved = 0;
+  for (const [section, field, envName] of targets) {
+    const raw = cfg?.[section]?.[field];
+    // 已经是 {env:...} 占位符，或为空 → 不是明文，不管
+    if (typeof raw !== 'string' || !raw.trim()) continue;
+    if (/^\{env:[A-Za-z_][A-Za-z0-9_]*\}$/.test(raw.trim())) continue;
+    if (!envName) continue; // proxy 不是密钥，本来就该写在配置里
+    const secretsPath = join(__dirname, '..', 'config', 'secrets.local.json');
+    let secrets = {};
+    try {
+      if (existsSync(secretsPath)) secrets = readJsonFile(secretsPath) || {};
+    } catch {
+      secrets = {}; // 文件坏了就重建，别因为它挡住迁移
+    }
+    // 环境变量/文件里已有真值就不覆盖，避免用旧值盖掉用户刚换的
+    if (secrets[envName] || process.env[envName]) {
+      cfg[section][field] = `{env:${envName}}`;
+      moved++;
+      continue;
+    }
+    secrets[envName] = raw.trim();
+    try {
+      writeFileSync(secretsPath, `${JSON.stringify(secrets, null, 2)}\n`, { encoding: 'utf-8' });
+    } catch (err) {
+      console.warn(`[Secrets] 写 ${secretsPath} 失败，密钥保持原样: ${err.message}`);
+      continue; // 没写成就不动配置，绝不把 key 弄丢
+    }
+    cfg[section][field] = `{env:${envName}}`;
+    moved++;
+    console.log(`[Secrets] 已把 ${section}.${field} 的明文密钥迁到 config/secrets.local.json（${envName}），default.json 还原为占位符`);
+  }
+  if (!moved) return 0;
+  try {
+    writeFileSync(configPath, `${JSON.stringify(cfg, null, 2)}\n`, { encoding: 'utf-8' });
+    console.log('[Secrets] 密钥已移出受版本管理的 config/default.json');
+  } catch (err) {
+    console.warn(`[Secrets] 改写 ${configPath} 失败（密钥仍在原处，可手动处理）: ${err.message}`);
+  }
+  return moved;
+}
+
+migratePlaintextKeysToSecrets(join(__dirname, '..', 'config', 'default.json'));
 loadLocalSecrets();
 
 // 崩溃留痕：任何未捕获异常都写入 data/crash.log，方便排查“静默退出”
@@ -103,7 +182,11 @@ process.on('unhandledRejection', (reason) => {
 
 function loadConfig() {
   const configPath = join(__dirname, '..', 'config', 'default.json');
-  return JSON.parse(readFileSync(configPath, 'utf-8'));
+  const cfg = readJsonFile(configPath);
+  // 桌面端「引擎」面板的设置（key/协议/中转地址）也作为配置来源，
+  // 桌面端往 default.json 同步的那条通道写死了旧盘符，挪盘后一直是坏的。
+  applyDesktopEngineSettings(cfg);
+  return cfg;
 }
 
 // Status check mode
@@ -189,7 +272,17 @@ if (process.argv.includes('--init')) {
 }
 
 // Main server mode
-const orchestrator = new Orchestrator();
+//
+// 2026-10-10 修：applyProxyEnv 原来只在 --status 分支里跑，
+// 真正的服务进程从来没执行过。于是出网代理完全依赖"父进程恰好注入了 HTTPS_PROXY"：
+//   - 由 hermes-guard.js 拉起 → 守护会自己读 Windows 系统代理注进去，能连
+//   - 由 start-glb.cmd 直接拉起（/health 探不到时走的就是这条）→ 什么都没注入，
+//     Node 内置 fetch 只认环境变量、不读系统代理，于是所有云端请求直连超时
+// 表现就是"key 明明填对了却连不上"，而本机 curl -x 同一个地址完全正常。
+// 修法：服务进程自己也要把代理灌进 process.env（幂等，守护注入的优先级更高，见 applyProxyEnv）。
+const serverConfig = loadConfig();
+applyProxyEnv(serverConfig);
+const orchestrator = new Orchestrator(serverConfig);
 _activeOrchestrator = orchestrator;
 
 // Graceful shutdown

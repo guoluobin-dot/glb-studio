@@ -11,7 +11,10 @@
 import { resolveProxy, applyProxyEnv, proxySource, describeHttpFailure } from "../proxy.js";
 import { readFileSync } from "node:fs";
 
-const cfg = JSON.parse(readFileSync("<GLB_ROOT>/Hermes/config/default.json", "utf8"));
+// 2026-10-12：原来写死 D:/GLB/Hermes/config/default.json —— 全家桶挪到 E: 之后
+  // 这个验证脚本必然读不到配置。改成按脚本自身位置推算仓库根。
+  const ROOT = join(fileURLToPath(import.meta.url), "..", "..", "..", "..");
+  const cfg = JSON.parse(readFileSync(join(ROOT, "config", "default.json"), "utf8"));
 const g = cfg.gemini || {};
 const oai = (g.protocol || "gemini-native") === "openai-compatible";
 

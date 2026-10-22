@@ -16,12 +16,13 @@
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { readJsonFile } from '../utils/read-config.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function loadConfig() {
   const configPath = join(__dirname, '..', '..', 'config', 'default.json');
-  return JSON.parse(readFileSync(configPath, 'utf-8'));
+  return readJsonFile(configPath);
 }
 
 function resolveApiKey(cfg) {

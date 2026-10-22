@@ -15,12 +15,14 @@ import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { repairJson } from '../utils/json-repair.js';
+import { readJsonFile } from '../utils/read-config.js';
+import { makeRequestController } from './abort.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function loadConfig() {
 	const configPath = join(__dirname, '..', '..', 'config', 'default.json');
-	return JSON.parse(readFileSync(configPath, 'utf-8'));
+	return readJsonFile(configPath);
 }
 
 function resolveApiKey(cfg) {
@@ -79,9 +81,27 @@ export class DeepSeekClient {
 		this.timeout = ds.timeout || 300000;
 		this.maxTokens = ds.maxTokens || 8192;
 		this.temperature = ds.temperature ?? 0.7;
+		/*
+		 * 2026-10-12 补额度闸门。
+		 *
+		 * router.js 的判断是 `typeof cloud.budgetLeft === 'function'` ——
+		 * DeepSeekClient 以前根本没有这几个方法，于是切到 DeepSeek 通道之后
+		 * **cloudBudgetPerRun 完全失效**，一场长直播可以无限次打 API。
+		 * 用户在界面上把"单次分析云端调用上限"从 8 改成 4，
+		 * 实际花钱次数一点没变 —— 配置看着生效了，其实没生效。
+		 *
+		 * 默认沿用 gemini.cloudBudgetPerRun（同一份配置项，不新增配置），
+		 * 需要单独设置时用 deepseek.cloudBudgetPerRun 覆盖。
+		 */
+		this.budget = Number(ds.cloudBudgetPerRun ?? cfg?.gemini?.cloudBudgetPerRun ?? 8);
+		this.spent = 0;
 		this._availableModels = [];
 		this._visionWarned = false;
 	}
+
+	resetBudget() { this.spent = 0; }
+
+	budgetLeft() { return Math.max(0, this.budget - this.spent); }
 
 	setAvailableModels(models) {
 		this._availableModels = models || [];
@@ -115,8 +135,13 @@ export class DeepSeekClient {
 			body.temperature = options.temperature ?? this.temperature;
 		}
 
-		const controller = new AbortController();
-		const timeoutId = setTimeout(() => controller.abort(), options.timeout || this.timeout);
+		// 外部取消信号接进来（2026-10-12）：以前只看自己的超时，
+		// 用户点"取消"时 DeepSeek 这条路根本断不掉，会一直跑到自然结束。
+		if (this.budgetLeft() <= 0) {
+			throw new Error(`DeepSeek 额度已用完（本轮上限 ${this.budget}），本次不再发起请求`);
+		}
+		this.spent++;
+		const { controller, detach } = makeRequestController(options.signal, options.timeout || this.timeout);
 		try {
 			const res = await fetch(`${this.baseUrl}/chat/completions`, {
 				method: 'POST',
@@ -133,7 +158,7 @@ export class DeepSeekClient {
 			if (!text.trim()) throw new Error('DeepSeek 未返回内容');
 			return text;
 		} finally {
-			clearTimeout(timeoutId);
+			detach();
 		}
 	}
 

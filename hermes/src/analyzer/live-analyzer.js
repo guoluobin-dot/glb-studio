@@ -86,9 +86,9 @@ function renderStandardForSegmentation(st) {
 export function buildMemoryContext(store, collection = undefined) {
   const mem = { themes: [], lessons: [], feedback: [], avoid: [], opening: '', hooks: [], openers: [], viralPoints: [], standard: '', edits: null };
   // 选中集合后，下面三块记忆（主题 / 评审经验 / 打回意见）都必须按集合取。
-  // 以前全是全局池：混着所有老师的爆款和意见。后果是"我选了案例老师，
+  // 以前全是全局池：混着所有老师的爆款和意见。后果是"我选了祝老师，
   // 结果模型学的是别人的主题和避雷点"，而且界面完全看不出来。
-  // 当前全局文件夹（只作为兜底）：比如界面停在"案例老师"，但正在分析的这条直播
+  // 当前全局文件夹（只作为兜底）：比如界面停在"祝老师"，但正在分析的这条直播
   // 自己绑定了"王老师"，就该用王老师的记忆 —— 传进来的 collection 优先。
   // 不传（undefined）才回落到全局，所以老调用方行为不变。
   const active = collection !== undefined
@@ -202,7 +202,7 @@ export function buildMemoryContext(store, collection = undefined) {
   //
   // 优先取**当前选中的 IP 老师**的钩子；没选集合才回落 genre 全局池。
   // 顺序反了的话：全局池里混着所有老师的钩子，会覆盖掉本该学的那位，
-  // 表现为"我选了案例老师，结果学的是别人的钩子"，而且界面不报错。
+  // 表现为"我选了祝老师，结果学的是别人的钩子"，而且界面不报错。
   try {
     let picked = false;
     if (active) {
@@ -387,21 +387,32 @@ export class LiveAnalyzer {
     this.asr = new ASRHelper(config);
     this.liveDir = config.upload?.liveDir || join(__dirname, '..', '..', 'upload', 'live');
     this.tempDir = config.upload?.tempDir || join(__dirname, '..', '..', 'upload', 'temp');
+    /** 爆款素材时长中位数（秒）。每场分析开始时按 hit_videos 现状重算，见 analyze() Step 5 */
+    this.hitMedianSec = 0;
     // LLM 调用预算：本机 8B 实测约 约 69 tok/s(2026-09-30 实测)，参数必须围绕这个真实吞吐来定
     // （原来 maxTokens 4096 + timeout 180s，物理上不可能返回完整 JSON）
-    this.segmentChunkSeconds = config.performance?.segmentChunkSeconds || 240;
+    /*
+     * 2026-10-21：可调参数全部夹取范围。以前这些值直接 `|| fallback`，
+     * 配置里手滑写 0 / 巨值都会原样生效 —— segmentChunkSeconds=0 会把每块
+     * 切成空块，matchBatchSize=2000 会一批发满上下文直接爆。
+     */
+    const clampNum = (v, fb, min, max) => {
+      const n = Math.round(Number(v));
+      return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fb;
+    };
+    this.segmentChunkSeconds = clampNum(config.performance?.segmentChunkSeconds, 240, 30, 1800);
     // 2026-09-30 实测校准：本机 8B 实际约 69 tok/s（不是早期注释估的 约 69 tok/s(2026-09-30 实测)，
     // 那个数字来自更小/更早的模型，留着会把批量和超时都调得过保守，白白慢十倍）。
     // 匹配阶段每段约 140 token 输出，6 段一批 → 150 段要 25 次串行调用。
     // 69 tok/s 下 20 段一批完全写得完（20×140≈2800 token ≈ 40s），
     // 批次数从 25 降到 8，整体墙钟时间跟着降。
-    this.matchBatchSize = config.performance?.matchBatchSize || 20;
-    this.llmTimeoutMs = config.performance?.llmTimeoutMs || 600000;
+    this.matchBatchSize = clampNum(config.performance?.matchBatchSize, 20, 1, 60);
+    this.llmTimeoutMs = clampNum(config.performance?.llmTimeoutMs, 600000, 30000, 1800000);
     // 预筛参数（2026-09-30 加）：本机 8B 约 约 69 tok/s(2026-09-30 实测)，能少送一块就少等一分。
     // 默认开着；阈值调到 0 可关闭，退回"全部分析"的旧行为。
     this.prescreen = config.performance?.prescreen !== false;
-    this.prescreenMinChars = Number(config.performance?.prescreenMinChars || 260);
-    this.prescreenMinDensity = Number(config.performance?.prescreenMinDensity || 1.6);
+    this.prescreenMinChars = clampNum(config.performance?.prescreenMinChars, 260, 0, 5000);
+    this.prescreenMinDensity = clampNum(config.performance?.prescreenMinDensity, 1.6, 0, 50);
     // 2026-09-27：输出预算按通道分档。
     // 本地 8B 约 5tok/s，给小了 JSON 会被掐断成半截（历史上整批报废 → 90 秒等分兜底），
     // 而超时预算有 10 分钟，翻倍输出只多花 ~20 秒，换一次成功远比省这点时间划算。
@@ -459,17 +470,41 @@ export class LiveAnalyzer {
      * 中途不查的话用户点了取消还是要等整个流程走完。
      */
     const signal = opts.signal || null;
-    // 存到实例上，让深层（_analyzeChunkOnce / 主题匹配）不用一路改签名也能拿到。
-    // 这些方法被多处复用（含调度器自动分析），走实例字段是最小改动面。
-    this._abortSignal = signal;
-    const throwIfAborted = () => {
-      if (signal?.aborted) {
-        const err = new Error('分析已被用户取消');
-        err.name = 'AbortError';
-        err.userCancelled = true;
-        throw err;
-      }
+    /*
+     * 2026-10-12：取消信号改成**每次运行一个局部上下文**，不再挂在实例上。
+     *
+     * 原来存成 this._abortSignal（"走实例字段是最小改动面"），
+     * 但 analyze() 的锁只在 orchestrator 层按 videoPath 加，不同素材之间**不互斥** ——
+     * 于是 scanAndAnalyze / 调度器 / 手动触发可以同时跑多个 analyze()，后果是：
+     *   - A 场（带 signal）跑到一半，B 场启动 → 464 行把 _abortSignal 覆盖成 B 的
+     *     → A 场后续所有 LLM 调用拿到 null，**永远断不了**
+     *   - B 场结束时 810 行无条件置 null → 又把 A 的 signal 清一次
+     *     → _isAbort 也判不出取消
+     *
+     * 现在用运行级上下文（this._run = {signal, throwIfAborted, isAbort}）：
+     * 深层方法仍能从 this._run 拿（不用改一长串签名），
+     * 但每次运行各自一份，并发分析之间不会互相踩。
+     */
+    const ctx = {
+      signal,
+      throwIfAborted: () => {
+        if (signal?.aborted) {
+          const e = new Error('已取消');
+          e.name = 'AbortError';
+          e.userCancelled = true;
+          throw e;
+        }
+      },
+      isAbort: (err) => {
+        if (err?.userCancelled) return true;
+        if (err?.name === 'AbortError') return true;
+        if (signal?.aborted) return true;
+        return false;
+      },
     };
+    const prevRun = this._run;
+    this._run = ctx;
+    const throwIfAborted = ctx.throwIfAborted;
     throwIfAborted();
 
     try {
@@ -578,7 +613,7 @@ export class LiveAnalyzer {
       // 随分段系统提示词一起喂给 Ollama，让"切哪里、怎么命名、钩子打几分"直接受记忆影响
       //
       // 用这条直播自己绑定的老师，而不是全局当前文件夹：
-      // 导入案例老师的素材时界面可能正停在王老师身上，用错记忆不会报错，
+      // 导入祝老师的素材时界面可能正停在王老师身上，用错记忆不会报错，
       // 只是选出来的片段"不对味"，事后根本查不出是谁的问题。
       const ownCollection = this.store.getLiveVideoCollection?.(liveVideoId) ?? undefined;
       const mem = buildMemoryContext(this.store, ownCollection);
@@ -650,6 +685,29 @@ export class LiveAnalyzer {
       // Step 5: ★ 记忆注入点 2/3 —— 用记忆库里累积的爆款主题做匹配，
       // 并把评审经验（如"指定开头/钩子不够炸"）一并传给匹配器参与打分
       const hitThemes = this.store.getAllHitThemes(50);
+      /*
+       * 爆款素材的时长中位数（2026-10-14）。
+       *
+       * 默认勾选要按爆款标准来，而爆款最硬的客观特征就是时长：
+       * 实测这批爆款的中位数是 554 秒（9.2 分钟），
+       * 而分析切出来的段清一色 20 秒 —— 不看时长就永远发现不了这个落差。
+       * 统计放在这里（而不是构造函数），因为爆款库会随着分析不断增长，
+       * 每场重算一次才准。
+       */
+      this.hitMedianSec = 0;
+      try {
+        const durs = this.store.db.prepare(
+          "SELECT duration_ms FROM hit_videos WHERE analysis_status = 'completed' AND duration_ms > 0"
+        ).all().map((r) => Number(r.duration_ms) / 1000).sort((a, b) => a - b);
+        if (durs.length) {
+          this.hitMedianSec = durs[Math.floor(durs.length / 2)];
+          console.log(`[LiveAnalyzer] 爆款时长中位数 = ${Math.round(this.hitMedianSec)} 秒（样本 ${durs.length} 条），用于候选打分`);
+        } else {
+          console.log('[LiveAnalyzer] 没有可用爆款时长样本，候选打分退回纯爆款价值分');
+        }
+      } catch (err) {
+        console.warn('[LiveAnalyzer] 统计爆款时长中位数失败:', err.message);
+      }
       console.log(`[LiveAnalyzer] Matching ${allSegments.length} segments against ${hitThemes.length} historical themes (batch=${this.matchBatchSize})`);
       await this._matchAllWithHitThemes(allSegments, hitThemes, mem);
 
@@ -711,6 +769,10 @@ export class LiveAnalyzer {
           hookQuality: seg.hook_quality,
           peakCount: 0,
           transcriptSummary: seg.transcript_summary,
+          // 爆款价值分与建议动作必须落到库里（以前在这里被丢掉，
+          // 界面只好拿 hook_quality 当分数 —— 于是"按爆款逻辑挑"成了空话）
+          viralPotential: seg.viral_potential,
+          recommendedAction: seg.recommended_action,
           status: 'draft'
         });
       }
@@ -748,19 +810,83 @@ export class LiveAnalyzer {
       // 这里与 addLiveSegment 用同一套映射,保证"接口看到什么,库里就是什么"。
       // 零长段已经在写库前剔除(allSegments 里就没有了),所以这里直接 map,
       // 序号也是连续的 —— 时间轴偏移按序号累加,断号会算错。
-      const normalized = allSegments.map((seg, i) => ({
-        segmentIndex: i,
-        startMs: Math.round(Number(seg.start_seconds ?? 0) * 1000),
-        endMs: Math.round(Number(seg.end_seconds ?? 0) * 1000),
-        durationMs: Math.round((Number(seg.end_seconds ?? 0) - Number(seg.start_seconds ?? 0)) * 1000),
-        themeName: seg.theme_name,
-        themeConfidence: seg.confidence,
-        matchedHitThemes: seg.matched_hit_themes,
-        hookQuality: seg.hook_quality,
-        peakCount: 0,
-        transcriptSummary: seg.transcript_summary,
-        status: 'draft'
-      }));
+const normalized = allSegments.map((seg, i) => {
+        /*
+         * 界面那一侧的默认勾选是写死的：
+         *   score100 = hook_quality * 100 ; recommended = score100 >= 60
+         * （app.asar 里 toClipCandidate 的最后一行，不可改）
+         *
+         * 只看 hook_quality 的后果，实测过：一场 3 小时直播切出 255 段，
+         * LLM 给绝大多数段的 hook_quality 落在 0.6~0.95，
+         * 于是 190 段被默认勾上 —— 清一色 20 秒的段，
+         * 而爆款素材的时长中位数是 554 秒（9.2 分钟）。
+         * 用户看到的就是"全是垃圾、完全没用爆款逻辑"。
+         *
+         * 所以这里把 hook_quality 换成**按爆款逻辑算出来的综合分**：
+         * 爆款价值分（拿爆款主题库匹配出来的）为主，钩子分为辅，
+         * 再按"离爆款时长中位数多远"做温和惩罚。
+         *
+         * 为什么不直接覆盖 hook_quality：
+         *   - 老的 hook_quality 仍有独立含义（钩子好不好），别两个概念混成一个数；
+         *   - 但界面的 recommended 只看这一个数，不覆盖它就没法生效。
+         * 所以：hook_quality 原样保留在 hookQuality 字段里供分析/剪辑使用，
+         *      而**接口返回的** hookQuality 用爆款分重算 —— 界面读的就是这个。
+         * 两边用途不同、字段名相同，这里写清楚以免后人以为被覆盖错了。
+         */
+        const hookRaw = Number(seg.hook_quality);
+        const viralRaw = Number(seg.viral_potential);
+        const hookSafe = Number.isFinite(hookRaw) ? Math.min(1, Math.max(0, hookRaw)) : 0.5;
+        const viralSafe = Number.isFinite(viralRaw) ? Math.min(1, Math.max(0, viralRaw)) : null;
+
+        /*
+         * 爆款分为主，钩子分只做微调。
+         *
+         * 权重是实测标定的（2026-10-14）：
+         * 匹配器给的 viral_potential 集中在 0.6~0.85（LLM 打分习惯偏保守），
+         * 钩子分集中在 0.5~0.95。
+         * 早先按 0.8/0.2 加权，再乘时长惩罚，实际跑下来综合分只有 0.51~0.59，
+         * 界面判 recommended（>=0.60）就变成 0 条 —— 又走到另一个极端。
+         *
+         * 现在的做法是"以爆款分为基底，钩子分只在附近微调"：
+         *   综合分 = 爆款分 × 0.9 + 钩子分 × 0.1
+         * 这样 0.80 的爆款分 → 0.72~0.80 区间，0.70 → 0.63~0.70，
+         * 落在阈值两侧有真实区分度，而不是全在阈值之下或全在阈值之上。
+         */
+        let displayHook = viralSafe !== null
+          ? viralSafe * 0.9 + hookSafe * 0.1
+          : hookSafe * 0.92;
+
+        // 时长惩罚：爆款素材时长中位数（由 hit_videos 统计得出）。
+        // 20 秒的段与 554 秒差一个数量级，但它确实承载了完整讲解，
+        // 所以只做温和惩罚（最低 ×0.75），不做一票否决 ——
+        // 否则短小精悍的高价值段会被误杀，而"该选哪几段"最终由用户决定。
+        const durSec = Number(seg.end_seconds) - Number(seg.start_seconds);
+        if (Number.isFinite(durSec) && durSec > 0 && this.hitMedianSec > 0) {
+          const ratio = durSec / this.hitMedianSec;
+          // 明显偏短才罚；与爆款同量级或更长不罚
+          if (ratio < 0.1) displayHook *= 0.75;   // 不到爆款十分之一
+          else if (ratio < 0.25) displayHook *= 0.88;
+        }
+
+        return {
+          segmentIndex: i,
+          startMs: Math.round(Number(seg.start_seconds ?? 0) * 1000),
+          endMs: Math.round(Number(seg.end_seconds ?? 0) * 1000),
+          durationMs: Math.round((Number(seg.end_seconds ?? 0) - Number(seg.start_seconds ?? 0)) * 1000),
+          themeName: seg.theme_name,
+          themeConfidence: seg.confidence,
+          matchedHitThemes: seg.matched_themes,
+          // 界面用它算 SCORE 与 recommended —— 所以这里是爆款综合分
+          hookQuality: Number(displayHook.toFixed(4)),
+          // 原钩子分另存一份，需要时（分析/剪辑/排查）能拿回真值
+          rawHookQuality: hookSafe,
+          viralPotential: viralSafe,
+          recommendedAction: seg.recommended_action || null,
+          peakCount: 0,
+          transcriptSummary: seg.transcript_summary,
+          status: 'draft'
+        };
+      });
       return { liveVideoId, segments: normalized, health };
 
     } catch (err) {
@@ -776,8 +902,14 @@ export class LiveAnalyzer {
           health.finishedAt = new Date().toISOString();
           health.grade = 'cancelled';
           health.error = '用户取消';
+          /*
+           * 2026-10-21：取消别再落回 'pending'。
+           * pending 会被调度器 30 秒一轮自动选中 → 用户点取消 = 点了"暂停 30 秒"，
+           * 死任务无限复活；用力过猛还会把只写了一半的 live_segments 再清空一次。
+           * 现在落 'cancelled'：自动队列不碰它，想重跑请手动点"重新分析"。
+           */
           this.store.upsertLiveVideo(videoPath, {
-            analysisStatus: liveVideoId ? 'pending' : 'pending',
+            analysisStatus: 'cancelled',
             analysisHealth: health
           });
         } catch { /* ignore */ }
@@ -807,7 +939,9 @@ export class LiveAnalyzer {
       try { this.ollama?.endTask?.(); } catch { /* ignore */ }
       // 也要清掉取消信号：留在实例上会让下一次分析（哪怕是几小时后调度器自动跑的）
       // 一进 LLM 就被一个早已 aborted 的 signal 打断，等于分析功能彻底瘫掉。
-      this._abortSignal = null;
+      // 注意是**恢复上一次的**而不是无条件置空 —— 并发分析时 B 场结束
+      // 不能把 A 场还在用的上下文清掉（这正是原来 instance 字段的 bug）。
+      this._run = prevRun || null;
     }
   }
 
@@ -1007,7 +1141,7 @@ IMPORTANT: start_seconds/end_seconds must be RELATIVE offsets from the chunk sta
         tier: 'heavy',
         // 这一步是整场分析里最慢的一次调用（几十秒到几分钟）。
         // 不传 signal 的话用户点了取消它照跑到底，整条分析要等它返回才 unwind。
-        signal: this._abortSignal ?? signal ?? null,
+        signal: this._run?.signal ?? signal ?? null,
       });
 
       const text = typeof raw === 'string' ? raw : JSON.stringify(raw ?? '');
@@ -1095,6 +1229,14 @@ IMPORTANT: start_seconds/end_seconds must be RELATIVE offsets from the chunk sta
 
     const batchSize = this.matchBatchSize;
     for (let b = 0; b < allSegments.length; b += batchSize) {
+      /*
+       * 2026-10-12 加取消检查点。
+       *
+       * 这一段是整场分析里墙钟时间最长的一段：150 段 / 每批 20 = 8 批云端请求，
+       * 每批几十秒，取消点却要到分析末尾才有机会生效 ——
+       * 用户点了取消，剩下 7 批照发照烧 token，空跑十几分钟。
+       */
+      this._run?.throwIfAborted?.();
       const batch = allSegments.slice(b, b + batchSize);
       const ok = await this._matchBatchWithLlm(batch, hitThemes, themeList, lessonBlock);
       if (!ok) {
@@ -1127,6 +1269,8 @@ theme_id 必须用 [id=] 里的数字id；无好匹配则空数组+null+needs_us
 
     let arr = [];
     try {
+      // 正在跑的那一发也要能断：光在批循环里检查，正在进行的这次仍会跑完
+      this._run?.throwIfAborted?.();
       const result = await this.ollama.generate(THEME_MATCH_PROMPT, userPrompt, {
         // 按批大小动态给输出预算（每段约 130 tokens）。原 2048 是给 30 段批的，
         // 但 8B 在 600s 内写不完 30 段，尾部被截断 → 整批报废。
@@ -1136,10 +1280,13 @@ theme_id 必须用 [id=] 里的数字id；无好匹配则空数组+null+needs_us
         parseJson: true,
         // 与分段共用同一 num_ctx：切 tier 会改 num_ctx 导致 KV 缓存失效、重新 prefill（实测 173ms → 38s）
         tier: 'heavy',
+        signal: this._run?.signal ?? null,
       });
       arr = result?.results || result?.matches || [];
       if (!Array.isArray(arr)) arr = [];
     } catch (err) {
+      // 用户取消要往上抛，不能当"这批没匹配上"吞掉 —— 吞了就会继续跑下一批
+      if (this._isAbort(err)) throw err;
       console.warn(`[LiveAnalyzer] 批次匹配调用失败: ${err.message}`);
       arr = [];
     }
@@ -1160,6 +1307,8 @@ theme_id 必须用 [id=] 里的数字id；无好匹配则空数组+null+needs_us
 
     // 覆盖不足：拆半重试（已覆盖的段保留结果，只补未覆盖的半批）
     if (batch.length > 1) {
+      // 拆半会额外发两次请求，取消了就别发
+      this._run?.throwIfAborted?.();
       const half = Math.ceil(batch.length / 2);
       const a = batch.slice(0, half);
       const c = batch.slice(half);
@@ -1198,9 +1347,16 @@ theme_id 必须用 [id=] 里的数字id；无好匹配则空数组+null+needs_us
       }
     }
     matched.sort((a, b) => b.similarity_score - a.similarity_score);
+    /*
+     * 2026-10-21 修评分倒挂：没匹配到任何主题的段，以前直接拿 hook_quality
+     * 当 viral_potential（0.6~0.95）—— 综合分 = viral*0.9 + hook*0.1 算下来
+     * 几乎和真命中一样高，甚至压过 0.75 的真命中（默认勾选跟着选错）。
+     * 现在未命中走 0.6 折算的"下位代理"（0.9 hook ≈ 综合分 0.54，默认不勾），
+     * 真命中的分段公式不动。
+     */
     const viral = matched.length
       ? Math.min(0.95, (segment.hook_quality || 0.5) * 0.4 + bestScore * 0.6 + 0.1)
-      : (segment.hook_quality || 0.5);
+      : Math.min(0.6, (segment.hook_quality || 0.5) * 0.6);
     return {
       matched_themes: matched.slice(0, 3),
       best_match_theme_id: best,
@@ -1280,7 +1436,7 @@ Output the match result as specified JSON.`;
     if (!err) return false;
     if (err.userCancelled) return true;
     if (err.name === 'AbortError') return true;
-    if (this._abortSignal?.aborted) return true;
+    if (this._run?.signal?.aborted) return true;
     return false;
   }
 
@@ -1340,7 +1496,25 @@ Output the match result as specified JSON.`;
    * 每 90s 一段，主题记“待分类”，钩子质量取中值，后续照样可走匹配/粗剪/人工确认。
    */
   _fallbackSplit(transcript, sliceSeconds = 90) {
-    const endMs = Math.max(...transcript.map(t => (t.end ?? t.end_ms ?? 0)));
+    /*
+     * 2026-10-12：Math.max(...arr) 改成 reduce。
+     *
+     * spread 展开的是**实参**，词级逐字稿上万条（3 小时直播 ~12 万元素）时
+     * 会撞上 V8 的参数上限，抛 RangeError: Maximum call stack size exceeded ——
+     * 而这里在 catch 路径上，一抛就把整场推进 failed。
+     *
+     * 顺带修掉"全都没有 end 时 endMs = -Infinity、循环一次都不跑 → 返回 []"
+     * 那个静默返回空数组的分支（LLM 每块都返回零长段时会走到）。
+     */
+    let endMs = 0;
+    for (const t of transcript || []) {
+      const e = Number(t.end ?? t.end_ms ?? 0);
+      if (Number.isFinite(e) && e > endMs) endMs = e;
+    }
+    if (!Number.isFinite(endMs) || endMs <= 0) {
+      console.warn('[LiveAnalyzer] 兜底切分：逐字稿没有任何有效时间戳，返回空分段');
+      return [];
+    }
     const segs = [];
     for (let s = 0; s * 1000 < endMs; s += sliceSeconds) {
       const e = Math.min(s + sliceSeconds, Math.ceil(endMs / 1000));

@@ -18,6 +18,8 @@ import { fileURLToPath } from 'url';
 import { pipeline } from 'stream/promises';
 import { MemoryStore } from '../memory/store.js';
 import { createLlmClient } from '../llm/router.js';
+import { applyProxyEnv, resetProxyCache, resolveProxy, proxySource } from '../llm/proxy.js';
+import { GeminiClient } from '../llm/gemini.js';
 import { HitAnalyzer } from '../analyzer/hit-analyzer.js';
 import { SentenceCutter } from '../analyzer/sentence-cutter.js';
 import { DeepAnalyzer } from '../analyzer/deep-analyzer.js';
@@ -33,13 +35,22 @@ import { UserQuery } from '../query/index.js';
 import { IdleScheduler } from '../scheduler/index.js';
 import { getGpuState } from '../scheduler/gpu.js';
 import { killAllFfmpeg } from '../analyzer/ffmpeg-helper.js';
+import { CloudASR } from '../analyzer/cloud-asr.js';
 import { GlbBridge } from '../bridge/glb-memory.js';
+import { readJsonFile } from '../utils/read-config.js';
+import { resolveBundlePaths as resolveBundlePathsImpl } from '../utils/bundle-paths.js';
+import { applyDesktopEngineSettings, engineSettingsMtime, findEngineSettingsFile } from '../utils/engine-settings.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function loadConfig() {
-  const configPath = join(__dirname, '..', '..', 'config', 'default.json');
-  return JSON.parse(readFileSync(configPath, 'utf-8'));
+    const configPath = join(__dirname, '..', '..', 'config', 'default.json');
+    const cfg = readJsonFile(configPath);
+    // 桌面端「引擎」面板写的那份设置优先（它才是用户填 key 的地方）。
+    // 桌面端本该把它同步进这个文件，但那条通道写死了 D:\GLB\... 的旧路径，
+    // 全家桶挪到 E 盘之后就一直静默失败 —— 详见 utils/engine-settings.js。
+    applyDesktopEngineSettings(cfg);
+    return cfg;
 }
 
 const WEAK_SECRETS = new Set(['', 'hermes-local-secret', 'changeme', '123456', 'password']);
@@ -109,42 +120,10 @@ function isLoopbackRemote(remote) {
   return isLoopbackIp(h) || /^::ffff:127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
 }
 
-// 挪盘自愈：配置里写死的 D:/GLB… 在换盘/改名后不存在时，自动回退到全家桶相对路径
-function resolveBundlePaths(config) {
-  try {
-    const bundleRoot = join(__dirname, '..', '..', '..');
-    const fallback = {
-      outputWatchDir: join(bundleRoot, 'output'),
-      transcriptDir: join(bundleRoot, 'output', 'transcripts'),
-      highlightDir: join(bundleRoot, 'output', 'highlights'),
-      clipDir: join(bundleRoot, 'output', 'clips'),
-      exePath: join(bundleRoot, 'GLB', 'GLB.exe'),
-      hitsDir: join(bundleRoot, 'Hermes', 'upload', 'hits'),
-      liveDir: join(bundleRoot, 'Hermes', 'upload', 'live'),
-      tempDir: join(bundleRoot, 'Hermes', 'upload', 'temp'),
-      finishedDir: join(bundleRoot, 'output', 'finished'),
-      draftDir: join(bundleRoot, 'output', 'draft'),
-    };
-    const fix = (p, fb) => (!p || !existsSync(p)) && existsSync(fb) ? fb : p;
-    if (config?.glb) {
-      config.glb.outputWatchDir = fix(config.glb.outputWatchDir, fallback.outputWatchDir);
-      config.glb.transcriptDir = fix(config.glb.transcriptDir, fallback.transcriptDir);
-      config.glb.highlightDir = fix(config.glb.highlightDir, fallback.highlightDir);
-      config.glb.clipDir = fix(config.glb.clipDir, fallback.clipDir);
-      config.glb.exePath = fix(config.glb.exePath, fallback.exePath);
-    }
-    if (config?.upload) {
-      config.upload.hitsDir = fix(config.upload.hitsDir, fallback.hitsDir);
-      config.upload.liveDir = fix(config.upload.liveDir, fallback.liveDir);
-      config.upload.tempDir = fix(config.upload.tempDir, fallback.tempDir);
-    }
-    if (config?.output) {
-      config.output.finishedDir = fix(config.output.finishedDir, fallback.finishedDir);
-      config.output.draftDir = fix(config.output.draftDir, fallback.draftDir);
-    }
-  } catch { /* ignore */ }
-  return config;
-}
+// 挪盘自愈：配置里写死的 D:/GLB… 在换盘/改名后不存在时，自动回退到全家桶相对路径。
+// 实现在 src/utils/bundle-paths.js（拆出来是为了能直接跑单测 —— 这个 bug 曾经
+// 整整一代没人测得到，因为「回退条件要求兜底目录已存在」形成了死锁）。
+const resolveBundlePaths = (config) => resolveBundlePathsImpl(config, join(__dirname, '..', '..', '..'));
 
 /**
  * 按档取段 v2：三档是【每一条】成片的时长，且时长随主题内容自然变化。
@@ -294,32 +273,48 @@ function memorySentenceSegments(videoName, rawSegs, mode, themeKws, hooks, opts 
  *   4. 被剪掉的句子（互动/重复/水句）所在区间不会以"音乐空隙"名义拼回来
  */
 /**
- * 单位护栏：整条链路的 scored 用毫秒，输出用秒。
+ * 单位护栏：把逐句稿的时间戳统一成**毫秒**。
  *
- * 真实 bug：某次调用把毫秒直接当秒传进来，3 小时的视频产出 2330000 秒的候选，
- * 界面显示 "2330000.0s"。根因是没有人在入口处确认单位，
- * 于是错误一路传到最底下才暴露成"界面上的时间不对"。
- * 这里只做一次判断，并且把"发现单位不对"写进返回值，让调用方能记进体检。
+ * 真实 bug（2026-10-14）：这里的判断方向是反的。
+ *
+ * 原来的写法是「maxRaw 很大 → 说明是毫秒被当成秒了 → 除以 1000」，
+ * 于是把**本来就正确的毫秒**又除了一次：一场 185 分钟的直播
+ * maxRaw = 11,100,000（毫秒），被当成"秒"除掉 1000 变成 11.1 秒。
+ * 整场稿子在记忆挑句里被压成 11.1 秒，界面只出 1 条 11 秒候选，
+ * 而同一素材在 10-02 还是正常的 8 条 —— 现场完全看不出是哪一步错的。
+ *
+ * 而且两种输入都会错，只是方向相反：
+ *   输入毫秒(11,100,000) → 判成"要修" → /1000 → 秒   ✗
+ *   输入秒  (11,100)     → 判成"不用修" → 原样 → 秒   ✗（下游要毫秒）
+ *
+ * 正确的判据是"值大 = 本来就是毫秒，不动"：
+ *   一场直播再长也就 12 小时 = 43,200,000 毫秒；
+ *   100,000 秒已经是 27.7 小时，正常素材不可能有这么大。
+ *   所以：maxRaw 超过阈值 → 本来就是毫秒，原样返回；
+ *         没超过 → 确实是秒，换算成毫秒。
+ *
+ * 下游约定（memorySentenceSegments / packSentencePieces）一律按毫秒处理，
+ * 它们内部自己除 1000 转秒，所以**这里的输出必须是毫秒**。
  */
 function normalizeToMs(list, hint) {
   const arr = (list || []).filter((s) => s && (Number.isFinite(s.start) || Number.isFinite(s.startMs)));
   if (!arr.length) return { list: arr, fixed: false, maxRaw: 0 };
   const maxRaw = Math.max(...arr.map((s) => Number(s.start ?? s.startMs ?? 0)));
-  // 一场直播再长也就 12 小时 = 43,200,000ms；当成秒的话这个值就是 4320 万秒 = 500 天。
-  // 阈值取 100,000 秒（27.7 小时）足够宽松，不会误伤真实素材。
+  // 一场直播再长也就 12 小时 = 43,200,000ms；当成秒的话就是 500 天。
   const SECONDS_UPPER_BOUND = 100_000;
-  const fixed = maxRaw > SECONDS_UPPER_BOUND;
-  if (!fixed) return { list: arr, fixed, maxRaw };
-  // 看起来是毫秒被当成了秒 —— 往下游传秒。真正的错值会在这里被纠正。
+  const alreadyMs = maxRaw > SECONDS_UPPER_BOUND;
+  // 已经是毫秒：一个字节都不能动。动一下就是上面那个 185 分钟 → 11.1 秒的 bug。
+  if (alreadyMs) return { list: arr, fixed: false, maxRaw };
+  // 确实是秒：换算成毫秒交给下游。
   return {
     list: arr.map((s) => ({
       ...s,
-      start: Number(s.start ?? s.startMs ?? 0) / 1000,
-      end: Number(s.end ?? s.endMs ?? 0) / 1000
+      start: Number(s.start ?? s.startMs ?? 0) * 1000,
+      end: Number(s.end ?? s.endMs ?? 0) * 1000
     })),
-    fixed,
+    fixed: true,
     maxRaw,
-    unitNote: `${hint || 'sentences'} 的时间戳量级像毫秒（最大 ${maxRaw}），已按秒处理`
+    unitNote: `${hint || 'sentences'} 的时间戳量级像秒（最大 ${maxRaw}），已换算成毫秒`
   };
 }
 
@@ -634,10 +629,24 @@ function composeModeSegments(candidates, reranked, mode, segByTime) {
 export class Orchestrator {
   constructor(config = null) {
     this.config = resolveBundlePaths(config || loadConfig());
+    // 无论配置是外部传进来的还是自己读的，都要用桌面端设置覆盖一次：
+    // hermes.js 也有一份 loadConfig，两条入口都得覆盖到，否则漏一条就又静默失效了。
+    applyDesktopEngineSettings(this.config);
+    // 配置文件路径 + mtime：桌面端「引擎」面板保存后只写这个文件、不通知本进程。
+    // 以前配置只在构造期读一次，于是"保存了 key 但看板还是云端不可用"，
+    // 用户只能重启服务 —— 而重启会打断正在跑的分析队列。
+    this._configPath = join(__dirname, '..', '..', 'config', 'default.json');
+    this._configMtime = this._configMtimeNow();
+    // 存"上次见到的值"用 _engineStamp，不能再叫 _engineSettingsMtime ——
+    // 那是 _engineSettingsMtime() 方法名，同名赋值会把方法压成数字，
+    // 之后热重载一调 this._engineSettingsMtime() 就 TypeError（还被空 catch 吞掉，静默失效）。
+    this._engineStamp = this._engineSettingsMtime();
     this.ollama = createLlmClient(this.config); // 名字保持 ollama：全链路透传，provider 由 config.llm.provider 决定
     // 2026-09-27：让看板能看见「AI 大脑」是谁——接入了什么一目了然，不再藏在配置文件里
     this.llmProvider = String(this.config?.llm?.provider || "ollama").toLowerCase();
-    this.llmModel = this.ollama.model || "";
+    // AutoClient 在自动分派下要等到真分派才知道用哪个模型，构造期常常是空串；
+    // 空着会让面板上的"AI 大脑"型号一直空白，看起来像没配好。兜底取配置里的本地模型。
+    this.llmModel = this.ollama.model || this.config?.ollama?.chatModel || "";
     // auto 模式下 provider 只是"策略"，不等于实际在用云端。
     // 原来直接写 provider !== "ollama"，配置成 auto 就报"云端在线"，
     // 而实际每个任务都在本地跑 —— 看板说的和做的不一致。
@@ -648,10 +657,16 @@ export class Orchestrator {
     try { this.store.setActiveCollection(this.getActiveCollection()); } catch { /* ignore */ }
 
     // New pipeline modules
-    // 分析完成即自动预测播量（hooks.onCompleted），存量缺预测的由调度器每轮补一个
+    /*
+     * 2026-10-21：onCompleted 不再直接打 predictHitVideo。
+     * 直呼会绕过调度器的 LLM 显存闸门（_llmGateFull 已关时照样把 8B 拉进显存，
+     * 与并发中的其它任务抢 8G —— 这是"视频分析完那一刻整条 GPU 排队"的元凶之一）。
+     * 缺预测的行本来就由 _processPendingPredictions 每轮扫描补齐（带闸门+退避），
+     * 最多晚一个 tick（30s），代价可忽略。
+     */
     this.hitAnalyzer = new HitAnalyzer(this.ollama, this.store, this.config, {
-      onCompleted: (hitId) => this.predictHitVideo(hitId).catch((err) =>
-        console.warn(`[Orchestrator] Auto-predict failed for hit ${hitId}:`, err.message)),
+      onCompleted: (hitId) => console.log(
+        `[Orchestrator] hit ${hitId} 分析完成，预测交由调度器队列补齐（下轮 tick）`),
     });
     this.deepAnalyzer = new DeepAnalyzer(this.ollama, this.store, this.config);
     this.sentenceCutter = new SentenceCutter(this.ollama, this.store, this.config);
@@ -671,14 +686,17 @@ export class Orchestrator {
       },
     });
     this.scheduler = new IdleScheduler(this, this.config);
-    // 记忆桥：Hermes 记忆 ⇄ GLB 桌面端/CLI（每小时自动双向同步一次）
+    // 记忆桥：Hermes 记忆 ↔ GLB 桌面端/CLI（每小时自动双向同步一次）
     this.glbBridge = new GlbBridge(this.store, this.config);
+    // 云端语音识别（懒构造，见 _cloudAsr）。HTTP 层自己持一份：
+    // 各分析器里那些实例随任务创建销毁，不在 HTTP 层可控。
+    this._cloudAsrClient = undefined;
 
     this.app = express();
+
     // 内嵌 JSON 全局上限 15mb（长直播逐句稿几 MB～十几 MB 也收得下）；
     // 超大的请走 transcriptPath 文件路径（_loadJson），不要内嵌全文。
-    this.app.use(express.json({ limit: '15mb' }));
-    // 安全：本机服务，只允许同源/本地 Origin，拒绝任意互联网页面 drive-by 调用。
+    this.app.use(express.json({ limit: '15mb' }));    // 安全：本机服务，只允许同源/本地 Origin，拒绝任意互联网页面 drive-by 调用。
     // Electron file:// / app://（Origin null/file:）和 curl（无 Origin）放行；外网 Origin 必须预检且不反射 *。
     this.app.use((req, res, next) => {
       const origin = req.headers.origin;
@@ -766,7 +784,164 @@ export class Orchestrator {
       console.warn('[Recovery] 归位 analyzing 失败:', e.message);
     }
 
+    /*
+     * 2026-10-10：爆款侧同样要归位。
+     *
+     * 上面那段自愈只管 live_videos，hit_videos 没人管。而调度器选队列时
+     * `analysis_status === 'analyzing'` 是直接跳过的（scheduler/index.js）——
+     * 于是进程在爆款分析中途被 kill / 关窗 / 断电重启，这条素材就永远卡在
+     * analyzing：既不会被重新分析，也不会退回 pending，
+     * 界面上还一直转圈。实测就是"上传的素材有几条怎么都不动了"。
+     *
+     * 判据比 live 简单：爆款没有"分段"这种中间产物，
+     * 只要已经写了 analyzed_at 就当跑完了，否则一律退回 pending 重来。
+     */
+    try {
+      const stuckHits = this.store.db
+        .prepare("SELECT id, video_name, analyzed_at FROM hit_videos WHERE analysis_status = 'analyzing'")
+        .all();
+      for (const r of stuckHits) {
+        const to = r.analyzed_at ? 'completed' : 'pending';
+        this.store.db
+          .prepare("UPDATE hit_videos SET analysis_status = ? WHERE id = ?")
+          .run(to, r.id);
+        console.log(`[Recovery] 爆款 #${r.id} 上次进程退出时停在 analyzing -> ${to}（${r.video_name}）`);
+      }
+    } catch (e) {
+      console.warn('[Recovery] 归位爆款 analyzing 失败:', e.message);
+    }
+
     this._setupRoutes();
+  }
+
+  /**
+   * 云端语音识别客户端（懒构造 + 换配置后重建）。
+   *
+   * 换配置必须重建：CloudASR 在构造期就把 baseUrl/key/model 定死到实例上，
+   * 而用户改「引擎」面板后是热重载进来的 —— 不重建就会出现在
+   * “明明保存了新 key，探测还在用旧 key”。
+   */
+  _cloudAsr() {
+    const cfg = this.config || {};
+    // 用内容而不是 mtime 判断是否需要重建：热重载后 mtime 可能没变，
+    // 内容却已经换过了（setup-cloud.mjs 就是直接写文件的那种）。
+    const stamp = JSON.stringify(cfg.analyzer?.cloudAsr || {})
+      + '|' + String(cfg.gemini?.apiKey || '')
+      + '|' + String(cfg.gemini?.baseUrl || '')
+      + '|' + String(cfg.gemini?.model || '');
+    if (this._cloudAsrClient !== undefined && this._cloudAsrStamp === stamp) return this._cloudAsrClient;
+    try {
+      this._cloudAsrClient = new CloudASR(cfg);
+    } catch (err) {
+      console.warn(`[Orchestrator] 云端识别客户端构造失败：${err.message}`);
+      this._cloudAsrClient = null;
+    }
+    this._cloudAsrStamp = stamp;
+    return this._cloudAsrClient;
+  }
+
+  /** 云端识别状态（不花钱：只看配置，不发任何请求） */
+  cloudAsrStatus() {
+    const asr = this._cloudAsr();
+    if (!asr) {
+      const c = this.config?.analyzer?.cloudAsr || {};
+      return { available: false, enabled: c.enabled === true, reason: '客户端构造失败（缺 ffmpeg？）' };
+    }
+    if (!asr.available) return { available: false, enabled: asr.enabled, reason: asr.configError };
+    return {
+      available: true,
+      enabled: asr.enabled,
+      provider: asr._useGemini() ? 'gemini' : 'openai-compatible',
+      baseUrl: asr.baseUrl,
+      model: asr.model,
+      language: asr.language,
+      chunkSeconds: asr.chunkSeconds,
+      concurrency: asr.concurrency,
+      maxMinutesPerRun: asr.maxMinutesPerRun,
+      fallbackToLocal: asr.fallbackToLocal,
+    };
+  }
+
+  _configMtimeNow() {
+    try { return statSync(this._configPath).mtimeMs; } catch { return 0; }
+  }
+
+  /**
+   * 桌面端设置文件的 mtime。桌面端保存只写那一个文件，Hermes config 可能纹丝不动，
+   * 所以只看 default.json 的 mtime 会完全错过"用户刚换了 key"这件事。
+   */
+  _engineSettingsMtime() {
+    // 只缓存文件路径，不做任何同名赋值 —— 以前这里写过 `this._engineSettingsMtime = 0`，
+    // 构造器里"字段=方法()"一路连环覆盖，方法从此变数字，热重载每轮必抛 TypeError。
+    if (this._engineSettingsFile === undefined) {
+      this._engineSettingsFile = findEngineSettingsFile();
+    }
+    return engineSettingsMtime(this._engineSettingsFile);
+  }
+
+  /**
+   * 配置文件被改过就热重载 LLM 层（调度器每轮 tick 调一次，代价是一次 statSync）。
+   *
+   * 为什么必须有：桌面端「引擎」面板保存时只是把 key/协议/地址写进
+   * config/default.json，**不通知本进程**。而配置原来只在构造期读一次，
+   * 于是用户明明保存成功了、面板却一直显示"云端不可用"，
+   * 唯一的办法是重启服务 —— 而重启会把正在跑的分析队列全部打断。
+   */
+  maybeReloadLlmConfig() {
+    // 两个来源都要看：Hermes 自己的 config/default.json，以及桌面端的 engine-settings.json。
+    // 只看后者时，桌面端那条"同步进 default.json"的通道一旦真的生效（挪回 D 盘、或修好 app.asar）就会被漏掉。
+    const mt = this._configMtimeNow();
+    const es = this._engineSettingsMtime();
+    if (mt === this._configMtime && es === this._engineStamp) return false;
+    const which = es !== this._engineStamp ? '桌面端引擎设置' : 'config/default.json';
+    this._configMtime = mt;
+    this._engineStamp = es;
+    return this.reloadLlmConfig(`${which} 有改动`);
+  }
+
+  /**
+   * 重新读取配置并重建 LLM 客户端，把新的客户端同步给所有持有旧引用的组件。
+   *
+   * 两个坑：
+   *  1) 合并必须**原地**改 this.config —— 各组件构造时拿到的就是这个对象的引用，
+   *     换成新对象的话它们（store/glbBridge 等）还抱着旧配置，只有 LLM 是新的，
+   *     于是"代理地址改了但调度器还用旧的"，又是一次静默不一致。
+   *  2) 组件把客户端存在 `this.ollama`（hit/deep/live/sentence/clipper/generator），
+   *     只换 orchestrator.ollama 的话分析链路仍在用旧客户端 —— key 依然不生效。
+   */
+  reloadLlmConfig(reason = '手动触发') {
+    try {
+      const next = resolveBundlePaths(readJsonFile(this._configPath));
+      // 桌面端设置叠加在上面（它是用户填 key 的地方，且同步通道可能已经失效）
+      applyDesktopEngineSettings(next);
+      for (const k of Object.keys(next)) this.config[k] = next[k];
+      // 代理地址也可能在同一个面板里被改；resolveProxy 按对象身份缓存，必须清掉
+      applyProxyEnv(this.config);
+      resetProxyCache();
+
+      const client = createLlmClient(this.config);
+      this.ollama = client;
+      for (const c of [this.hitAnalyzer, this.deepAnalyzer, this.liveAnalyzer,
+        this.sentenceCutter, this.clipper, this.contentGenerator]) {
+        if (c && 'ollama' in c) c.ollama = client;
+      }
+
+      this.llmProvider = String(this.config?.llm?.provider || 'ollama').toLowerCase();
+      // 同构造函数：自动分派下 client.model 常常是空串，兜底取配置里的本地模型，
+      // 否则面板上"AI 大脑"的型号一直空白，看着像没配好。
+      this.llmModel = client.model || this.config?.ollama?.chatModel || '';
+      this.llmCloud = typeof client?.usingCloud === 'boolean' ? client.usingCloud : this.llmProvider !== 'ollama';
+      const blocked = client?.cloudBlockedReason || '';
+      console.log(
+        `[Orchestrator] 已热重载 LLM 配置（${reason}）：provider=${this.llmProvider} `
+        + `model=${this.llmModel || '(空)'} 代理=${resolveProxy(this.config) || '直连'}(${proxySource()})`
+        + (blocked ? ` 云端不可用：${blocked}` : '')
+      );
+      return { ok: true, provider: this.llmProvider, model: this.llmModel, cloud: this.llmCloud, cloudBlockedReason: blocked };
+    } catch (err) {
+      console.error('[Orchestrator] 热重载 LLM 配置失败:', err.message);
+      return { ok: false, error: err.message };
+    }
   }
 
   /**
@@ -784,7 +959,7 @@ export class Orchestrator {
    * 为什么以素材自己的为准：分析时是"针对某位老师"做的，
    * 这条直播从头到尾就属于那位老师。审片发生在几天之后，
    * 那时用户早就切到别的 IP 了 —— 用 activeCollection 就会把
-   * "案例老师"的口播删减记到"李老师"名下。
+   * "祝老师"的口播删减记到"李老师"名下。
    * 而且这种错记不报错，还会持续产出错误的避雷规则，污染越积越多。
    *
    * 查不到就返回 null（不猜）。宁可让这条意见暂时用不上，
@@ -911,13 +1086,30 @@ export class Orchestrator {
       // 手动任务也登记进调度器的 runningTasks，下个 tick 就不会对同一条再起一个 analyze。
       // 走到这里说明调度器原本没在跑它，所以 finally 里删掉的是我们自己刚登记的标记。
       this.scheduler?.runningTasks?.add(sKey);
+      /*
+       * 2026-10-12：登记取消控制器。
+       *
+       * 以前 /pipeline/analyze-cancel 只认 _liveAbort（直播），
+       * 爆款分析根本没有取消通道 —— 用户点"取消"之后：
+       * 转写要等 sherpa 自己的硬超时（3 小时素材 60 分钟），
+       * LLM 调用不收 signal 也断不掉。界面上显示"已取消"，实际还在满负荷跑。
+       * 现在与分析器内部那条 signal 是同一个对象，取消能真正传导下去。
+       */
+      const hitCtl = new AbortController();
+      this._hitAbort = this._hitAbort || new Map();
+      this._hitAbort.set(key, hitCtl);
       try {
-        const result = await this.hitAnalyzer.analyze(videoPath);
+        const result = await this.hitAnalyzer.analyze(videoPath, { signal: hitCtl.signal });
         res.json({ ok: true, ...result });
       } catch (err) {
+        // 用户取消不是错误：回 200 并带上标记，前端据此停止转圈
+        if (err?.name === 'AbortError' || err?.userCancelled) {
+          return res.json({ ok: false, cancelled: true, error: '已取消' });
+        }
         res.status(500).json({ error: err.message });
       } finally {
         this._busyHits.delete(key);
+        this._hitAbort?.delete(key);
         this.scheduler?.runningTasks?.delete(sKey);
       }
     });
@@ -1019,12 +1211,23 @@ export class Orchestrator {
         const result = await this.liveAnalyzer.analyze(videoPath, { signal: ctl.signal });
         // 竞态兜底：abort 可能在 analyze() 刚返回、还没进 catch 时发生。
         // 这时 analyze() 走的是正常出口（没有抛错），取消分支不会执行，
-        // 而 analysis_status 还停在 'analyzing' —— 界面于是永远转圈。
+        // 而 analysis_status 可能还停在 'analyzing' —— 界面于是永远转圈。
         //
-        // 判据：客户端确实点了取消，且我们还没写过 completed。
+        // 2026-10-21 修：以前这里无条件把状态改成 pending，调度器 30 秒后
+        // 会自动重跑一场刚被取消的直播；而且 analyze() 正常返回意味着
+        // 结果其实已经写完（completed），把它打回 pending 反而拆了已完成的工作。
+        // 现在只在状态还悬在 'analyzing' 时归位成 cancelled，不再自动复活，
+        // 界面上仍按"已取消"响应 —— 用户想重跑请点"重新分析"。
         if (ctl.signal.aborted) {
-          console.log('[analyze-live] 取消发生在正常返回之后，按取消归位');
-          this.store.upsertLiveVideo(videoPath, { analysisStatus: 'pending' });
+          console.log('[analyze-live] 取消发生在正常返回之后，按取消处理（状态归位但不重启任务）');
+          try {
+            const vid = this.store.getLiveVideoIdByPath?.(videoPath);
+            if (vid) {
+              this.store.db
+                .prepare("UPDATE live_videos SET analysis_status = 'cancelled' WHERE id = ? AND analysis_status = 'analyzing'")
+                .run(vid);
+            }
+          } catch { /* ignore */ }
           this._busyLives.delete(key);
           this.scheduler?.runningTasks?.delete(sKey);
           if (this._liveAbort) this._liveAbort.delete(key);
@@ -1065,23 +1268,37 @@ export class Orchestrator {
       if (ctl && !ctl.signal.aborted) {
         try { ctl.abort(new Error('用户取消')); aborted = true; } catch { /* ignore */ }
       }
-      // 立刻杀掉在跑的 ffmpeg/ffprobe/whisper，不能只让 JS 抛错。
-      // 否则界面上已经显示"已取消"，实际 CPU 还在满载、sherpa 还占着显存，
-      // 用户马上重跑就会被上一次拖住 —— 实测第二次请求直接 HeadersTimeout。
+      // 2026-10-12：爆款也要能取消。以前这里只查 _liveAbort，
+      // 于是"取消"对爆款分析完全无效 —— 用户点了没反应，任务继续满负荷跑。
+      const hitCtl = this._hitAbort?.get(key);
+      if (hitCtl && !hitCtl.signal.aborted) {
+        try { hitCtl.abort(new Error('用户取消')); aborted = true; } catch { /* ignore */ }
+      }
+      /*
+       * 2026-10-21：杀进程从"全局"改为"定向"。
+       *
+       * 原来这里弹 killAllFfmpeg() + ASRHelper.killAll() —— 取消 A 素材，
+       * 把调度器此刻正在跑的 B/C 素材的转码/切片进程一起杀掉，
+       * B/C 的分析整场报废还不知道为什么。
+       * （sherpa worker 内部的进程不在这张表里，靠 abort 信号由 worker
+       * 自己杀，本来就只影响被取消的那一条 —— 与这里的主线程登记表互补。）
+       */
       let killed = 0;
       try {
-        const { killAllFfmpeg } = await import('../analyzer/ffmpeg-helper.js');
-        killed += killAllFfmpeg();
+        const { killForFile } = await import('../analyzer/ffmpeg-helper.js');
+        killed += killForFile(videoPath);
       } catch { /* ignore */ }
       try {
         const { ASRHelper } = await import('../analyzer/asr-helper.js');
-        killed += ASRHelper.killAll();
+        killed += ASRHelper.killForFile(videoPath);
       } catch { /* ignore */ }
       // 无论有没有 controller 都要清标记：否则用户取消后立刻重试会撞 409，
       // 而实际上上一次已经不会再写库了。
       this._busyLives?.delete(key);
+      this._hitAbort?.delete(key);
       this.scheduler?.runningTasks?.delete(`live:${key}`);
-      // 状态也一起归位。
+      this.scheduler?.runningTasks?.delete(`hit:${key}`);
+      // 状态也一起归位（爆款也要：它同样可能停在 analyzing 上）
       //
       // 以前只清 busy 标记，于是有一种情况永远卡住：
       // 上一次 analyze-live 因为进程被杀/崩溃而停在 analyzing，
@@ -1092,20 +1309,39 @@ export class Orchestrator {
       // 实测就卡在这里：取消 27ms 返回，但 analyzing 6 秒后还在。
       if (!aborted) {
         try {
+          const hid = this.store.getHitVideo?.(videoPath)?.id;
+          if (hid) {
+            /*
+             * 2026-10-21：悬空 analyzing 归位为 cancelled，而不是 pending。
+             * 归 "pending" 会让调度器 30 秒后自动重跑 —— 可用户刚刚才点过"取消"，
+             * 让死任务自动复活等于取消失效。手动重跑入口（analyze-hit 按钮）不受影响。
+             */
+            this.store.db
+              .prepare("UPDATE hit_videos SET analysis_status = 'cancelled' WHERE id = ? AND analysis_status = 'analyzing'")
+              .run(hid);
+          }
+        } catch (e) {
+          console.warn('[analyze-cancel] 归位爆款状态失败:', e.message);
+        }
+        try {
           const vid = this.store.getLiveVideoIdByPath?.(videoPath);
           if (vid) {
-            // 归位成 pending 而不是 completed：分段可能只写了一部分，
-            // 让用户自己决定要不要重跑，比我们替他判断"这次跑完了"安全。
+            /*
+             * 同上：归位成 cancelled 不再自动复活（用户意图是"停下来"）。
+             * 旧分段如被 purge 掉也保持 cancelled —— 要重跑请点"重新分析"。
+             */
             this.store.db
-              .prepare("UPDATE live_videos SET analysis_status = 'pending' WHERE id = ? AND analysis_status = 'analyzing'")
+              .prepare("UPDATE live_videos SET analysis_status = 'cancelled' WHERE id = ? AND analysis_status = 'analyzing'")
               .run(vid);
-            console.log(`[analyze-cancel] ${videoPath} 无进行中的请求，把悬空的 analyzing 归位为 pending`);
+            console.log(`[analyze-cancel] ${videoPath} 无进行中的请求，把悬空的 analyzing 归位为 cancelled`);
           }
         } catch (e) {
           console.warn('[analyze-cancel] 归位失败:', e.message);
         }
       }
       console.log(`[analyze-cancel] ${videoPath} ${aborted ? '已中断' : '（无进行中的请求，仅清标记）'}`);
+      // 状态可能刚被改（analyzing→cancelled）：让看板下一次轮询立刻看到，而不是等 TTL
+      this.invalidateDashboardCaches();
       return res.json({ ok: true, aborted, killed });
     });
 
@@ -1369,17 +1605,33 @@ this.app.post('/pipeline/set-selection', this.requireWriteAuth, async (req, res)
         const collection = b.collection === undefined || b.collection === null
           ? null
           : (String(b.collection).trim() || null);
-const r = this.store.addHotword(collection, b.from, b.to);
+        const r = this.store.addHotword(collection, b.from, b.to);
         if (!r.ok) return res.status(400).json({ error: r.error });
         /*
-         * "立刻生效"不靠任何全局状态：
-         * 每个读稿处都会用自己那条直播的 collection 现取规则，
-         * 所以这里只要把规则写进库，下次读稿自然就是新的。
+         * 归属为空时的兜底（2026-10-14）。
          *
-         * （以前这里调 setHotwords 去更模块级状态，看着像"立刻生效"，
-         *   实际上没人读那个状态 —— 属于会误导后来人的假保证。）
+         * 界面那栏写的是「归档: 祝老师」—— 归档按**人**存，而字幕里的错词是
+         * 按**这条素材**发现的。人在爆款库/项目库里还没建过这位时归档是空的，
+         * 于是 collection=null，规则落进「通用」。
+         *
+         * 后果不是加不进去（加得进去），而是"加完看不见效果"：
+         * 规则对所有人生效，但用户以为只对当前素材生效；
+         * 而修好的字只在下一次**重新读稿**时才替换，已缓存的稿子不受影响。
+         * 所以这里明确回一句，让界面能提示"去爆款库建归档"而不是让人以为功能坏了。
          */
-        res.json({ ok: true, id: r.id, updated: r.updated });
+        const isGeneric = !collection;
+        res.json({
+          ok: true, id: r.id, updated: r.updated,
+          collection: isGeneric ? null : collection,
+          scope: isGeneric ? 'generic' : collection,
+          // 界面据此提示用户；后端不替界面做决定，但把事实说清楚。
+          hint: isGeneric
+            ? '这条规则存成了【通用】（对所有素材生效）。想只对当前 IP 生效，请先在「爆款库」建好这位老师的归档，再重新添加。'
+            : null,
+          // 规则是"读稿时替换"的，不追溯已缓存的稿子。界面必须说清楚，
+          // 否则用户加了词发现字幕没变，会以为规则没生效。
+          appliesOn: 'next-read',
+        });
       } catch (err) {
         res.status(500).json({ error: err.message });
       }
@@ -1529,6 +1781,8 @@ this.app.delete('/memory/hotwords/:id', this.requireWriteAuth, (req, res) => {
           duckBgm: b.duckBgm,
           sfx: b.sfx,
           sfxAt: b.sfxAt,
+          // 2026-10-21：响度标准化（generator 侧默认关）
+          audioNormalize: b.audioNormalize,
 
           // 字幕 / 标题样式（字体、颜色、字号、位置、描边、阴影、底板）
           captionFontStyle: b.captionFontStyle,
@@ -1545,6 +1799,48 @@ this.app.delete('/memory/hotwords/:id', this.requireWriteAuth, (req, res) => {
         res.json({ ok: true, ...result });
       } catch (err) {
         res.status(500).json({ error: err.message });
+      }
+    });
+
+    // 2026-10-21：AI 文案套装 —— 勾选的切片段子直接生成"标题候选/简介/话题标签"。
+    // 以前标题只有手填一个框，用户挤半天文案；模型就在本地（qwen3:8b-chat），
+    // 缺的只是这一段 prompt 与一个路由。生成类接口走写鉴权（回环直连自动放行）。
+    this.app.post('/pipeline/copy-suggest', this.requireWriteAuth, async (req, res) => {
+      try {
+        const b = req.body || {};
+        const raw = String(b.transcript || '').trim();
+        if (!raw) return res.status(400).json({ error: 'transcript required' });
+        // 8b 模型上下文有限，超长截头：开头往往有正题铺垫，掐中间比掐开头稳
+        const transcript = raw.length > 8000 ? raw.slice(0, 4000) + '\n[……中间略……]\n' + raw.slice(-3000) : raw;
+        const sys = [
+          '你是短视频运营编辑。用户给你一段直播切片的字幕文本。',
+          '只输出一个 JSON 对象（不要 markdown、不要解释），字段如下：',
+          '{"titles":["标题1","标题2","标题3"],"desc":"简介","tags":["标签1","标签2","标签3","标签4","标签5"],"hook":"最抓人的一句话"}',
+          '要求：titles 每条不超过18字，口语化、有钩子（悬念/痛点/反差），不要"震惊"式标题党；',
+          'desc 不超过80字，说明这条视频讲什么、给谁看；',
+          'tags 是 5 个带话题符号的中文标签（如 "#剪发教程"）；',
+          'hook 从文本里挑原句或轻度改写，必须是字幕里真实说过的话。'
+        ].join('\n');
+        const user = [
+          `时长约 ${Math.max(1, Math.round(Number(b.durationSec) || 45))} 秒。`,
+          b.titleText ? `用户已拟标题（可参考但不必拘泥）：${b.titleText}` : '',
+          '字幕文本：',
+          transcript
+        ].filter(Boolean).join('\n');
+        const out = await this.ollama.generate(sys, user, { parseJson: true, timeout: 120000 });
+        const titles = Array.isArray(out?.titles) ? out.titles.map((t) => String(t).slice(0, 30)).filter(Boolean).slice(0, 3) : [];
+        const tags = Array.isArray(out?.tags) ? out.tags.map((t) => String(t).slice(0, 16)).filter(Boolean).slice(0, 5) : [];
+        if (!titles.length) throw new Error(out && out.error ? out.error : '模型没返回可用的标题');
+        res.json({
+          ok: true,
+          titles,
+          desc: String(out?.desc || '').slice(0, 120),
+          tags,
+          hook: String(out?.hook || '').slice(0, 60),
+          model: this.ollama?.model || this.llmModel || ''
+        });
+      } catch (err) {
+        res.status(500).json({ ok: false, error: err.message });
       }
     });
 
@@ -1736,7 +2032,16 @@ this.app.delete('/memory/hotwords/:id', this.requireWriteAuth, (req, res) => {
         const collection = this.getActiveCollection();
         this.store.addReviewFeedback({
           clipProjectId: null, liveVideoId: null,
-          decision: 'reject', segmentIds: null,
+          /*
+           * 2026-10-12：'reject' → 'recut'。
+           *
+           * 读取方只认两个值：getCollectionAvoidRules / brief 里都是 `decision = 'recut'`，
+           * 桌面包与 glb-memory 只认 'approve'。而这里写的是 'reject' ——
+           * 结果是桌面端每一次"弃段"都往库里写了一条**永远不会被读到**的死数据，
+           * 而 getCollectionAvoidRules 读不到任何避雷规则，也不报任何错。
+           * 语义上"弃掉一个段落"本来就是 recut（打回重剪），不是 approve。
+           */
+          decision: 'recut', segmentIds: null,
           comment: `[桌面端弃段${collection ? '·' + collection : ''}]《${name}》${range}：这段不要了${body ? `——"${body}"` : ''}`,
         });
         this.store.addReviewLesson(
@@ -1808,17 +2113,139 @@ this.app.delete('/memory/hotwords/:id', this.requireWriteAuth, (req, res) => {
     // AI 大脑状态（2026-09-27）：看板「AI 大脑」状态条的数据源
     this.app.get('/api/llm-status', this.requireReadAuth, (req, res) => {
       try {
-        const names = { ollama: "Ollama 本地", deepseek: "DeepSeek API", zen: "Zen 云端" };
+        const names = { ollama: "Ollama 本地", deepseek: "DeepSeek API", zen: "Zen 云端", gemini: "Gemini/云端" };
+        // 2026-10-10 补字段：以前只回 provider/model/cloud 三个值，
+        // 云端不可用时接口给的是 cloud:false，什么原因都不说 ——
+        // 排查时只能靠猜（是缺 key、key 无效、还是没走代理）。
+        // 现在把代理地址、key 是否就绪、引擎给出的原因一并返回。
+        const proxy = resolveProxy(this.config);
+        const rawKey = this.config?.gemini?.apiKey ?? '';
+        const keyEnvName = String(rawKey).match(/^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/)?.[1] || null;
+        const keyReady = keyEnvName ? !!process.env[keyEnvName] : !!String(rawKey).trim();
         res.json({
           ok: true,
           provider: this.llmProvider || "ollama",
           providerName: names[this.llmProvider] || this.llmProvider,
           model: this.llmModel || "",
           cloud: !!this.llmCloud,
+          cloudBlockedReason: this.ollama?.cloudBlockedReason || "",
+          proxy: proxy || null,
+          proxySource: proxySource(),
+          cloudKeyReady: keyReady,
+          cloudKeyFrom: keyEnvName ? `env:${keyEnvName}` : (keyReady ? "config" : null),
+          cloudProtocol: this.config?.gemini?.protocol || "gemini-native",
+          cloudBaseUrl: this.config?.gemini?.baseUrl || null,
+          // key 到底是从哪读到的。桌面端那条"同步进 default.json"的通道
+          // 写死了 D:\GLB\...，全家桶挪盘后一直静默失败 ——
+          // 不把来源报出来，下次还会有人怀疑"key 到底有没有保存进去"。
+          engineSettingsFile: this._engineSettingsFile || null,
         });
       } catch (err) {
         res.status(500).json({ error: err.message });
       }
+    });
+    // 手动热重载（保存设置后想立刻生效、不等下一轮 tick 时用）
+    this.app.post('/api/llm-reload', this.requireWriteAuth, (req, res) => {
+      try {
+        this._configMtime = this._configMtimeNow();
+        this._engineStamp = this._engineSettingsMtime();
+        res.json(this.reloadLlmConfig('接口触发'));
+      } catch (err) {
+        res.status(500).json({ ok: false, error: err.message });
+      }
+    });
+    /*
+     * 云端连通性实测（2026-10-12）。
+     *
+     * 为什么需要：桌面端「检测连通」跑在 Electron 主进程里，那里的 fetch 是
+     * undici，只认环境变量代理、不读 Windows 系统代理 —— 于是本机明明开着
+     * Clash/v2ray，按钮却直接给一个毫无信息量的 "fetch failed"
+     * （实测：undici 直连 api.apimart.ai 10.7 秒后 UND_ERR_CONNECT_TIMEOUT，
+     *   而 undici 的 message 就是笼统的 "fetch failed"，
+     *   也匹配不上那段代码里"超时/连接失败"的中文提示分支）。
+     *
+     * 而真正干活的分析链路在 Hermes 里，它拿得到代理（守护进程读系统代理注入的）。
+     * 也就是说"按钮说连不上"和"实际能不能用云端"是两回事，
+     * 必须有一个不受 Electron 影响的验证口 —— 就是这个接口。
+     *
+     * 走的是 GeminiClient.health()：真实发一次 models 请求，
+     * 并把配置里的模型名和服务商实际提供的列表对一遍
+     * （中转站改名/下架模型是最常见的"连上了但一调用就 404"）。
+     */
+    this.app.post('/api/cloud-test', this.requireWriteAuth, async (req, res) => {
+      const started = Date.now();
+      const probe = typeof this.ollama?.probeCloud === 'function'
+        ? await this.ollama.probeCloud()
+        : null;
+      if (!probe) {
+        // 非 AutoClient（写死某个 provider）时退回单路探测
+        let client;
+        try {
+          client = new GeminiClient(this.config);
+        } catch (err) {
+          return res.json({ ok: false, stage: 'init', error: err.message, proxy: resolveProxy(this.config) || null });
+        }
+        const h = await client.health();
+        return res.json({
+          ok: !!h.ok, stage: 'request', error: h.error || null, models: h.models || [],
+          elapsedMs: Date.now() - started, proxy: resolveProxy(this.config) || null,
+        });
+      }
+      // 热重载后的 LLM 客户端：把面板看到的云端状态同步过来
+      this.llmCloud = !!probe.ok;
+      res.json({
+        ok: probe.ok,
+        stage: 'request',
+        active: probe.active,
+        verdict: probe.verdict,
+        providers: probe.providers,
+        proxy: probe.proxy,
+        proxySource: probe.proxySource,
+        elapsedMs: Date.now() - started,
+      });
+    });
+
+    /**
+     * 云端语音识别：状态查询 + 真发一段音频探测。
+     *
+     * GET 只看配置与本地缓存（不花钱、毫秒级返回，面板每次打开都调）；
+     * POST 真发 1 秒音频到服务商 —— 按次计费的场景下必须让人主动点。
+     *
+     * 分开是因为两者开销差几个数量级：合成一个接口把探测塞进去，
+     * 面板每刷新一次就是一次真实计费调用。
+     *
+     * 这里自己持有一个 CloudASR（不复用各分析器里的那份）：
+     * 那些实例挂在 analyzer 内部，随任务创建销毁，不在 HTTP 层可控；
+     * CloudASR 构造只做一次 ffmpeg 探测，缓存住即可。
+     */
+    this.app.get('/api/cloud-asr', this.requireReadAuth, (req, res) => {
+      const st = this.cloudAsrStatus();
+      res.json({ ok: st.available, ...st, priority: this.config?.analyzer?.cloudAsr?.priority || 'before-local' });
+    });
+
+    this.app.post('/api/cloud-asr/probe', this.requireWriteAuth, async (req, res) => {
+      const asr = this._cloudAsr();
+      if (!asr) {
+        const st = this.cloudAsrStatus();
+        return res.json({ ok: false, error: st.reason || '云端识别不可用', audioSupported: false });
+      }
+      const started = Date.now();
+      const r = await asr.probe();
+      res.json({
+        ok: !!r.ok,
+        error: r.error || null,
+        // supported=false 要单独说：那意味着"连得上但这一路没有 audio"，
+        // 换 key 是没用的，必须换一家支持转写的服务商
+        audioSupported: r.supported,
+        hint: r.supported === false
+          ? '这一路不支持音频接口（可能只代理了 chat）。换 OpenAI / Groq，或确认该中转支持 /audio/transcriptions。'
+          : null,
+        baseUrl: asr.baseUrl,
+        model: asr.model,
+        chunkSeconds: asr.chunkSeconds,
+        elapsedMs: Date.now() - started,
+        proxy: resolveProxy(this.config) || null,
+      });
     });
     this.app.get('/api/collections', this.requireReadAuth, (req, res) => {
       try {
@@ -1848,7 +2275,7 @@ this.app.delete('/memory/hotwords/:id', this.requireWriteAuth, (req, res) => {
       }
     });
     // 2026-09-24 补：以前只有 POST 没有 GET，调用方没法"先读当前值再改"。
-    // 实测踩过坑：读不到当前值 → 盲写把「案例老师」清成了空，记忆隔离被静默关掉。
+    // 实测踩过坑：读不到当前值 → 盲写把「祝老师」清成了空，记忆隔离被静默关掉。
     this.app.get('/api/active-collection', this.requireReadAuth, (req, res) => {
       try {
         const name = this._activeCollection || '';
@@ -1937,6 +2364,7 @@ this.app.delete('/memory/hotwords/:id', this.requireWriteAuth, (req, res) => {
           }
         }
         this._briefCache = null;
+        this.invalidateDashboardCaches();
         res.json({
           ok: accepted.length > 0,
           collection,
@@ -2111,10 +2539,13 @@ this.app.delete('/memory/hotwords/:id', this.requireWriteAuth, (req, res) => {
     // 自主清理：清掉"文件已不在磁盘"的空壳记录（看板点一次，调度器每天也会自动清一次）
     this.app.post('/pipeline/purge-orphans', this.requireWriteAuth, async (req, res) => {
       try {
-        const before = this.store.findOrphanHits().length;
-        const r = this.store.purgeOrphanHits();
+        // purgeOrphanHits 从 2026-10-12 起是异步的（内部走 fs/promises.stat，
+        // 不再对每条素材同步 existsSync 阻塞事件循环）—— 必须 await，
+        // 否则拿到的是 Promise，.deleted 恒为 undefined，界面永远显示"清掉 0 条"。
+        // 统计也一起收进返回值，避免为了报个数再全库同步扫一遍。
+        const r = await this.store.purgeOrphanHits(req.body?.collection);
         this._briefCache = null;
-        res.json({ ok: true, found: before, deleted: r.deleted });
+        res.json({ ok: true, found: r.found ?? 0, deleted: r.deleted ?? 0, scanned: r.scanned ?? 0 });
       } catch (err) {
         res.status(500).json({ error: err.message });
       }
@@ -2408,9 +2839,26 @@ this.app.delete('/memory/hotwords/:id', this.requireWriteAuth, (req, res) => {
         if ((!rawSegs || !rawSegs.length) && videoName) {
           try {
             const base = String(videoName).split(/[\\/]/).pop().replace(/\.[^.]+$/, '');
-            const live = this.store.db.prepare(
-              "SELECT asr_path FROM live_videos WHERE (video_name LIKE ? OR video_path LIKE ?) AND asr_path IS NOT NULL ORDER BY id DESC LIMIT 1"
-            ).get('%' + base.slice(0, 20) + '%', '%' + base.slice(0, 20) + '%');
+            /*
+             * 查找顺序：先精确匹配，再退回前缀匹配。
+             *
+             * 原来只有前缀匹配，而且只取前 20 个字符。
+             * 「compressO-2026-06-06_103624.mp4」和「compressO-2026-06-06_103203.mp4」
+             * 前 20 个字符完全一样 —— 于是 ORDER BY id DESC 会把另一条直播的稿子
+             * 当成这条的（谁后入库谁赢）。挑错稿子的后果很隐蔽：
+             * 候选时间轴对不上原片，但界面上不报任何错。
+             */
+            const pickLive = (sql, ...args) => this.store.db.prepare(sql).get(...args);
+            let live = pickLive(
+              "SELECT id, asr_path FROM live_videos WHERE asr_path IS NOT NULL AND (video_name = ? OR video_name = ? OR video_path = ?) ORDER BY id DESC LIMIT 1",
+              base, `${base}.mp4`, base
+            );
+            if (!live && base.length > 8) {
+              live = pickLive(
+                "SELECT id, asr_path FROM live_videos WHERE asr_path IS NOT NULL AND (video_name LIKE ? OR video_path LIKE ?) ORDER BY id DESC LIMIT 1",
+                `%${base.slice(0, 20)}%`, `%${base.slice(0, 20)}%`
+              );
+            }
             if (live?.asr_path && existsSync(live.asr_path)) {
               const cached = JSON.parse(readFileSync(live.asr_path, 'utf-8'));
               const list = (Array.isArray(cached.segments) ? cached.segments : Array.isArray(cached) ? cached : [])
@@ -3023,6 +3471,8 @@ let p = this.store.getClipProject(id);
         renameSync(tmp, dest);
         tmp = null;
         console.log(`[Upload] ${kind}: ${dest} (${statSync(dest).size} bytes)`);
+        // 新素材落盘：让看板立即出现这一行（uploads 列表会 readdir）
+        this.invalidateDashboardCaches();
         res.json({ ok: true, kind, path: dest, name: basename(dest) });
       } catch (err) {
         console.error('[Upload] failed:', err.message);
@@ -3036,8 +3486,43 @@ let p = this.store.getClipProject(id);
       }
     });
 
+    /*
+     * 2026-10-21：看板轮询的两个大路由加 2.5s 微缓存。
+     *
+     * 看板每 30 秒拉一次 /api/uploads 与 /api/projects：
+     * 前者 readdir + 逐文件 statSync + 每条 3 连查（含两个大 JSON 字段）；
+     * 后者 50 个工程 each JSON.parse(selected_segments) + readdirSync。
+     * 整个同步链路一跑上百毫秒到数秒，刷新同时发生就会卡住别的 API。
+     * TTL 取 2.5s：轮询间隔 30s 完全无感；写路径状态变化最多晚 2.5s 可见
+     * （分析动辄十几分钟，2.5s 不构成决策延迟）。要立即生效用 invalidateDashboardCaches。
+     *
+     * 注意这里是路由注册函数体、不是 class —— 必须用箭头函数属性，
+     * 方法简写（name() {}）在函数体里是语法错误（上线时实踩过）。
+     */
+    this._dashCacheGet = (kind) => {
+      const c = this._dashCache || (this._dashCache = {});
+      const at = this._dashCacheAt || (this._dashCacheAt = {});
+      if (c[kind] && Date.now() - (at[kind] || 0) < 2500) return c[kind];
+      return null;
+    };
+
+    this._dashCacheSet = (kind, payload) => {
+      const c = this._dashCache || (this._dashCache = {});
+      const at = this._dashCacheAt || (this._dashCacheAt = {});
+      c[kind] = payload;
+      at[kind] = Date.now();
+    };
+
+    this.invalidateDashboardCaches = () => {
+      const c = this._dashCache || (this._dashCache = {});
+      c.uploads = null;
+      c.projects = null;
+    };
+
     // 上传目录一览（含分析状态）
     this.app.get('/api/uploads', this.requireReadAuth, (req, res) => {
+      const cached = this._dashCacheGet('uploads');
+      if (cached) return res.json(cached);
       try {
         const hitsDir = this.config.upload?.hitsDir;
         const liveDir = this.config.upload?.liveDir;
@@ -3089,7 +3574,9 @@ let p = this.store.getClipProject(id);
             health: this._safeJson(r.analysis_health, null),
           };
         });
-        res.json({ ok: true, hits, live });
+        const payload = { ok: true, hits, live };
+        this._dashCacheSet('uploads', payload);
+        res.json(payload);
       } catch (err) {
         res.status(500).json({ error: err.message });
       }
@@ -3097,6 +3584,8 @@ let p = this.store.getClipProject(id);
 
     // 粗剪项目一览（含可直接播放的片段文件，评审/预览用）
     this.app.get('/api/projects', this.requireReadAuth, (req, res) => {
+      const cached = this._dashCacheGet('projects');
+      if (cached) return res.json(cached);
       try {
         const draftDir = this.config.output?.draftDir;
         const finishedDir = this.config.output?.finishedDir;
@@ -3130,7 +3619,9 @@ let p = this.store.getClipProject(id);
           } catch { /* ignore */ }
           return { ...r, selected_segments: segs, clips };
         });
-        res.json({ ok: true, projects: rows });
+        const payload = { ok: true, projects: rows };
+        this._dashCacheSet('projects', payload);
+        res.json(payload);
       } catch (err) {
         res.status(500).json({ error: err.message });
       }
@@ -3171,12 +3662,21 @@ let p = this.store.getClipProject(id);
           this._healthCache = { at: Date.now(), health: await this.ollama.health() };
         }
         const ollama = this._healthCache.health;
+        const scheduler = this.scheduler.getStatus();
         res.json({
           ok: true,
+          /*
+           * 顶层 running：桌面端「录播监听」按钮直接读 st.running。
+           * 以前这个字段根本不存在 → st.running 恒为 undefined → 界面永远显示
+           * 「录播监听当前未运行。素材需要手动导入」，哪怕调度器正每 30 秒扫着盘。
+           * 用户看到的就是「素材扫不出来」，而 Hermes 那边一切正常。
+           * 监听是否真的在跑，看的是调度器而不是某个子进程。
+           */
+          running: Boolean(scheduler?.isRunning),
           ollama,
           ffmpeg: { available: ff.isAvailable, path: ff.ffmpegPath },
           sherpa: getSherpaStatus(),
-          scheduler: this.scheduler.getStatus(),
+          scheduler,
           dirs: {
             hits: this.config.upload?.hitsDir,
             live: this.config.upload?.liveDir,
@@ -3387,11 +3887,18 @@ favorites: perf.favorites ?? null
             stats: this.store.getExtendedStats(),
           });
         }
-        this.scheduler._effLimit = limit;
-        // Use scheduler methods to respect task locks and avoid race conditions
-        await this.scheduler._processPendingHits();
-        await this.scheduler._processPendingLives();
-        await this.scheduler._processReadyProjects();
+        /*
+         * 2026-10-12 不再写 scheduler._effLimit。
+         *
+         * 原来这一行把手动扫描算出来的 limit 留在**全局**上，于是：
+         *   1) 下一轮 tick 的 _llmGate() 会继续用它（自己的降档判断被绕过）；
+         *   2) 这个 limit 没经过"模型常驻显存 → 并发降到 1"的降档，
+         *      用户把 performance.maxConcurrentLlm 调大之后，
+         *      在常驻模型的 8G 卡上按 maxConcurrentIdle=3 并发 → fetch failed。
+         *
+         * 改成把本次扫描的并发上限**局部**传给处理器，不污染全局状态。
+         */
+        await this.scheduler.scanOnce({ limit, gpu });
         const stats = this.store.getExtendedStats();
         res.json({ ok: true, limited: false, gpu: { util: gpu.util, mode: gpu.mode, ollamaBusy: !!gpu.ollamaBusy }, stats });
       } catch (err) {
@@ -3868,6 +4375,23 @@ const pred = this.store.upsertHitPrediction(hit.id, {
    * Start the Hermes server.
    */
   async start() {
+    /*
+     * 配置热重载的独立心跳（20s）。
+     *
+     * 原本只在调度器 tick 开头检查，而 tick 的 _tickRunning 互斥是有意为之：
+     * 一场长分析能把一整轮 tick 占几分钟，期间不再开新轮。
+     * 于是"用户在面板里保存了 key"这件事可能要等好几分钟才生效 ——
+     * 而用户正在盯着"云端不可用"这几个字等它变，正好是最容易误判成又坏了的时候。
+     *
+     * 这里单独起一个定时器：代价只有一次 statSync，与调度器忙闲无关。
+     */
+    if (!this._reloadTimer) {
+      this._reloadTimer = setInterval(() => {
+        try { this.maybeReloadLlmConfig(); } catch { /* ignore */ }
+      }, 20000);
+      if (this._reloadTimer.unref) this._reloadTimer.unref();
+    }
+
     // Check LLM connectivity (warn but don't exit if offline)
     const health = await this.ollama.health();
     this.ollamaReady = health.ok;
@@ -3985,6 +4509,7 @@ const pred = this.store.upsertHitPrediction(hit.id, {
   }
 
   async stop() {
+    if (this._reloadTimer) { clearInterval(this._reloadTimer); this._reloadTimer = null; }
     // 先掐子进程：ffmpeg 一次转写能跑几十分钟，服务停了它还在后台吃 CPU、占着源文件句柄，
     // 后面想删素材/挪盘都会被占用挡住。
     const killed = killAllFfmpeg();
@@ -4313,7 +4838,7 @@ function pickCollection(name){
  if(name){api('/api/active-collection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})}).then(()=>{toast('已切换：剪片将用【'+name+'】的爆款记忆','ok');const a=document.getElementById('col-active');if(a)a.textContent='当前剪片用的记忆库：'+name;}).catch(e=>toast('切换失败：'+e.message,'err'));}
 }
 async function newCollection(){
- const name=await askInput('给这个文件夹起个名字（建议用 IP / 老师名）','','创建','例如：案例老师 / 朱老师 / 轻语IP');
+ const name=await askInput('给这个文件夹起个名字（建议用 IP / 老师名）','','创建','例如：祝老师 / 朱老师 / 轻语IP');
  if(name===null)return;
  if(!String(name).trim())return;
  const n=String(name).trim().slice(0,40);
@@ -4336,7 +4861,7 @@ function colCell(h){
 }
 async function setCol(id,name){
  if(name==='__new__'){
-  name=await askInput('归入新文件夹（用 IP / 老师名命名）','','创建','例如：案例老师');
+  name=await askInput('归入新文件夹（用 IP / 老师名命名）','','创建','例如：祝老师');
   if(name===null){loadUploads();return;}
   if(!String(name).trim()){loadUploads();return;}
   name=String(name).trim().slice(0,40);
@@ -4346,7 +4871,7 @@ async function setCol(id,name){
   .catch(e=>toast('设置失败：'+e.message,'err'));
 }
 async function moveOne(id){
- const name=await askInput('归入文件夹（填新名字就是新建文件夹，留空=移出）','','归入','例如：案例老师');
+ const name=await askInput('归入文件夹（填新名字就是新建文件夹，留空=移出）','','归入','例如：祝老师');
  if(name===null)return;
  api('/hits/collection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,name})})
   .then((r)=>{toast('已归入【'+(name||'未归类')+'】','ok');markUndoable(r);loadUploads();})
@@ -4397,7 +4922,7 @@ function selAll(el){document.querySelectorAll('.hitpick').forEach(b=>{if(!b.disa
 function clearSel(){document.querySelectorAll('.hitpick').forEach(b=>b.checked=false);selChange();}
 async function batchMove(){
  const ids=pickedIds();if(!ids.length){toast('先勾选素材','err');return;}
- const name=await askInput('把这 '+ids.length+' 条归入文件夹（填新名字就是新建文件夹，留空=移出）','','归入','例如：案例老师');
+ const name=await askInput('把这 '+ids.length+' 条归入文件夹（填新名字就是新建文件夹，留空=移出）','','归入','例如：祝老师');
  if(name===null)return;
  api('/hits/collection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids,name})})
   .then((r)=>{toast('已归入【'+(name||'未归类')+'】 '+ids.length+' 条','ok');markUndoable(r);clearSel();loadUploads();})

@@ -1,6 +1,27 @@
 import { loadTranscript, buildEditableText, charRangeToTime, normalizeRanges } from "../editable-text.js";
 
-const tr = loadTranscript("<GLB_ROOT>/Hermes/upload/temp/compressO-2026-06-17_103203_asr.json");
+/*
+ * 2026-10-12：原来写死 "D:/GLB/Hermes/upload/temp/..._asr.json"。
+ *
+ * 两个问题：
+ *   1) 全家桶挪盘后这条路径不存在（这已经是第四次栽在挪盘上），loadTranscript
+ *      拿到 null，后面整段脚本在 undefined 上炸，报错还跟真实原因无关；
+ *   2) 它依赖一条**本机私有**的转写样本，用例根本没有随包分发 ——
+ *      别人 clone 下来跑必然失败。
+ *
+ * 现在改成环境变量驱动：没给样本就明确跳过并说明原因，
+ * 而不是让一条不存在的路径把脚本搞崩。
+ */
+const SAMPLE = process.env.HERMES_ASR_SAMPLE;
+if (!SAMPLE) {
+  console.warn("跳过：这是需要真实转写文件的 e2e 脚本，请设 HERMES_ASR_SAMPLE 指向一个 *_asr.json");
+  process.exit(0);
+}
+const tr = loadTranscript(SAMPLE);
+if (!tr) {
+  console.error(`读不到转写样本：${SAMPLE}`);
+  process.exit(1);
+}
 const SEG_START = 1750000;
 const e = buildEditableText(tr, 1750, 1810);
 

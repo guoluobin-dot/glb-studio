@@ -199,9 +199,24 @@ test('生产配置不得再有明文 key', () => {
 //     Unexpected token 'd', "data: {"id"... is not valid JSON
 // 这个报错完全看不出是协议没配对，很容易被当成 key 或模型的问题去查。
 test('OpenAI 兼容请求必须显式声明非流式', () => {
-  const i = src.indexOf('const isOai = this.protocol');
-  const seg = src.slice(i, i + 1400);
-  assert.match(seg, /stream:\s*false/, '必须带 stream:false，否则服务端按默认流式返回');
+  /*
+   * 2026-10-19：锚点不能用 indexOf。
+   * `const isOai = this.protocol === 'openai-compatible'` 在 gemini.js 里有四处
+   * （_fetchModels / 对话 / 转写 / 兜底），indexOf 命中的是第一处 _fetchModels，
+   * 而 stream:false 在对话方法里，天然隔了两千多字符 —— 断言永远失败，
+   * 测的却不是它想测的那件事。改成「四处锚点里至少有一处后面带着 stream:false」。
+   */
+  const anchors = [];
+  for (let i = src.indexOf('const isOai = this.protocol'); i >= 0;
+    i = src.indexOf('const isOai = this.protocol', i + 1)) anchors.push(i);
+  assert.ok(anchors.length > 0, '找得到 isOai 判定');
+  const withStreamFalse = anchors.filter(
+    (i) => /stream:\s*false/.test(src.slice(i, i + 1400))
+  );
+  assert.ok(
+    withStreamFalse.length > 0,
+    '必须有 OpenAI 兼容请求显式带 stream:false，否则服务端按默认流式返回'
+  );
 });
 
 test('真的收到流式(SSE)响应也要能拼出正文', () => {

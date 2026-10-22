@@ -12,6 +12,7 @@
 
 import { parentPort, workerData } from 'node:worker_threads';
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join, basename } from 'node:path';
 import { FFmpegHelper } from './ffmpeg-helper.js';
 import { loadSherpaSync, createRecognizer, SHERPA_CHUNK_SECONDS } from './sherpa-asr.js';
@@ -20,6 +21,37 @@ import { loadSherpaSync, createRecognizer, SHERPA_CHUNK_SECONDS } from './sherpa
 // (比如模块没加载上),worker 会静默退回 60s 分块 —— 正好踩 sense-voice 的 15s 上限,
 // 于是整场转写全空,而且没有任何报错。
 const CHUNK_SECONDS = SHERPA_CHUNK_SECONDS || 10;
+
+/**
+ * 主线程发来的取消指令（2026-10-12）。
+ *
+ * 为什么必须显式通知 Worker：killAllFfmpeg() 遍历的是**主线程那份**
+ * ACTIVE_CHILDREN —— 而这里在 Worker 里 new FFmpegHelper()，模块实例是独立的、
+ * 集合也是另一份。于是主线程的取消端点一个 worker 内的 ffmpeg 都杀不掉，
+ * CPU 持续满载、界面上却已经显示"已取消"。
+ *
+ * Worker 本身能靠 terminate() 停掉，但 native 解码期间 terminate 是异步的，
+ * 而正在跑的那一发 ffmpeg 是独立进程 —— 所以这里让主线程把"要取消"告诉 Worker，
+ * 由 Worker 自己去 kill 自己 spawn 的子进程。
+ */
+let cancelled = false;
+try {
+  parentPort.on('message', (msg) => {
+    if (msg?.type === 'cancel') cancelled = true;
+  });
+  parentPort.unref?.(); // 别因为这个监听器让 worker 自己无法退出
+} catch { /* ignore */ }
+
+function killFfmpegTree(child) {
+  try {
+    if (process.platform === 'win32' && child?.pid) {
+      // 同步杀：terminate() 是异步的，等它回来这个 ffmpeg 早跑完了
+      execFileSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true, timeout: 5000 });
+    } else {
+      child?.kill?.('SIGKILL');
+    }
+  } catch { /* ignore */ }
+}
 
 async function main() {
   const { videoPath, durationSec, ffmpegPath, ffprobePath, tmpBase } = workerData || {};
@@ -51,6 +83,12 @@ async function main() {
   const n = Math.max(1, Math.ceil(durationSec / CHUNK_SECONDS));
   const segments = [];
   for (let i = 0; i < n; i++) {
+    // 取消检查点：每片之前看一眼，别把整场 10s 分片跑完
+    if (cancelled) {
+      parentPort.postMessage({ type: 'warn', msg: `chunk ${i} 前收到取消，停止转写` });
+      parentPort.postMessage({ type: 'done', segments, cancelled: true });
+      return;
+    }
     const startSec = i * CHUNK_SECONDS;
     const lenSec = Math.min(CHUNK_SECONDS, durationSec - startSec);
     const wavPath = join(tmpBase, `chunk_${i}.wav`);

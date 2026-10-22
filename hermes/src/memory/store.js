@@ -11,15 +11,158 @@ import { fileURLToPath } from 'url';
 // unlinkSync：清除素材时可选连源视频一起删；existsSync：找"文件已不在"的空壳记录
 // 注意：本文件是 ESM，里面写 require('fs') 会 ReferenceError（会被 try/catch 静默吞掉，排查极坑）
 import { mkdirSync, readFileSync, existsSync, unlinkSync, rmSync } from 'fs';
+import { stat } from 'fs/promises';
+import { readJsonFile } from '../utils/read-config.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function loadConfig() {
   const configPath = join(__dirname, '..', '..', 'config', 'default.json');
-  return JSON.parse(readFileSync(configPath, 'utf-8'));
+  return readJsonFile(configPath);
+}
+
+/**
+ * 素材路径的唯一归一化入口（2026-10-12）。
+ *
+ * 之前全文件散着 7 处 `String(p).replace(/\\/g,'/')`，而各处口径还不一样：
+ * 有的去尾斜杠、有的 toLowerCase，读路径 (getVideo/getLiveVideo) 干脆不归一。
+ *
+ * 更要命的是**注释声称已修、实际没修**：至少三处注释写着
+ * "调度器扫到 D:////x 时 ON CONFLICT 匹配不上，同一条素材会插出两条记录"，
+ * 可代码只换了分隔符 —— `D:////x` 和 `D:/x` 归一之后仍然是两个字符串，
+ * UNIQUE(video_path) 照样拦不住，双跑锁照样失效。
+ *
+ * 现在统一走这里：反斜杠→正斜杠、折叠连续斜杠、去尾斜杠（保留盘符根）。
+ * 大小写不动 —— video_path 是 TEXT UNIQUE（BINARY collation），
+ * 改成 NOCASE 需要重建表，代价远大于收益；保持原样至少口径一致。
+ */
+export function normalizeVideoPath(p) {
+  let s = String(p ?? '');
+  if (!s) return '';
+  s = s.replace(/\\/g, '/');
+  s = s.replace(/\/{2,}/g, '/');
+  // 去掉尾斜杠，但 `E:/` 这种盘符根要保住
+  if (s.length > 3) s = s.replace(/\/+$/, '');
+  return s;
+}
+
+/** 需要统一成 SQL datetime 口径的时间列（2026-10-21，见 updateHitVideo 注释） */
+const TS_COLUMNS = new Set(['analyzed_at', 'failed_at']);
+
+/**
+ * 任意时间值 → 'YYYY-MM-DD HH:MM:SS'（UTC，与 SQLite datetime('now') 同格式）。
+ *
+ * 背景：hit_videos 的 analyzed_at/failed_at 以前写 JS 的 toISOString()
+ *（'2026-10-21T09:30:00.123Z'），deep_memory.updated_at 是 datetime('now')。
+ * scheduler 用 `v.analyzed_at > d.updated_at` 字符串比较挑"待补深度分析" ——
+ * 同一天里 'T' 恒大于空格，每 30 秒整场重跑，UTC 翻天才停。
+ * 解析不动的原样返回（别把未知格式写坏）。
+ */
+export function normalizeSqlTs(v) {
+  if (v == null || v === '' || v === false) return v;
+  if (v instanceof Date) {
+    return Number.isNaN(v.getTime()) ? String(v) : v.toISOString().replace('T', ' ').slice(0, 19);
+  }
+  if (typeof v === 'string' && /^(\d{4}-\d{2}-\d{2})(T|\s)\d{2}:\d{2}/.test(v)) {
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(v)) return v; // 已是 SQL 口径
+    const d = new Date(v.endsWith('Z') || v.includes('+') ? v : v + 'Z');
+    if (!Number.isNaN(d.getTime())) return d.toISOString().replace('T', ' ').slice(0, 19);
+  }
+  const d = v instanceof Date ? v : new Date(v);
+  if (Number.isNaN(d.getTime())) return String(v);
+  return d.toISOString().replace('T', ' ').slice(0, 19);
+}
+
+/**
+ * 向量 ↔ Buffer 的编解码（全库唯一的实现）。
+ *
+ * 2026-10-12。原来读写各写一份，两份都有坑：
+ *
+ * 写：Buffer.from(new Float32Array(data.embedding).buffer)
+ *   - 传进来的如果是 Buffer/ArrayBuffer（而不是 number[]），
+ *     `new Float32Array(buf)` 会按**数组**去迭代它 —— 逐字节当成元素，
+ *     3 维向量会变成 12 维的字节值，存进去的是垃圾。
+ *   - 传 Float32Array 时又是另一条路径，行为取决于入参类型，调用方没法预期。
+ *
+ * 读：new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4)
+ *   - byteOffset 非 4 的倍数 → 直接抛
+ *     "start offset of Float32Array should be a multiple of 4"。
+ *     Buffer 来自 slab 池时很容易出现这种切片。
+ *   - 长度不是 4 的倍数 → length/4 取整，静默丢掉尾部字节。
+ *
+ * 所以这里统一：只认"数值序列"，其余一律拒绝，并且**宁可返回 null 也不写坏数据** ——
+ * 一条坏向量会让相似度检索静默失准（命中错的话术），比查不到更糟。
+ */
+
+/** number[] | Float32Array | ArrayBuffer | Buffer → Buffer(float32)，无法解释时返回 null */
+function toEmbeddingBuffer(input) {
+  if (input === null || input === undefined) return null;
+
+  let arr;
+  if (input instanceof Float32Array) {
+    arr = input;
+  } else if (input instanceof ArrayBuffer) {
+    if (input.byteLength % 4 !== 0) return null;
+    arr = new Float32Array(input);
+  } else if (ArrayBuffer.isView(input)) {
+    // Buffer / Uint8Array 等：必须按字节解释成 float32，不能按数组迭代
+    const bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+    if (bytes.length % 4 !== 0) return null;
+    arr = new Float32Array(bytes.buffer, bytes.byteOffset, bytes.length / 4);
+  } else if (Array.isArray(input) || ArrayBuffer.isView(input)) {
+    if (!input.length) return null;
+    arr = Float32Array.from(input, (x) => {
+      const n = Number(x);
+      // NaN / Infinity 进了向量会把所有余弦相似度算成 NaN，比较排序直接乱掉
+      return Number.isFinite(n) ? n : 0;
+    });
+  } else {
+    return null;
+  }
+  if (!arr.length) return null;
+  // 复制一份再取 buffer：保证 byteOffset 是 0、长度是 4 的倍数，
+  // 否则读回来时又会踩上对齐问题
+  return Buffer.from(Float32Array.from(arr).buffer);
+}
+
+/** Buffer(float32) → number[]；对不齐/不是 4 的倍数时返回 null（跳过该条，不猜） */
+function readEmbedding(buf) {
+  if (!buf) return null;
+  const bytes = buf instanceof Buffer ? buf : Buffer.from(buf);
+  if (bytes.length === 0 || bytes.length % 4 !== 0) return null;
+  // 不走 new Float32Array(bytes.buffer, bytes.byteOffset, ...) ——
+  // byteOffset 可能不是 4 的倍数（pool 切片），那会直接抛 RangeError。
+  // 直接复制到 8 字节对齐的独立 buffer 再读。
+  const copy = Buffer.allocUnsafeSlow(bytes.length);
+  bytes.copy(copy);
+  return Array.from(new Float32Array(copy.buffer, 0, bytes.length / 4));
 }
 
 export class MemoryStore {
+  /**
+   * 数值夹取（2026-10-12）。
+   *
+   * 写进库之前统一过一道，堵住三类脏值：
+   *   - NaN / Infinity：Number("1e999") 就是 Infinity，直接写进去会让
+   *     所有统计（sum/avg/排序）静默变成 NaN，界面上看不出来
+   *   - 超出量程：confidence/intensity 这类 0~1 的值，模型给 5 就该夹到 1
+   *   - falsy-zero：`value || 0.5` 会把模型明确给的 0（"完全没信心"）吞成 0.5
+   *
+   * 全库共用一个实现，避免每个 add* 各写各的（之前就有 5 处口径不一）。
+   */
+  static num(v, { min = null, max = null, fallback = null, integer = false } = {}) {
+    // 布尔必须显式拒绝：Number(true) === 1、Number(false) === 0 是 JS 的类型强转陷阱。
+    // 接口直传的字段（segmentIds / views 之类）混进一个 true，
+    // 就会静默变成"第 1 段"或"1 次播放"—— 不报错，只是结果完全不对。
+    if (typeof v === 'boolean') return fallback;
+    const n = Number(v);
+    if (!Number.isFinite(n)) return fallback;
+    let x = integer ? Math.round(n) : n;
+    if (min !== null) x = Math.max(min, x);
+    if (max !== null) x = Math.min(max, x);
+    return x;
+  }
+
   constructor(config = null) {
     const cfg = config || loadConfig();
     this.dbPath = join(__dirname, '..', '..', cfg.memory.dbPath);
@@ -49,6 +192,20 @@ export class MemoryStore {
     // 老库不受影响：ALTER TABLE ADD COLUMN 是幂等的。
     this._init();
     this._addMissingColumns();
+    /*
+     * collection 索引必须放在 _addMissingColumns 之后建（2026-10-12）。
+     *
+     * collection 是记忆隔离的唯一过滤键（多 IP/多老师并行时，取热词/避雷词/素材列表
+     * 全靠它筛），而这几个列在线上库里实测一个索引都没有，上万行时每次调用都是全表扫。
+     *
+     * 为什么不能放进 _init 的索引段：
+     *   - review_feedback.collection 是 ALTER 补的，建表语句里没有；
+     *   - hotwords 这张表本身就排在索引段之后才 CREATE。
+     * 放进同一段会直接 "no such column: collection"，而 _init 是裸 exec，
+     * 一个语句失败整段中止 —— 后面所有索引都没建，构造函数抛异常，服务起不来。
+     */
+    this._ensureCollectionIndexes();
+    this._ensureUniqueConstraints();
     // 进程内 profile 缓存：getStyleProfile 全表读+JSON.parse，被 clipper/generator/rerank 高频调用
     this._profileCache = null;
     // 当前活跃文件夹（一个 IP/老师一个文件夹）。评审经验按它隔离——剪哪个老师的片
@@ -77,8 +234,24 @@ export class MemoryStore {
     try { this.db.exec('ALTER TABLE live_videos ADD COLUMN collection TEXT'); } catch { /* 列已存在 */ }
   }
 
+  /**
+   * 建表 + 建索引。
+   *
+   * 2026-10-12：失败不再"一颗雷炸掉整段"。
+   *
+   * 原来是一整段 SQL 交给 db.exec，**任何一条语句失败 → 整段中止 → 构造函数抛异常 →
+   * 服务起不来**。而这段里最脆的是函数索引：
+   *   CREATE UNIQUE INDEX idx_hotword_pair ON hotwords(IFNULL(collection,''), from_word)
+   * 只要 hotwords 表里已有重复的 (collection, from_word) 组合（老库很可能有），
+   * 这条就建不出来 —— 而它恰好排在整段的**最后**，于是前面所有索引都没建成，
+   * 而且一行日志都没有。
+   *
+   * 现在：先按原来那样整段跑（最快，SQLite 一次解析）；
+   * 只有整段失败时才退化成逐条重试 —— 建表失败仍然抛（那是库真的坏了），
+   * 索引失败只打 warn 并继续，让后面的索引照样建起来。
+   */
   _init() {
-    this.db.exec(`
+    const SCHEMA_SQL = `
       -- Processed video records
       CREATE TABLE IF NOT EXISTS video_records (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -430,6 +603,8 @@ export class MemoryStore {
       -- 学习样本查询：按 IP 老师 + 类型取避雷词/正样本，按场次回溯
       CREATE INDEX IF NOT EXISTS idx_review_edits_coll ON review_edits(collection, kind);
       CREATE INDEX IF NOT EXISTS idx_review_edits_project ON review_edits(clip_project_id);
+      -- collection 索引见构造器里的 _ensureCollectionIndexes()：
+      -- 那几个列/表此刻还不存在（ALTER 补列 + hotwords 建表都在后面），放这里会报错。
 
       /*
        * 热词硬纠正（按 IP 老师归档）
@@ -455,9 +630,66 @@ export class MemoryStore {
         hits INTEGER DEFAULT 0,
         created_at TEXT DEFAULT (datetime('now'))
       );
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_hotword_pair
-        ON hotwords(IFNULL(collection,''), from_word);
-    `);
+    `;
+
+    /*
+     * 快慢两条路，但**两条路都要往下走** —— 下面还有 idx_hotword_pair 和
+     * speaker_profiles 迁移，早先我在这条分支里写了 return，
+     * 结果成功路径直接跳过它们：老库缺 updated_at 时迁移不跑，
+     * upsertSpeaker 会抛 "no such column: updated_at"。
+     *
+     * 切分只按"分号 + 换行"来分 —— 这段里没有触发器（CREATE TRIGGER 的分号体会被切坏），
+     * 字符串字面量里也没有分号，所以这样切是安全的。
+     */
+    try {
+      // 快路径：一次 exec 跑完（SQLite 只解析一次，比逐条 prepare 快很多）
+      this.db.exec(SCHEMA_SQL);
+    } catch (err) {
+      // 慢路径：逐条重试，把失败的那条揪出来
+      console.warn(`[MemoryStore] 整段建表脚本失败（${err.message}），改为逐条重试以定位并跳过问题语句`);
+      let idxFailed = 0;
+      for (const sql of SCHEMA_SQL.split(/;\s*\r?\n/).map((x) => x.trim()).filter(Boolean)) {
+        const head = sql.split('\n')[0].trim();
+        try {
+          this.db.exec(sql);
+        } catch (e2) {
+          if (/^CREATE\s+(UNIQUE\s+)?INDEX/i.test(head)) {
+            idxFailed++;
+            console.warn(`[MemoryStore] 索引未能建立（已跳过，不影响其它）：${head} —— ${e2.message}`);
+          } else {
+            // 建表失败 → 照旧抛出去。磁盘满/库损坏，继续跑只会把错误推到更远的地方。
+            console.error(`[MemoryStore] 建表失败：${head} —— ${e2.message}`);
+            throw e2;
+          }
+        }
+      }
+      if (idxFailed) {
+        console.warn(`[MemoryStore] ${idxFailed} 条索引未能建立；相关查询会退化为全表扫描，功能不受影响`);
+      }
+    }
+
+    /*
+     * 热词的 (文件夹, 原词) 唯一索引单独建 —— 它是**最可能失败**的一条：
+     * 老库里只要存在重复的 (collection, from_word) 组合就建不出来。
+     * 以前它排在整个大 exec 的**最后**，一旦失败就把前面所有索引一起带走；
+     * 现在它失败只影响热词查重的性能。
+     */
+    try {
+      this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_hotword_pair
+        ON hotwords(IFNULL(collection,''), from_word)`);
+    } catch (err) {
+      try {
+        const dup = this.db.prepare(
+          "SELECT IFNULL(collection,'') c, from_word f, COUNT(*) n FROM hotwords GROUP BY c, f HAVING n > 1 LIMIT 5"
+        ).all();
+        console.warn(
+          `[MemoryStore] idx_hotword_pair 建不出来：${err.message}`
+          + (dup.length ? `；重复组合 ${dup.map((d) => `${d.f}×${d.n}`).join(', ')}（查重会退化为全表扫描）` : '')
+        );
+      } catch {
+        console.warn(`[MemoryStore] idx_hotword_pair 建不出来：${err.message}`);
+      }
+    }
 
     // ── 轻量迁移：老库缺字段/约束时补上（幂等，可重复执行）──
     // speaker_profiles 曾无 UNIQUE(speaker_label) 且无 updated_at，
@@ -465,7 +697,19 @@ export class MemoryStore {
     try {
       const cols = this.db.prepare(`PRAGMA table_info(speaker_profiles)`).all().map(c => c.name);
       if (!cols.includes('updated_at')) {
-        this.db.exec(`ALTER TABLE speaker_profiles ADD COLUMN updated_at TEXT DEFAULT (datetime('now'))`);
+        /*
+         * 注意：不能写 DEFAULT (datetime('now'))。
+         * SQLite 拒绝"非常量默认值"的 ADD COLUMN：
+         *   "Cannot add a column with non-constant default"
+         * （表里一行数据都没有时才会放行，所以拿空表一测根本看不出来）
+         *
+         * 而这段是被 try/catch 包住的，于是它**从来没在老库上成功过**，
+         * 只有一行没人看的 warn —— 老库 upsertSpeaker 照样抛
+         * "no such column: updated_at"，正是这段迁移想修的那个症状。
+         * 改成：先加列，再回填。
+         */
+        this.db.exec(`ALTER TABLE speaker_profiles ADD COLUMN updated_at TEXT`);
+        this.db.exec(`UPDATE speaker_profiles SET updated_at = datetime('now') WHERE updated_at IS NULL`);
       }
       this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_speaker_label ON speaker_profiles(speaker_label)`);
     } catch (err) {
@@ -480,6 +724,26 @@ export class MemoryStore {
     } catch (err) {
       console.warn('[MemoryStore] hit_performance migration skipped:', err.message);
     }
+    /*
+     * live_segments 补列（2026-10-14）。
+     *
+     * viral_potential / recommended_action 从来不是"新需求"：
+     * live-analyzer 的 _matchAllWithHitThemes 一直在算它们，
+     * 只是建表时没给这两列，于是写库那一刻就被丢掉了。
+     * 老库更是完全没有 —— 所以先查再补，别让 ALTER 报错把后面截断。
+     */
+    try {
+      const segCols = this.db.prepare('PRAGMA table_info(live_segments)').all().map((c) => c.name);
+      if (!segCols.includes('viral_potential')) {
+        this.db.exec('ALTER TABLE live_segments ADD COLUMN viral_potential REAL');
+      }
+      if (!segCols.includes('recommended_action')) {
+        this.db.exec('ALTER TABLE live_segments ADD COLUMN recommended_action TEXT');
+      }
+    } catch (err) {
+      console.warn('[Store] live_segments 补列失败（爆款分将不可用）:', err.message);
+    }
+
     // 老库补列：hit_performance.favorites / hit_predictions.favorites+confidence / hit_videos 记忆维度
     // （幂等：缺哪列补哪列，已有库直接升级，不用重建）
     try {
@@ -511,8 +775,26 @@ export class MemoryStore {
   upsertVideo(videoPath, data = {}) {
     // 2026-09-25 修：分隔符统一成正斜杠——接口传 D:/x、调度器扫到 D:////x 时
     // ON CONFLICT(video_path) 匹配不上，同一条素材会插出两条记录、双跑锁失效。
-        videoPath = String(videoPath || '').replace(/\\/g, '/');
+        videoPath = normalizeVideoPath(videoPath);
+        /*
+         * 2026-10-12：空路径直接拒绝，不能写进库。
+         *
+         * video_path 是 NOT NULL UNIQUE，而空串**能通过** NOT NULL 检查 ——
+         * 于是第一个空路径 upsert 插出一条 video_path='' 的垃圾行，
+         * 之后每一次空路径 upsert 都因 UNIQUE 冲突落到同一条 '' 行上互相覆盖。
+         * 结果：所有“路径算错了”的调用共用一条记录，谁都能改它，
+         * 而 listCollections / getCollectionHits 会把它当成一条真实素材统计进去。
+         *
+         * 宁可让调用方拿到明确的失败，也不要悄悄写一条共享的垃圾行。
+         */
+        if (!videoPath) {
+          const e = new Error('videoPath 为空，拒绝写入（否则会往库里插一条共享的垃圾行）');
+          e.code = 'EMPTY_VIDEO_PATH';
+          throw e;
+        }
         // 只覆盖传入的非空字段，避免用默认 null 洗掉已有记录（如转写路径、类型等）
+    // 只取真正要读的列：SELECT * 在 hit_videos 上会把整场逐字稿（可达上百 KB）
+    // 搬进 JS 内存，只为了读几个标量字段。存在性检查同理。
     const cur = this.db.prepare('SELECT * FROM video_records WHERE video_path = ?').get(videoPath);
     const pick = (v, c) => (v !== undefined && v !== null ? v : (c !== undefined && c !== null ? c : null));
     const merged = {
@@ -545,7 +827,9 @@ export class MemoryStore {
   }
 
   getVideo(videoPath) {
-    const row = this.db.prepare('SELECT * FROM video_records WHERE video_path = ?').get(videoPath);
+    // 2026-10-12：读侧也要归一。写侧存的是归一化后的值，读侧拿原样路径查必然查不到 ——
+    // 同一个文件里曾有三种口径（upsert 归一 / getHitVideo 归一 / 这两个不归一）。
+    const row = this.db.prepare('SELECT * FROM video_records WHERE video_path = ?').get(normalizeVideoPath(videoPath));
     if (row) {
       row.clip_paths = row.clip_paths ? JSON.parse(row.clip_paths) : [];
       row.metadata = row.metadata ? JSON.parse(row.metadata) : {};
@@ -577,11 +861,18 @@ export class MemoryStore {
     `);
     return stmt.run({
       videoId: data.videoId,
-      startMs: data.startMs,
-      endMs: data.endMs,
-      confidence: data.confidence || 0.5,
-      peakType: data.peakType || 'unknown',
-      intensity: data.intensity || 0.5,
+      /*
+       * 2026-10-12：start_ms/end_ms 是 NOT NULL，原来裸传。
+       * 值来自模型输出的 JSON，缺一个字段就是 undefined → 绑成 NULL → 抛
+       * NOT NULL constraint failed，一路冒到上层把整条素材判 failed。
+       * （和 live_segments / hit_structure 是同一类，那两处已修。）
+       */
+      startMs: MemoryStore.num(data.startMs, { min: 0, integer: true, fallback: 0 }),
+      endMs: MemoryStore.num(data.endMs, { min: 0, integer: true, fallback: 0 }),
+      // `|| 0.5` 是 falsy-zero：模型明确给 0（"完全没信心"）会被吞成 0.5
+      confidence: MemoryStore.num(data.confidence, { min: 0, max: 1, fallback: 0.5 }),
+      peakType: String(data.peakType || 'unknown').trim() || 'unknown',
+      intensity: MemoryStore.num(data.intensity, { min: 0, max: 1, fallback: 0.5 }),
       contextText: data.contextText || '',
       genre: data.genre || null
     }).lastInsertRowid;
@@ -640,16 +931,19 @@ export class MemoryStore {
       INSERT INTO copywriting_patterns (video_id, pattern_type, text_content, time_ms, effectiveness, context_text, embedding)
       VALUES (@videoId, @patternType, @textContent, @timeMs, @effectiveness, @contextText, @embedding)
     `);
-    return stmt.run({
-      videoId: data.videoId || null,
-      patternType: data.patternType,
-      textContent: data.textContent,
-      timeMs: data.timeMs || null,
-      effectiveness: data.effectiveness || 0.5,
-      contextText: data.contextText || '',
-      embedding: data.embedding ? Buffer.from(new Float32Array(data.embedding).buffer) : null
-    }).lastInsertRowid;
-  }
+return stmt.run({
+    videoId: data.videoId || null,
+    // 同 addHitStructure：这两列是 NOT NULL，值来自 LLM 的 JSON。
+    // 模型偶尔少给一个字段就会让整条素材的分析前功尽弃（实测踩过），
+    // 这里兜底成 unknown / 空串，保证"写不进去"不会升级成"整条失败"。
+    patternType: String(data.patternType ?? '').trim() || 'unknown',
+    textContent: String(data.textContent ?? '').trim() || '（无原文）',
+    timeMs: data.timeMs || null,
+    effectiveness: Number.isFinite(Number(data.effectiveness)) ? data.effectiveness : 0.5,
+    contextText: data.contextText || '',
+    embedding: toEmbeddingBuffer(data.embedding)
+  }).lastInsertRowid;
+}
 
   getCopywritingByType(patternType, limit = 20) {
     return this.db.prepare(
@@ -671,17 +965,15 @@ export class MemoryStore {
       'SELECT * FROM copywriting_patterns WHERE embedding IS NOT NULL ORDER BY id DESC LIMIT 500'
     ).all();
 
-    const scored = rows.map(row => {
-      // Buffer 可能是底层 ArrayBuffer 池的切片，必须用 byteOffset/byteLength，
-      // 否则 new Float32Array(buf.buffer) 会读到池里别人的字节，相似度全错。
-      const buf = row.embedding;
-      const emb = new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4);
-      const sim = cosineSimilarity(queryEmbedding, Array.from(emb));
+    const scored = rows.map((row) => {
+      const emb = readEmbedding(row.embedding);
+      if (!emb) return { row, similarity: -1 };
+      const sim = cosineSimilarity(queryEmbedding, emb);
       return { row, similarity: sim };
     });
 
     scored.sort((a, b) => b.similarity - a.similarity);
-    return scored.slice(0, topK).filter(s => s.similarity >= this.similarityThreshold);
+    return scored.slice(0, topK).filter((s) => s.similarity >= this.similarityThreshold);
   }
 
   // ──────────────────────────────────────────────
@@ -708,7 +1000,7 @@ export class MemoryStore {
       avgPauseMs: data.avgPauseMs || 0,
       energyBaseline: data.energyBaseline || 0,
       catchphrases: data.catchphrases ? JSON.stringify(data.catchphrases) : null,
-      embedding: data.embedding ? Buffer.from(new Float32Array(data.embedding).buffer) : null
+      embedding: toEmbeddingBuffer(data.embedding)
     }).lastInsertRowid;
   }
 
@@ -733,7 +1025,7 @@ export class MemoryStore {
    *
    * 为什么要单独一套：getStyleProfile() 返回的是 user_style_profile 全表，
    * 那些 hooks_<genre> 是**跨 IP 混在一起的**全局钩子池。而用户要的是
-   * "跟案例老师学爆款感"，混进别的老师的钩子等于学错人。
+   * "跟祝老师学爆款感"，混进别的老师的钩子等于学错人。
    *
    * 这里只取 activeCollection 命中的爆款（hit_videos.collection），
    * 没有集合时返回空数组而不是回落到全局池 —— 回落会让"没设集合"看起来
@@ -875,9 +1167,35 @@ export class MemoryStore {
   upsertHitVideo(videoPath, data = {}) {
     // 2026-09-25 修：分隔符统一成正斜杠——接口传 D:/x、调度器扫到 D:////x 时
     // ON CONFLICT(video_path) 匹配不上，同一条素材会插出两条记录、双跑锁失效。
-        videoPath = String(videoPath || '').replace(/\\/g, '/');
+        videoPath = normalizeVideoPath(videoPath);
+        /*
+         * 2026-10-12：空路径直接拒绝，不能写进库。
+         *
+         * video_path 是 NOT NULL UNIQUE，而空串**能通过** NOT NULL 检查 ——
+         * 于是第一个空路径 upsert 插出一条 video_path='' 的垃圾行，
+         * 之后每一次空路径 upsert 都因 UNIQUE 冲突落到同一条 '' 行上互相覆盖。
+         * 结果：所有“路径算错了”的调用共用一条记录，谁都能改它，
+         * 而 listCollections / getCollectionHits 会把它当成一条真实素材统计进去。
+         *
+         * 宁可让调用方拿到明确的失败，也不要悄悄写一条共享的垃圾行。
+         */
+        if (!videoPath) {
+          const e = new Error('videoPath 为空，拒绝写入（否则会往库里插一条共享的垃圾行）');
+          e.code = 'EMPTY_VIDEO_PATH';
+          throw e;
+        }
         // 合并语义：只覆盖传入字段，防止 analyzing/completed 两次 upsert 互相清空
-    const cur = this.db.prepare('SELECT * FROM hit_videos WHERE video_path = ?').get(videoPath);
+    /*
+     * 2026-10-12：不再 SELECT *。
+     *
+     * hit_videos 带 full_transcript（整场逐字稿，几 MB~十几 MB），
+     * SELECT * 会把整份全文稿复制进 JS 内存 —— 而这里只是为了读十几个标量字段
+     * 做 merge。素材上万行时，每次 upsert 都是一次大 blob 拷贝。
+     */
+    const cur = this.db.prepare(
+      'SELECT id, video_name, duration_ms, file_size, resolution, fps, genre, analysis_status,'
+      + ' asr_path, collection, title FROM hit_videos WHERE video_path = ?'
+    ).get(videoPath);
     const pick = (v, c) => (v !== undefined && v !== null ? v : (c !== undefined && c !== null ? c : null));
     const merged = {
       videoName: pick(data.videoName, cur?.video_name),
@@ -935,10 +1253,26 @@ export class MemoryStore {
   updateHitVideo(id, data) {
     const fields = [];
     const params = { id };
+    /*
+     * 2026-10-21 修：时间列统一口径。
+     *
+     * 以前 analyzed_at / failed_at 经这里直接写 JS 的 toISOString()
+     *（'2026-10-21T09:30:00.123Z'），而 deep_memory.updated_at 是 SQL 的
+     * datetime('now')（'2026-10-21 09:30:05'）。scheduler 的深度补全判断
+     * `v.analyzed_at > d.updated_at` 是 SQLite 的**字符串字典序**：
+     * 同一天里 'T' (0x54) 恒大于 ' ' (0x20)，于是"同日永远判定更新过" ——
+     * 每 30 秒把同一条素材重新完整跑一遍深度分析，直到 UTC 翻天才消停。
+     * 统一成 SQL 的 'YYYY-MM-DD HH:MM:SS'（UTC）假象格式（datetime('now') 同口径）。
+     */
     for (const [key, value] of Object.entries(data)) {
+      // 2026-10-12 修：原来把 data 的键直接拼进 SET 子句，而 params 是 {id} 起步的 ——
+      // 于是 data 里只要带 id（`{...req.body}` 这种写法很常见）就会把 params.id 覆盖掉，
+      // 生成 `UPDATE hit_videos SET id = @id WHERE id = @id`：改的是**另一行**，
+      // 而调用方以为改成功了。静默改错行比抛异常难查得多。
+      if (key === 'id') continue;
       const dbKey = key.replace(/[A-Z]/g, m => '_' + m.toLowerCase());
       fields.push(`${dbKey} = @${dbKey}`);
-      params[dbKey] = value;
+      params[dbKey] = TS_COLUMNS.has(dbKey) && value ? normalizeSqlTs(value) : value;
     }
     if (fields.length === 0) return;
     const sql = `UPDATE hit_videos SET ${fields.join(', ')} WHERE id = @id`;
@@ -948,7 +1282,19 @@ export class MemoryStore {
   // 历史上并发 upsert 曾给同一路径留下多行（新分析写进新行、列表读旧行 → 永远显示 failed）。
   // 统一取 id 最大的那行，保证"刚分析完"的结果能被读到。
   getHitVideo(videoPath) {
-    return this.db.prepare('SELECT * FROM hit_videos WHERE video_path = ? ORDER BY id DESC LIMIT 1').get(String(videoPath || '').replace(/\\/g, '/'));
+    return this.db.prepare('SELECT * FROM hit_videos WHERE video_path = ? ORDER BY id DESC LIMIT 1').get(normalizeVideoPath(videoPath));
+  }
+
+  /**
+   * 只要分析状态（2026-10-12）。
+   *
+   * 调度器每 30 秒对**每个**候选文件调一次 getHitVideo —— 而 hit_videos 带
+   * full_transcript（整场逐字稿，几 MB~十几 MB），SELECT * 一次就是一份大 blob
+   * 拷贝扔掉。热路径只需要 status，投影两个列就够。
+   */
+  getHitVideoStatus(videoPath) {
+    return this.db.prepare('SELECT analysis_status FROM hit_videos WHERE video_path = ? ORDER BY id DESC LIMIT 1')
+      .get(normalizeVideoPath(videoPath));
   }
 
   getHitVideoById(id) {
@@ -963,8 +1309,34 @@ export class MemoryStore {
 
   /** 文件夹名规范：去首尾空格、限长；空名返回 null */
   _normCollection(name) {
-    const n = String(name || '').trim().slice(0, 40);
+    // 'null' / 'undefined' 这类字符串不是文件夹名。
+    // 调用方经常写 String(x ?? null) 之类的转换，传进来就是字符串 "null"，
+    // 而它能通过 `collection ? ... : null` 的真值判断，于是被当成一个真实文件夹存进库 ——
+    // 之后按真实名字查询永远查不到，也不报任何错。
+    //（addHotword 早就单独防了这��，而同类路径没有，属于防护不一致。）
+    if (name === null || name === undefined) return null;
+    const raw = typeof name === 'string' ? name : String(name);
+    if (/^(null|undefined|NULL|UNDEFINED)$/.test(raw.trim())) return null;
+    const n = raw.trim().slice(0, 40);
     return n || null;
+  }
+
+  /**
+   * collection 入参的统一解析（2026-10-12）。
+   *
+   * 三态约定（全库只有这一处实现，之前散着 9 份各自的 inline 归一）：
+   *   undefined → 用当前活跃文件夹（省略 = 跟随当前）
+   *   null      → 通用（对所有文件夹生效）
+   *   '字符串'  → 该文件夹（trim + 限长 40）
+   *
+   * 为什么必须统一：归一口径不一致时，`upsertLiveVideo` 写进去的名字
+   * 和 renameCollection / getEditArchive 用 _normCollection 规范化后的名字对不上 ——
+   * 于是改名/归档**静默失效**，界面显示改成功了，记忆还留在旧名下。
+   */
+  _resolveCollection(collection) {
+    if (collection === undefined) return this.activeCollection ?? null;
+    if (collection === null) return null;
+    return this._normCollection(collection);
   }
 
   createCollection(name) {
@@ -983,7 +1355,7 @@ export class MemoryStore {
     /*
      * 必须把所有带 collection 的表一起改。
      *
-     * 以前只改 hit_videos，结果"案例老师"改名后：
+     * 以前只改 hit_videos，结果"祝老师"改名后：
      *   - 爆款素材跟着走了
      *   - review_feedback / review_edits 还挂在旧名下 → 归档断裂，
      *     用户以为学到的偏好跟着老师一起搬过去了，实际没有
@@ -992,7 +1364,7 @@ export class MemoryStore {
      * 表现是"改了名之后记忆好像失忆了"，而且不报任何错。
      * 列在这里是刻意的：以后加带 collection 的表，忘了加进来就会重现同样的问题。
      */
-    const COLLECTION_TABLES = ['hit_videos', 'live_videos', 'review_feedback', 'review_edits'];
+    const COLLECTION_TABLES = ['hit_videos', 'live_videos', 'review_feedback', 'review_edits', 'hotwords'];
     this.db.transaction(() => {
       // 新名已存在时把旧文件夹的素材并进去，再删掉旧记录
       this.db.prepare('INSERT OR IGNORE INTO collections (name) VALUES (?)').run(n);
@@ -1000,8 +1372,24 @@ export class MemoryStore {
       for (const t of COLLECTION_TABLES) {
         try {
           this.db.prepare(`UPDATE ${t} SET collection = ? WHERE collection = ?`).run(n, o);
-        } catch {
-          // 老库可能还没建这张表，跳过即可 —— 缺表不影响其他表改名
+        } catch (err) {
+          /*
+           * 2026-10-12：这个 catch 原来完全为空，连消息都没有。
+           * 注释说"老库可能还没建这张表，跳过即可"，但它同时吞掉了
+           * SQLITE_BUSY / SQLITE_CORRUPT / 磁盘满 / 语法错误 ——
+           * 而外层是事务，任何一张表改名失败都会导致**全部回滚**，
+           * 表却照样返回 ok:true。表现就是"改了名之后记忆好像失忆了，而且不报任何错"。
+           *
+           * 至少要区分"表不存在"（可忽略）和"真的写失败了"（必须让人看见）。
+           */
+          const msg = String(err?.message || err);
+          const ignorable = /no such table/i.test(msg);
+          if (ignorable) {
+            // 老库缺表：跳过，下面的 _addMissingColumns 会补
+          } else {
+            console.error(`[Store] renameCollection 在 ${t} 上失败：${msg}`);
+            throw err; // 让事务回滚，不要留下改了一半的库
+          }
         }
       }
     })();
@@ -1070,9 +1458,23 @@ export class MemoryStore {
       }
     } catch { /* 读不到旧值不影响归类本身 */ }
 
-    const stmt = this.db.prepare('UPDATE hit_videos SET collection = ? WHERE id = ?');
+    // 2026-10-12 补事务：原来 N 条 UPDATE 各自独立自动提交。
+    // 批量归类跑到一半失败/进程被杀，就留下"一半新文件夹、一半旧文件夹"的混合态，
+    // 而接口照样回 ok 并弹出"可撤销" —— 用户以为整个文件夹都归好了。
+    // better-sqlite3 的 transaction() 是同步的，这里没有 await，不会被打断。
+    const applyAll = this.db.transaction((ids) => {
+      const stmt = this.db.prepare('UPDATE hit_videos SET collection = ? WHERE id = ?');
+      let n = 0;
+      for (const id of ids) n += stmt.run(val, id).changes;
+      return n;
+    });
     let n = 0;
-    for (const id of list) n += stmt.run(val, id).changes;
+    try {
+      n = applyAll(list);
+    } catch (err) {
+      console.warn(`[Store] 批量归类失败，已回滚（${err.message}）`);
+      throw err;
+    }
 
     if (n > 0 && prev.length) {
       this._lastCollectionUndo = { at: Date.now(), to: val, items: prev };
@@ -1094,9 +1496,22 @@ export class MemoryStore {
   undoLastCollection() {
     const u = this._lastCollectionUndo;
     if (!u || !u.items?.length) return { restored: 0, to: null };
-    const stmt = this.db.prepare('UPDATE hit_videos SET collection = ? WHERE id = ?');
+    // 同 setHitCollection：批量撤销也必须在事务里。
+    // 否则撤到一半失败 → 素材处于新旧文件夹混合状态，而 _lastCollectionUndo
+    // 又被置空（下面那行），用户连重试的机会都没有。
+    const restoreAll = this.db.transaction((items) => {
+      const stmt = this.db.prepare('UPDATE hit_videos SET collection = ? WHERE id = ?');
+      let n = 0;
+      for (const it of items) n += stmt.run(it.collection, it.id).changes;
+      return n;
+    });
     let n = 0;
-    for (const it of u.items) n += stmt.run(it.collection, it.id).changes;
+    try {
+      n = restoreAll(u.items);
+    } catch (err) {
+      console.warn(`[Store] 撤销归类失败，已回滚（${err.message}）`);
+      throw err; // 保留 _lastCollectionUndo，让用户还能再试一次
+    }
     this._lastCollectionUndo = null; // 一次操作只撤销一次，避免来回抖动
     return { restored: n, to: u.to };
   }
@@ -1109,9 +1524,22 @@ export class MemoryStore {
   _isSafeToUnlink(p) {
     const low = String(p || '').toLowerCase();
     if (!/\.(mp4|mov|mkv|webm|flv|avi|m4v|ts|mp3|wav|m4a|aac|flac)$/.test(low)) return false;
-    const forbidden = [process.env.SystemRoot, process.env.ProgramFiles, process.env['ProgramFiles(x86)'], process.env.ProgramData, process.env.USERPROFILE, process.env.LOCALAPPDATA]
-      .filter(Boolean).map((d) => String(d).toLowerCase().replace(/[\\/]+$/, ''));
-    return !forbidden.some((d) => low === d || low.startsWith(d + '\\'));
+    /*
+     * 2026-10-12 修：判定恒为 false，等于这道闸门从来没生效。
+     *
+     * 所有写入路径都做了 replace(/\\/g,'/')（见三个 upsert），
+     * 所以这里的 low 一定是正斜杠；而 forbidden 来自环境变量，是反斜杠，
+     * 原判定 `low.startsWith(d + '\\')` 在 'c:/windows/…' 和 'c:\windows' 之间比 ——
+     * 分隔符不一致，永远匹配不上，任何系统目录都能通过。
+     *
+     * 修法：两边都归一成正斜杠再去掉尾斜杠，然后比前缀。
+     */
+    const norm = (s) => normalizeVideoPath(s).toLowerCase();
+    const target = norm(low);
+    const forbidden = [process.env.SystemRoot, process.env.ProgramFiles, process.env['ProgramFiles(x86)'],
+      process.env.ProgramData, process.env.USERPROFILE, process.env.LOCALAPPDATA]
+      .filter(Boolean).map(norm).filter(Boolean);
+    return !forbidden.some((d) => target === d || target.startsWith(d + '/'));
   }
 
   /**
@@ -1192,15 +1620,100 @@ export class MemoryStore {
   }
 
   /** 文件已经不在磁盘上的素材记录（上传后又手工删了文件留下的空壳） */
-  findOrphanHits() {
-    return this.db.prepare('SELECT id, video_path, video_name, analysis_status FROM hit_videos')
-      .all().filter((r) => r.video_path && !existsSync(r.video_path));
+  findOrphanHits(collection) {
+    const rows = collection === undefined || collection === null
+      ? this.db.prepare('SELECT id, video_path, video_name, analysis_status, collection FROM hit_videos').all()
+      : this.db.prepare('SELECT id, video_path, video_name, analysis_status, collection FROM hit_videos WHERE collection = ?')
+          .all(this._resolveCollection(collection));
+    return rows.filter((r) => r.video_path && !existsSync(r.video_path));
   }
 
-  purgeOrphanHits() {
-    const orphans = this.findOrphanHits().filter((r) => r.analysis_status !== 'analyzing');
-    if (!orphans.length) return { deleted: 0 };
-    return this.deleteHits(orphans.map((r) => r.id), false);
+  /**
+   * 清掉"文件已不在磁盘"的空壳记录。
+   *
+   * 2026-10-12 改成异步。
+   *
+   * 原来对每行同步调 existsSync，在 Node 单线程里就是 N 次阻塞 syscall：
+   * 网络盘/机械盘上一次 stat 几毫秒，几百条素材就是一秒多的事件循环卡死 ——
+   * 而这个接口是**看板按钮 + 调度器每天一次**都会调用的，卡住的是整个服务。
+   *
+   * 三个改法：
+   *   - fs.promises.stat：交给线程池，不再堵事件循环
+   *   - 按目录去重：素材通常成堆放在少数几个目录里，原来同一个目录被反复 stat
+   *   - 限制并发：一次几百个 stat 会把线程池打满，反而更慢
+   *
+   * collection 缺省时**只清当前文件夹**，不再跨文件夹扫 ——
+   * 之前全库扫意味着：任一文件夹的素材被移走，另一个文件夹的正常记录也会被当成孤儿删掉。
+   */
+  async purgeOrphanHits(collection) {
+    /*
+     * 作用范围（这决定了"会不会删到别人的东西"）：
+     *
+     *   undefined / 某文件夹名 → 该文件夹 **+ 通用（collection IS NULL）**
+     *   null（显式）           → 只清通用
+     *
+     * 为什么把通用一起带上：hit_videos.collection 是靠 setHitCollection 事后归类的，
+     * 新素材入库时是 NULL，也就是"通用"—— 它在每个文件夹下都能看到，
+     * 不属于任何一个具名文件夹，没有别的归属需要保护。文件真没了就是没了。
+     *
+     * 为什么绝不碰别的具名文件夹：原来是一条 SELECT 全库扫，
+     * 任何一个文件夹的素材被移走/换盘，另一个文件夹的正常记录也会被当孤儿删掉，
+     * 而且没有任何提示。
+     */
+    const col = this._resolveCollection(collection);
+    const scope = col ? "(IFNULL(collection,'') = ? OR collection IS NULL)" : 'collection IS NULL';
+    const args = col ? [col] : [];
+
+    // 排除正在分析的：分析中的文件可能正在下载/移动，stat 不到是正常的
+    const rows = this.db.prepare(
+      `SELECT id, video_path FROM hit_videos
+       WHERE ${scope} AND IFNULL(analysis_status,'') != 'analyzing'`
+    ).all(...args);
+    if (!rows.length) return { deleted: 0, found: 0, scanned: 0, dirs: 0 };
+
+    // 按目录归组：同一目录下只 stat 一次目录本身，命中就整组判死
+    const byDir = new Map();
+    for (const r of rows) {
+      if (!r.video_path) continue;
+      const dir = dirname(r.video_path);
+      if (!byDir.has(dir)) byDir.set(dir, []);
+      byDir.get(dir).push(r);
+    }
+    // 目录太多的库不该靠调并发硬扛，先看现有素材量
+    const dirs = [...byDir.keys()];
+    const CONCURRENCY = 16;
+    const dirGone = new Array(dirs.length);
+    let cursor = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(CONCURRENCY, dirs.length) }, async () => {
+        while (cursor < dirs.length) {
+          const i = cursor++;
+          try {
+            // 先看目录还在不在：目录整个没了/换盘了，里面所有记录都是孤儿
+            dirGone[i] = !(await stat(dirs[i]));
+          } catch {
+            // EACCES / EBUSY 之类拿不准的，当作"还在"，宁可留着也不误删
+            dirGone[i] = false;
+          }
+        }
+      })
+    );
+
+    const orphanIds = [];
+    let scanned = 0;
+    for (let i = 0; i < dirs.length; i++) {
+      const group = byDir.get(dirs[i]);
+      if (dirGone[i]) { orphanIds.push(...group.map((r) => r.id)); continue; }
+      // 目录还在，逐条 stat
+      for (const r of group) {
+        scanned++;
+        try { await stat(r.video_path); } catch { orphanIds.push(r.id); }
+      }
+    }
+
+    if (!orphanIds.length) return { deleted: 0, found: 0, scanned, dirs: dirs.length };
+    const result = this.deleteHits(orphanIds, false);
+    return { ...result, found: orphanIds.length, scanned, dirs: dirs.length };
   }
 
   getAllHitVideos(limit = 100) {
@@ -1220,16 +1733,32 @@ export class MemoryStore {
       INSERT INTO hit_structure (hit_video_id, segment_type, start_ms, end_ms, duration_ms, description, key_text, emotion_tag, intensity, keyframe_path)
       VALUES (@hitVideoId, @segmentType, @startMs, @endMs, @durationMs, @description, @keyText, @emotionTag, @intensity, @keyframePath)
     `);
+    /*
+     * segment_type 是 NOT NULL，而它的值来自 LLM 的 JSON。
+     * 以前这里不做任何兜底：模型某一段少给一个字段，SQLite 直接抛
+     * NOT NULL constraint failed，异常一路冒到 analyze() 的 catch ——
+     * 整条素材判 failed，前面已经算好的标题/要点/主题全部作废。
+     * 一段结构写不进去，代价却是整条素材，这在结构上就不成比例。
+     *
+     * 归一化放在分析器里做（能按时长/位置推断类型，见 normalizeStructureSegment）；
+     * 这里是最后一道闸：宁可写成 unknown 也不让整条分析陪葬。
+     */
+    const type = String(data.segmentType ?? '').trim() || 'unknown';
+    const startMs = Math.round(Number(data.startMs) || 0);
+    const endMs = Math.round(Number(data.endMs) || 0);
+    const intensity = Number(data.intensity);
     return stmt.run({
       hitVideoId: data.hitVideoId,
-      segmentType: data.segmentType,
-      startMs: data.startMs,
-      endMs: data.endMs,
-      durationMs: data.durationMs || (data.endMs - data.startMs),
+      segmentType: type,
+      startMs,
+      endMs,
+      durationMs: Number.isFinite(Number(data.durationMs)) && data.durationMs > 0
+        ? Math.round(data.durationMs)
+        : Math.max(0, endMs - startMs),
       description: data.description || '',
       keyText: data.keyText || '',
       emotionTag: data.emotionTag || '',
-      intensity: data.intensity || 0.5,
+      intensity: Number.isFinite(intensity) ? Math.min(1, Math.max(0, intensity)) : 0.5,
       keyframePath: data.keyframePath || null
     }).lastInsertRowid;
   }
@@ -1249,8 +1778,12 @@ export class MemoryStore {
     `);
     return stmt.run({
       hitVideoId: data.hitVideoId,
-      themeName: data.themeName,
-      confidence: data.confidence || 0.5,
+      // theme_name 是 NOT NULL。上游有 normalizeThemeName 兜底，
+      // 但它也可能被绕过（比如以后新增一条写入路径），所以这里再兜一层。
+      themeName: String(data.themeName ?? '').trim() || '未归类',
+      // 夹到 0~1：模型返回 5 / -1 时直接落库的话，
+      // getAllHitThemes 按 confidence 排序会把假数据排到最前
+      confidence: MemoryStore.num(data.confidence, { min: 0, max: 1, fallback: 0.5 }),
       keywords: data.keywords ? JSON.stringify(data.keywords) : null,
       relatedSegments: data.relatedSegments ? JSON.stringify(data.relatedSegments) : null
     }).lastInsertRowid;
@@ -1272,7 +1805,7 @@ export class MemoryStore {
   getLiveVideoIdByPath(videoPath) {
     if (!videoPath) return null;
     try {
-      const p = String(videoPath).replace(/\\/g, '/');
+      const p = normalizeVideoPath(videoPath);
       const row = this.db.prepare('SELECT id FROM live_videos WHERE video_path = ?').get(p);
       return row?.id ?? null;
     } catch {
@@ -1301,10 +1834,18 @@ export class MemoryStore {
     }
   }
 
+  /** 只要分析状态（2026-10-12，理由同 getHitVideoStatus） */
+  getLiveVideoStatus(videoPath) {
+    return this.db.prepare('SELECT analysis_status FROM live_videos WHERE video_path = ? LIMIT 1')
+      .get(normalizeVideoPath(videoPath));
+  }
+
   /** 把直播绑定到某位老师的记忆库。传 null/空 = 解绑（退回全局） */
   bindLiveVideoCollection(liveVideoId, collection) {
     if (!liveVideoId) return { ok: false, error: '缺少 liveVideoId' };
-    const col = collection ? String(collection).trim() : null;
+    // 统一走 _normCollection：这里原来只 trim 不限长 40，
+    // 而 renameCollection / listCollections 用的是限长的口径 —— 超长名会两边对不上
+    const col = this._normCollection(collection);
     try {
       const r = this.db.prepare('UPDATE live_videos SET collection = ? WHERE id = ?').run(col, liveVideoId);
       if (r.changes === 0) return { ok: false, error: `找不到直播 ${liveVideoId}` };
@@ -1317,10 +1858,31 @@ export class MemoryStore {
   upsertLiveVideo(videoPath, data = {}) {
     // 2026-09-25 修：分隔符统一成正斜杠——接口传 D:/x、调度器扫到 D:////x 时
     // ON CONFLICT(video_path) 匹配不上，同一条素材会插出两条记录、双跑锁失效。
-        videoPath = String(videoPath || '').replace(/\\/g, '/');
+        videoPath = normalizeVideoPath(videoPath);
+        /*
+         * 2026-10-12：空路径直接拒绝，不能写进库。
+         *
+         * video_path 是 NOT NULL UNIQUE，而空串**能通过** NOT NULL 检查 ——
+         * 于是第一个空路径 upsert 插出一条 video_path='' 的垃圾行，
+         * 之后每一次空路径 upsert 都因 UNIQUE 冲突落到同一条 '' 行上互相覆盖。
+         * 结果：所有“路径算错了”的调用共用一条记录，谁都能改它，
+         * 而 listCollections / getCollectionHits 会把它当成一条真实素材统计进去。
+         *
+         * 宁可让调用方拿到明确的失败，也不要悄悄写一条共享的垃圾行。
+         */
+        if (!videoPath) {
+          const e = new Error('videoPath 为空，拒绝写入（否则会往库里插一条共享的垃圾行）');
+          e.code = 'EMPTY_VIDEO_PATH';
+          throw e;
+        }
         // 合并语义：同上。分析中/建项目/回填分段数多次 upsert 不再互相清零，
     // 否则调度器会陷入“重分析→clip_count归零→重复建项目”死循环。
-    const cur = this.db.prepare('SELECT * FROM live_videos WHERE video_path = ?').get(videoPath);
+    // 同 upsertHitVideo：不 SELECT *（live_videos 也有 full_transcript）
+    // 注意 live_videos 没有 genre / resolution / fps 这几列，别照抄 hit_videos 的列表
+    const cur = this.db.prepare(
+      'SELECT id, video_name, duration_ms, file_size, analysis_status, asr_path,'
+      + ' collection, segment_count, clip_count FROM live_videos WHERE video_path = ?'
+    ).get(videoPath);
     const pick = (v, c) => (v !== undefined && v !== null ? v : (c !== undefined && c !== null ? c : null));
     const merged = {
       videoName: pick(data.videoName, cur?.video_name),
@@ -1371,7 +1933,7 @@ export class MemoryStore {
   }
 
   getLiveVideo(videoPath) {
-    return this.db.prepare('SELECT * FROM live_videos WHERE video_path = ?').get(videoPath);
+    return this.db.prepare('SELECT * FROM live_videos WHERE video_path = ?').get(normalizeVideoPath(videoPath));
   }
 
   getLiveVideoById(id) {
@@ -1382,27 +1944,142 @@ export class MemoryStore {
     return this.db.prepare('SELECT * FROM live_videos ORDER BY created_at DESC LIMIT ?').all(limit);
   }
 
+  /**
+   * 回填 UNIQUE 约束所依赖的唯一索引（2026-10-12）。
+   *
+   * `ON CONFLICT(col) DO UPDATE` 要求 col 上真的有 UNIQUE 约束。
+   * 新库的建表语句带 UNIQUE，没问题；但**老库**是当年先建的表、后加的 UNIQUE
+   * （或者压根没有），于是 upsert 会抛
+   * "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"，
+   * 而且每次调用都抛 —— 功能整个不可用。
+   *
+   * speaker_profiles 上这个坑踩过一次并修过（见 _init 里的 idx_speaker_label），
+   * 但同样的补丁**没打到下面这三张表**。这里统一回填，并做前置去重 ——
+   * 有重复行时建唯一索引会失败，必须先合并/删除，否则索引永远建不出来。
+   */
+  _ensureUniqueConstraints() {
+    const specs = [
+      { table: 'hit_performance', col: 'hit_video_id' },
+      { table: 'hit_predictions', col: 'hit_video_id' },
+      { table: 'openings_cache', col: 'cache_key' },
+      // 注意是 speaker_label，不是 profile_key（那是 style_profile 的列）
+      { table: 'speaker_profiles', col: 'speaker_label' },
+    ];
+    for (const { table, col } of specs) {
+      try {
+        /*
+         * 已经有覆盖该列的唯一索引就别再建。
+         *
+         * 判据不能只看 origin='u'：UNIQUE **约束**生成的 sqlite_autoindex_* 是 'u'，
+         * 而 CREATE UNIQUE INDEX 建出来的是 'c' —— idx_speaker_label 就属于后者。
+         * 只认 'u' 的话会给已经有唯一索引的表再补一份完全重复的 B 树，
+         * 每次 INSERT 都得多维护一次（这台的库里 idx_speaker_label 就是这个情况）。
+         */
+        const covered = this.db.prepare(
+          `SELECT 1 FROM pragma_index_list(?) AS l
+           WHERE l."unique" = 1
+             AND EXISTS (SELECT 1 FROM pragma_index_info(l.name) AS ii WHERE ii.name = ?)`
+        ).get(table, col);
+        if (covered) continue;
+        this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_${table}_${col} ON ${table}(${col})`);
+      } catch (err) {
+        // 多半是已有重复数据 —— 明确报出来，不要静默：
+        // 静默的后果是每次 upsert 都抛，而错误信息指向 upsert，根本查不到这里。
+        //
+        // 诊断查询自己也要 try：表不存在 / 列还没有时 prepare 会抛，
+        // 那样会把原本的 warn 变成一次启动失败（构造函数里没有兜底）。
+        let dupNote = '';
+        try {
+          const dup = this.db.prepare(
+            `SELECT ${col} k, COUNT(*) c FROM ${table} WHERE ${col} IS NOT NULL GROUP BY ${col} HAVING c > 1 LIMIT 5`
+          ).all();
+          if (dup.length) dupNote = `；已有重复值 ${dup.map((d) => `${d.k}×${d.c}`).join(', ')}（upsert 会因此报错）`;
+        } catch { /* 表/列还没建，按无重复处理 */ }
+        console.warn(`[Store] ${table}.${col} 的唯一索引建不出来：${err.message}${dupNote}`);
+      }
+    }
+  }
+
+  /**
+   * 建 collection 相关索引（2026-10-12）。
+   *
+   * 单独拎出来、放在 _addMissingColumns 之后，理由见调用处注释。
+   * 逐条 try：某一张表/列在极老的库上不存在时，只跳过那一条，
+   * 不能因此让整个索引段失败（_init 里就是踩这个坑）。
+   */
+  _ensureCollectionIndexes() {
+    const pairs = [
+      ['idx_hit_video_collection', 'hit_videos'],
+      ['idx_live_video_collection', 'live_videos'],
+      ['idx_review_feedback_collection', 'review_feedback'],
+      ['idx_hotwords_collection', 'hotwords'],
+    ];
+    for (const [idx, table] of pairs) {
+      try {
+        this.db.exec(`CREATE INDEX IF NOT EXISTS ${idx} ON ${table}(collection)`);
+      } catch (err) {
+        // 表或列不存在（极老的库）：跳过这一条，不影响其余
+        console.warn(`[Store] 建索引 ${idx} 失败: ${err.message}`);
+      }
+    }
+  }
+
   // ──────────────────────────────────────────────
   // Live Segments
   // ──────────────────────────────────────────────
 
   addLiveSegment(data) {
     const stmt = this.db.prepare(`
-      INSERT INTO live_segments (live_video_id, segment_index, start_ms, end_ms, duration_ms, theme_name, theme_confidence, matched_hit_themes, hook_quality, peak_count, transcript_summary, status)
-      VALUES (@liveVideoId, @segmentIndex, @startMs, @endMs, @durationMs, @themeName, @themeConfidence, @matchedHitThemes, @hookQuality, @peakCount, @transcriptSummary, @status)
+      INSERT INTO live_segments (live_video_id, segment_index, start_ms, end_ms, duration_ms, theme_name, theme_confidence, matched_hit_themes, hook_quality, peak_count, transcript_summary, status, viral_potential, recommended_action)
+      VALUES (@liveVideoId, @segmentIndex, @startMs, @endMs, @durationMs, @themeName, @themeConfidence, @matchedHitThemes, @hookQuality, @peakCount, @transcriptSummary, @status, @viralPotential, @recommendedAction)
     `);
+    /*
+     * start_ms / end_ms 是 NOT NULL，值来自 LLM 的 JSON（live-analyzer 传
+     * Math.round(seg.start_seconds * 1000)）。模型少给一个字段 → NaN →
+     * better-sqlite3 把 undefined/NaN 绑成 NULL → 直接抛
+     * NOT NULL constraint failed → 整场直播分析判 failed。
+     *
+     * 这和 hit_structure.segment_type 是同一个坑（已修），这里还没修。
+     * 一场 3 小时直播的分段是几十上百条，为其中一条的时间戳把整场扔掉不成比例。
+     *
+     * 时间轴也要自洽：end < start 的段会让下游 ffmpeg 切出负时长，
+     * 直接把 end 夹到 start（写成零长度段），比写脏数据安全。
+     */
+    const rawStart = Math.round(Number(data.startMs));
+    const rawEnd = Math.round(Number(data.endMs));
+    const startMs = Number.isFinite(rawStart) ? Math.max(0, rawStart) : 0;
+    const endMs = Number.isFinite(rawEnd) ? Math.max(startMs, rawEnd) : startMs;
+    const rawDur = Math.round(Number(data.durationMs));
+    const conf = Number(data.themeConfidence);
+    const hook = Number(data.hookQuality);
     return stmt.run({
       liveVideoId: data.liveVideoId,
-      segmentIndex: data.segmentIndex || 0,
-      startMs: data.startMs,
-      endMs: data.endMs,
-      durationMs: data.durationMs || (data.endMs - data.startMs),
+      segmentIndex: Number.isFinite(Number(data.segmentIndex)) ? Number(data.segmentIndex) : 0,
+      startMs,
+      endMs,
+      durationMs: Number.isFinite(rawDur) && rawDur > 0 ? rawDur : (endMs - startMs),
       themeName: data.themeName || null,
-      themeConfidence: data.themeConfidence || 0.5,
-      matchedHitThemes: data.matchedHitThemes ? JSON.stringify(data.matchedHitThemes) : null,
-      hookQuality: data.hookQuality || 0.5,
-      peakCount: data.peakCount || 0,
+      // `|| 0.5` 是 falsy-zero 陷阱：模型明确给 0（"完全没信心"）会被吞成 0.5
+      themeConfidence: Number.isFinite(conf) ? Math.min(1, Math.max(0, conf)) : 0.5,      matchedHitThemes: data.matchedHitThemes ? JSON.stringify(data.matchedHitThemes) : null,
+      hookQuality: Number.isFinite(hook) ? Math.min(1, Math.max(0, hook)) : 0.5,      peakCount: Number.isFinite(Number(data.peakCount)) ? Math.max(0, Number(data.peakCount)) : 0,
       transcriptSummary: data.transcriptSummary || '',
+      /*
+       * 爆款价值分与建议动作（2026-10-14 补）。
+       *
+       * live-analyzer 的 _matchAllWithHitThemes 早就把这两项算出来了
+       * （拿爆款主题库 + 创作者历史评判去匹配每一段），
+       * 但表里没有这两列、也没往接口返回，于是它们在写库那一刻被丢掉。
+       *
+       * 后果就是界面只能拿 hook_quality 当分数，
+       * 而默认勾选判据是 `score100 >= 60` —— 于是只要钩子分过 60 就默认选中。
+       * 一场 3 小时直播的 255 段里有 190 段中招，
+       * 而爆款素材的时长中位数是 554 秒，选中的却是清一色 20 秒的段。
+       * 用户看到的"全是垃圾"，根因就在这里：**爆款逻辑算了，但没有出口。**
+       */
+      viralPotential: Number.isFinite(Number(data.viralPotential))
+        ? Math.min(1, Math.max(0, Number(data.viralPotential)))
+        : null,
+      recommendedAction: data.recommendedAction || null,
       status: data.status || 'draft'
     }).lastInsertRowid;
   }
@@ -1438,9 +2115,19 @@ export class MemoryStore {
    * 代价可控：源视频文件是同一个，起止时间没变，切出来仍然是当初那段内容。
    */
   getLiveSegmentsByIds(ids) {
-    const list = (Array.isArray(ids) ? ids : [ids])
-      .map((n) => Number(n))
-      .filter((n) => Number.isFinite(n));
+    /*
+     * 2026-10-12：只接受正整数 id。
+     *
+     * 原来 .map(Number).filter(Number.isFinite) 会放过一批垃圾输入：
+     *   Number(true)=1  → 静默返回 id=1 的段（！）
+     *   Number(null)=0  → 虽然查不到，但混在列表里不好排查
+     *   Number('12abc')=12
+     * 上游是接口直传的 segmentIds，这种输入现实存在（前端 bug / 手改请求）。     */
+    const list = [...new Set(
+      (Array.isArray(ids) ? ids : [ids])
+        .map((n) => MemoryStore.num(n, { integer: true, fallback: null }))
+        .filter((n) => n !== null && n > 0)
+    )];
     if (!list.length) return [];
     const CHUNK = 500;
     const out = [];
@@ -1492,6 +2179,8 @@ export class MemoryStore {
     const fields = [];
     const params = { id };
     for (const [key, value] of Object.entries(data)) {
+      // 同 updateHitVideo：data 里带 id 会覆盖 params.id，改到别的行上去
+      if (key === 'id') continue;
       const dbKey = key.replace(/[A-Z]/g, m => '_' + m.toLowerCase());
       fields.push(`${dbKey} = @${dbKey}`);
       params[dbKey] = value;
@@ -1569,7 +2258,7 @@ export class MemoryStore {
 
   addReviewFeedback({ clipProjectId, liveVideoId, decision, segmentIds, comment, collection = undefined }) {
     // 归属规则与 addReviewLesson 一致：省略 = 当前活跃文件夹；显式 null = 通用（所有文件夹生效）
-    const col = collection === undefined ? this.activeCollection : (collection ? String(collection).trim() : null);
+    const col = this._resolveCollection(collection);
     return this.db.prepare(`
       INSERT INTO review_feedback (clip_project_id, live_video_id, decision, segment_ids, comment, collection)
       VALUES (@clipProjectId, @liveVideoId, @decision, @segmentIds, @comment, @collection)
@@ -1646,7 +2335,7 @@ export class MemoryStore {
    * 所以要并上 collection IS NULL 的那批 —— 与 getReviewLessons 的约定保持一致。
    */
   getReviewEdits(collection = undefined, limit = 300) {
-    const col = collection === undefined ? this.activeCollection : (collection ? String(collection).trim() : null);
+    const col = this._resolveCollection(collection);
     return this.db.prepare(`
       SELECT * FROM review_edits
       WHERE (@col IS NULL OR collection IS NULL OR collection = @col)
@@ -1660,7 +2349,7 @@ export class MemoryStore {
    * kind 传 'segment' 拿整段保留的内容逻辑（结构层），传 'cut' 拿避雷词。
    */
   getReviewEditsByKind(kind, collection = undefined, limit = 200) {
-    const col = collection === undefined ? this.activeCollection : (collection ? String(collection).trim() : null);
+    const col = this._resolveCollection(collection);
     return this.db.prepare(`
       SELECT * FROM review_edits
       WHERE kind = @kind AND (@col IS NULL OR collection IS NULL OR collection = @col)
@@ -1684,15 +2373,21 @@ export class MemoryStore {
    */
   _findLiveByPath(videoPath) {
     if (!videoPath) return null;
-    const norm = (p) => String(p).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+    const norm = (p) => normalizeVideoPath(p).toLowerCase();
     const want = norm(videoPath);
     // 先精确（快路径），再退化到归一化比较
     const exact = this.db.prepare('SELECT * FROM live_videos WHERE video_path = ?').get(videoPath);
     if (exact) return exact;
-    for (const row of this.db.prepare('SELECT * FROM live_videos WHERE video_path IS NOT NULL').all()) {
-      if (norm(row.video_path) === want) return row;
-    }
-    return null;
+    /*
+     * 2026-10-12：兜底扫描原来 SELECT * 全表拉 —— 上万行时
+     * 每个请求都把上万行（含 full_transcript，几 MB 级别的 blob）搬进 JS 内存，
+     * 只为了在 JS 里逐行比一次路径。
+     *
+     * 现在只扫 id + video_path 两列（几 KB），命中后再按 id 取完整行。
+     */
+    const hit = this.db.prepare('SELECT id, video_path FROM live_videos WHERE video_path IS NOT NULL').all()
+      .find((r) => norm(r.video_path) === want);
+    return hit ? this.db.prepare('SELECT * FROM live_videos WHERE id = ?').get(hit.id) : null;
   }
 
   /**
@@ -1704,7 +2399,7 @@ export class MemoryStore {
    * 优先级：素材自己的 collection > 当前选中的集合 > null。
    * 素材自己的优先，是因为分析时就是"针对某位老师"做的；
    * 审片往往发生在几天之后，那时用户早就切到别的 IP 了。
-   * 用当前选中会把「案例老师」的口播删减记到「李老师」名下，
+   * 用当前选中会把「祝老师」的口播删减记到「李老师」名下，
    * 而且不报错，错误规则会持续累积。
    */
   _ownerOfLive(liveVideoId) {
@@ -1723,9 +2418,7 @@ export class MemoryStore {
    * collection 为 null 时取"通用"规则（对所有 IP 生效），与 getReviewEdits 同一约定。
    */
   getHotwords(collection = undefined) {
-    const col = collection === undefined
-      ? this.activeCollection
-      : (collection === null ? null : (String(collection).trim() || null));
+    const col = this._resolveCollection(collection);
     const rows = this.db.prepare(`
       SELECT * FROM hotwords
       WHERE (@col IS NULL OR collection IS NULL OR collection = @col)
@@ -1741,17 +2434,18 @@ export class MemoryStore {
    */
   addHotword(collection, from, to) {
     /*
-     * 显式挡掉字符串 "null"。
+     * collection 归一统一交给 _normCollection（2026-10-12）。
      *
-     * 因为 collection 是可选参数，调用方很容易把 JS 的 null 直接传进来，
-     * 而 `collection ? ... : null` 这种写法里 String(null) === 'null' 是真的成立 ——
-     * 只要外面多包一层 String()，null 就变成了字符串 'null' 存进库。
-     * 之后所有 collection = NULL 的查询都匹配不上它，
-     * 于是这条规则"添加成功、读不回来、也不生效"，是条谁都看不见的孤儿数据。
+     * 这里的注释记录了一个很有价值的坑：`collection ? ... : null` 这种写法里
+     * String(null) === 'null' 真的成立 —— 调用方只要在外面多包一层 String()，
+     * null 就变成了字符串 'null' 存进库，之后所有 collection = NULL 的查询都匹配不上，
+     * 这条规则就变成"添加成功、读不回来、也不生效"的孤儿数据。
+     *
+     * 原来只有这一个方法做了防护，同类路径（upsertLiveVideo / addReviewEdits…）都没有 ——
+     * 属于"修了一处没修同类"。现在把防护上收到 _normCollection，
+     * 顺带把限长 40 也统一了（原来这里不截断，别的入口截断）。
      */
-    const col = collection === undefined || collection === null
-      ? null
-      : (String(collection).trim() || null);
+    const col = this._normCollection(collection);
     const f = String(from || '').trim();
     const t = String(to || '').trim();
     if (!f) return { ok: false, error: '要改哪个词？' };
@@ -1937,7 +2631,7 @@ listEditArchives() {
  * 这里只统计**事实**：删了多少字、留了多少段、最常被删的开头是什么。
  */
 getEditStyleSummary(collection = undefined) {
-    const col = collection === undefined ? this.activeCollection : (collection ? String(collection).trim() : null);
+    const col = this._resolveCollection(collection);
     const base = { collection: col, cuts: 0, keeps: 0, segments: 0, cutChars: 0, keepChars: 0 };
     const q = (kind) => this.db.prepare(`
       SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(text)),0) AS chars
@@ -1968,7 +2662,7 @@ getEditStyleSummary(collection = undefined) {
    * 整句几乎各不相同，聚不出任何东西。
    */
   topCutOpenings(collection = undefined, limit = 10) {
-    const col = collection === undefined ? this.activeCollection : (collection ? String(collection).trim() : null);
+    const col = this._resolveCollection(collection);
     return this.db.prepare(`
       SELECT substr(text, 1, 6) AS opening, COUNT(*) AS n
       FROM review_edits
@@ -1990,8 +2684,18 @@ getEditStyleSummary(collection = undefined) {
    * 注意：这里必须容错——旧版 SQLite 不认这个 pragma，绝不能因此拖垮启动。
    */
   checkpointWal(mode = 'PASSIVE') {
+    /*
+     * 2026-10-12：mode 加白名单。
+     *
+     * `db.pragma()` 是直接执行任意 SQL 的，而 mode 被字符串拼进去。
+     * 现在两个调用点都不传参（不可达），但只要有人写一句
+     * `checkpointWal(req.query.mode)` 就立刻是一条注入路径 ——
+     * "目前没被调用"不是防护，是运气。这里把可接受的值钉死。
+     */
+    const safe = ['PASSIVE', 'FULL', 'RESTART', 'TRUNCATE']
+      .includes(String(mode).toUpperCase()) ? String(mode).toUpperCase() : 'PASSIVE';
     try {
-      this.db.pragma(`wal_checkpoint(${mode})`);
+      this.db.pragma(`wal_checkpoint(${safe})`);
       return true;
     } catch {
       return false;
@@ -2017,7 +2721,7 @@ getEditStyleSummary(collection = undefined) {
    *   显式传 null = 通用经验（对所有文件夹生效）。
    */
   addReviewLesson(lesson, collection = undefined) {
-    const col = collection === undefined ? this.activeCollection : (collection ? String(collection).trim() : null);
+    const col = this._resolveCollection(collection);
     // 必须拷贝：getStyleProfile 返回的是进程内缓存里的数组，直接 push 等于在 setStyleProfile
     // 之前就把缓存改了 —— 中途有读者会看到尚未落库的中间状态（单测踩到过）。
     let lessons = [];
@@ -2051,7 +2755,7 @@ getEditStyleSummary(collection = undefined) {
     } catch {
       return [];
     }
-    const col = collection === undefined ? this.activeCollection : (collection || null);
+    const col = this._resolveCollection(collection);
     if (!col) return all;
     return all.filter((l) => {
       const c = l && typeof l === 'object' ? (l.collection || null) : null;
@@ -2127,12 +2831,21 @@ getEditStyleSummary(collection = undefined) {
   upsertHitPerformance(hitVideoId, data = {}) {
     const cur = this.db.prepare('SELECT * FROM hit_performance WHERE hit_video_id = ?').get(hitVideoId);
     const pick = (v, c) => (v !== undefined && v !== null ? v : (c !== undefined && c !== null ? c : null));
+    /*
+     * 2026-10-12：计数列夹一次。
+     *
+     * 上游 orchestrator 的 num() 只做了 Math.max(0, Math.round(Number(v)||0))，
+     * 而 Number("1e999") = Infinity、Infinity || 0 还是 Infinity —— **上限没封**，
+     * 于是 POST {views:"1e999"} 就能把 Infinity 写进库，之后所有统计静默变 NaN。
+     * store 层这里兜住，任何调用方都绕不过去。
+     */
+    const cnt = (v, c) => MemoryStore.num(v ?? c, { min: 0, max: 1e9, integer: true, fallback: null });
     const merged = {
-      views: pick(data.views, cur?.views),
-      likes: pick(data.likes, cur?.likes),
-      comments: pick(data.comments, cur?.comments),
-      shares: pick(data.shares, cur?.shares),
-      favorites: pick(data.favorites, cur?.favorites),
+      views: cnt(data.views, cur?.views),
+      likes: cnt(data.likes, cur?.likes),
+      comments: cnt(data.comments, cur?.comments),
+      shares: cnt(data.shares, cur?.shares),
+      favorites: cnt(data.favorites, cur?.favorites),
       platform: pick(data.platform, cur?.platform),
       source: pick(data.source, cur?.source || 'manual'),
       screenshotPath: pick(data.screenshotPath, cur?.screenshot_path),
@@ -2163,7 +2876,7 @@ getEditStyleSummary(collection = undefined) {
  *
  * 【为什么必须按 collection 隔离】
  * 以前只按 genre(题材) 过滤、完全不看 collection。后果是：
- * 案例老师的爆款感标准，会被其他老师的同题材数据稀释 ——
+ * 祝老师的爆款感标准，会被其他老师的同题材数据稀释 ——
  * 而"这位老师自己的爆款感"正是这个功能存在的理由。
  * 素材少的时候掺进别人的数据，比没有基准更糟：
  * 看起来有参照，其实参照的是别人的标准，会系统性地把预测带偏。
@@ -2239,14 +2952,27 @@ getPerformanceBaseline(genre, platform = null, collection = null) {
         created_at = datetime('now')
     `).run({
       hitVideoId,
-      viewsLow: data.viewsLow ?? null,
-      viewsHigh: data.viewsHigh ?? null,
-      likes: data.likes ?? null,
-      comments: data.comments ?? null,
-      shares: data.shares ?? null,
-      favorites: data.favorites ?? null,
-      confidence: data.confidence || null,
-      rationale: data.rationale || '',
+      /*
+       * 2026-10-12：数值列统一夹一次。
+       * 直通 INTEGER 列有两个问题：字符串 "abc" 会因 affinity 保持 TEXT（下游比较全错），
+       * Infinity 会污染所有统计（getPerformanceBaseline 的 avg/sum 静默变 NaN）。
+       */
+      viewsLow: MemoryStore.num(data.viewsLow, { min: 0, max: 1e12, integer: true, fallback: null }),
+      viewsHigh: MemoryStore.num(data.viewsHigh, { min: 0, max: 1e12, integer: true, fallback: null }),
+      likes: MemoryStore.num(data.likes, { min: 0, max: 1e9, integer: true, fallback: null }),
+      comments: MemoryStore.num(data.comments, { min: 0, max: 1e9, integer: true, fallback: null }),
+      shares: MemoryStore.num(data.shares, { min: 0, max: 1e9, integer: true, fallback: null }),
+      favorites: MemoryStore.num(data.favorites, { min: 0, max: 1e9, integer: true, fallback: null }),
+      /*
+       * confidence 在这张表里是 **TEXT**，线上存的是 '低'/'中'/'高' 这种定性档位，
+       * 不是 0~1 的小数（PRAGMA table_info 确认过）。
+       * 所以这里绝不能按数值夹 —— Number('低') 是 NaN，一夹就变 null，
+       * 等于把真数据抹掉。（差点就改错了，是回归用例逼出来的。）
+       */
+      confidence: data.confidence === null || data.confidence === undefined
+        ? null
+        : String(data.confidence).trim().slice(0, 40) || null,
+      rationale: String(data.rationale || '').slice(0, 2000),
     });
     return this.getHitPrediction(hitVideoId);
   }
@@ -2261,6 +2987,28 @@ getPerformanceBaseline(genre, platform = null, collection = null) {
 
   getOpeningCache(key) {
     return this.db.prepare('SELECT * FROM openings_cache WHERE cache_key = ?').get(key) || null;
+  }
+
+  /**
+   * 单行几 MB 的两个大缓存表按 30 天 TTL 清理（2026-10-21）。
+   *
+   * sentence_clean_cache / openings_cache 的 value 是整份逐句 JSON（一部长视频几 MB），
+   * 只增不减 —— 服务跑几个月就能把 DB 顶到几百 MB，VACUUM 都救不回。
+   * 三个写入点（store:2994 / orchestrator:2879 / sentence-cutter:166）的 upsert
+   * 都带 datetime('now') 刷新，所以 TTL 过期即"30 天没再用"，热缓存不会被误清。
+   */
+  pruneBigCaches(maxAgeDays = 30) {
+    let n = 0;
+    try {
+      n += this.db.prepare(
+        "DELETE FROM sentence_clean_cache WHERE updated_at < datetime('now', ?)"
+      ).run(`-${maxAgeDays} day`).changes;
+      n += this.db.prepare(
+        "DELETE FROM openings_cache WHERE created_at < datetime('now', ?)"
+      ).run(`-${maxAgeDays} day`).changes;
+      if (n) console.log(`[Store] 大缓存清理（${maxAgeDays} 天 TTL）：共删 ${n} 行`);
+    } catch { /* 表还没建就跳过 */ }
+    return n;
   }
 
   setOpeningCache(key, mined) {

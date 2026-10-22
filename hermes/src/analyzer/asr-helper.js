@@ -8,18 +8,82 @@
  *   5. unavailable（提示先走 GLB 转写）
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, statSync } from 'fs';
 import { join, basename, dirname } from 'path';
+import { createHash } from 'crypto';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
 // 2026-09-27：唱歌领域术语纠错（混声/声带/关闭唱法…的 ASR 同音字错）
 import { correctTranscript } from './term-corrector.js';
+import { CloudASR } from './cloud-asr.js';
+import { countWords } from '../utils/count-words.js';
 
 const HERMES_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 export class ASRHelper {
   /** 在跑的外部进程：cmd -> Set<ChildProcess>。用于取消时杀掉它们 */
   static _running = new Map();
+  /**
+   * ASR 缓存/中间产物的文件键。
+   *
+   * 2026-10-12 修：原来只用 basename（`${name}_asr.json`），
+   * 而 hits 与 live 两条链路**共用同一个 tempDir**。于是：
+   *   - `upload/hits/A.mp4` 和 `upload/live/A.mp4` 共用同一份 A_asr.json
+   *     → 后分析的直接复用前一条的稿（hit-analyzer 还会把这个错路径写进 asr_path）
+   *   - 同名视频重新上传/内容替换，缓存永不失效（没有 mtime/大小比对），
+   *     scanAndAnalyze 只看 analysis_status，于是分析用旧稿
+   *   - 并发时两条链路还会互相覆写同一个 wav（whisper 完成后还原地覆写 json）
+   *
+   * 改成"目录名 + 文件名"的哈希，既避免撞车又保持文件名可读，
+   * 同时保留老的纯名字文件：先查新键，找不到再回落到旧键
+   * （否则升级后所有已缓存的转写都要重跑一遍）。
+   */
+  _cacheKey(videoPath) {
+    const abs = String(videoPath || '').replace(/\\/g, '/');
+    const dir = basename(dirname(abs));
+    const name = basename(abs).replace(/\.[^.]+$/, '');
+    const h = createHash('sha1').update(abs.toLowerCase()).digest('hex').slice(0, 8);
+    return `${dir}__${name}_${h}`;
+  }
+
+  /** 缓存文件路径（新键优先，回落旧键） */
+  _cachePaths(videoPath) {
+    const name = basename(videoPath, '.mp4').replace(/\.(mov|mkv|webm|flv|avi)$/i, '');
+    return {
+      current: join(this.tempDir, `${this._cacheKey(videoPath)}_asr.json`),
+      legacy: join(this.tempDir, `${name}_asr.json`),
+    };
+  }
+
+  /**
+   * 内容指纹（2026-10-21）：让"同名重传/内容替换"的缓存失效。
+   *
+   * 缓存键本身只含目录名+文件名+路径哈希 —— 元数据撞车依旧可能（之前的
+   * 注释里就留着"同名视频重新上传缓存永不失效"这一条尾巴）。只存 size
+   * 不算内容哈希：几 GB 视频全量读一遍付不起 IO；字节大小几乎只有在
+   * 换了内容时才会巧合相等，mtime 反而复制/搬盘就变，不能当失效依据。
+   */
+  _fingerprint(videoPath) {
+    try {
+      const s = statSync(videoPath);
+      return { size: s.size, mtimeMs: Math.round(s.mtimeMs) };
+    } catch { return null; }
+  }
+
+  /**
+   * 缓存条目是否过期：带指纹且 size 与当前文件不符 → 过期。
+   *
+   * **老缓存（没有 _fp 字段）一律放行** —— 里面躺着 226 分钟量级的
+   * 云端转写结果，那是真金白银买的；宁可保留"老名字旧内容继续沿用"
+   * 的旧行为，也不做一次性清库升级。
+   */
+  _fpStale(cached, videoPath) {
+    const fp = cached?._fp;
+    if (!fp) return false;
+    const cur = this._fingerprint(videoPath);
+    if (!cur) return false; // 视频读不到就不乱判，保持旧行为
+    return fp.size !== cur.size;
+  }
   constructor(config) {
     this.config = config;
     // tempDir 必须是绝对路径：以前用 dirname(config.memory.dbPath) 拼相对路径，
@@ -29,6 +93,8 @@ export class ASRHelper {
     this.ffmpegPath = null;
     // 术语纠错总开关：config/analyzer.termCorrect 或环境变量，默认开启
     this.termCorrect = config?.analyzer?.termCorrect !== false && process.env.HERMES_NO_TERM_CORRECT !== '1';
+    // 云端识别客户端，懒构造（见 _cloud）
+    this._cloudAsrClient = undefined;
   }
 
   /**
@@ -41,6 +107,126 @@ export class ASRHelper {
    *
    * 幂等：正确词不在错字表 key 里，重复调用不会出问题（缓存复读场景必需）。
    */
+  /**
+   * 云端识别客户端（懒构造）。
+   *
+   * 懒构造的原因：CloudASR 构造函数里会 new FFmpegHelper（走 _findBinaries），
+   * 而 ASRHelper 在不少不转写的场景下也会被创建（预设/只读元信息）。
+   * 让那部分场景不必付这次探测成本。
+   * 静态 import 已经足够 —— cloud-asr 只依赖 ffmpeg-helper 与 proxy，
+   * 不像 sherpa-asr 那样要加载 native 模块。
+   */
+  _cloud() {
+    if (this._cloudAsrClient !== undefined) return this._cloudAsrClient;
+    try {
+      this._cloudAsrClient = new CloudASR(this.config);
+    } catch (err) {
+      console.warn(`[ASR] 云端识别客户端构造失败（跳过云端转写）：${err.message}`);
+      this._cloudAsrClient = null;
+    }
+    return this._cloudAsrClient;
+  }
+
+  /**
+   * 跑一次云端识别，成功就写进本地缓存并返回（失败则返回 null 让调用方回退）。
+   *
+   * 为什么要写缓存：云端识别按分钟计费，同一素材重分析/重进调度
+   * 不该再付一次钱；而且写进标准 _cacheKey 之后，第 2 步的缓存命中
+   * 就直接返回，连"该不该调云端"这个判断都省了。
+   *
+   * @param {string} videoPath
+   * @param {object} opts getTranscript 的 opts（signal / onProgress…）
+   * @param {{current:string, legacy:string}} cachePaths
+   * @returns {Promise<null|{source:string, transcript:Array, rawPath:string, fromCloud:boolean}>}
+   */
+  async _cloudAsr(videoPath, opts, cachePaths) {
+    const cloud = this._cloud();
+    if (!cloud || !cloud.available) {
+      // 没启用/没配 key 时静默 —— 本地链路本来就在跑，不该为它刷日志
+      return null;
+    }
+
+    const t0 = Date.now();
+    const durationMin = Math.round((opts.durationSec || 0) / 60);
+    console.log(
+      `[ASR] 用云端识别：${basename(videoPath)}`
+      + `${durationMin ? `（约 ${durationMin} 分钟）` : ''}`
+      + `模型=${cloud.model} 片长=${cloud.chunkSeconds}s 并发=${cloud.concurrency}`
+    );
+
+    const r = await cloud.transcribe(videoPath, {
+      signal: opts.signal ?? null,
+      onProgress: (p) => {
+        if (p.phase === 'cloud' && p.total) {
+          opts.onProgress?.({
+            phase: 'asr-cloud',
+            done: p.done,
+            total: p.total,
+            chars: p.chars,
+          });
+        }
+      },
+    });
+
+    if (!r.ok) {
+      /*
+       * 这里的日志要能一眼看出"该改哪"。
+       * 缺配置 → 配一下就通；key 无效 → 换 key；片太大 → 调片长。
+       * 都写成同一句"云端识别失败"等于没写。
+       */
+      console.warn(`[ASR] 云端识别失败（${((Date.now() - t0) / 1000).toFixed(1)}s）：${r.reason}`);
+      if (r.partial) {
+        console.warn(`[ASR]   进度 ${r.done}/${r.total} 片已完成，已落缓存 —— 修好后重跑只会补剩下的，不会重新计费`);
+      }
+      return null; // 回退本地
+    }
+
+    // 落标准缓存，之后直接从第 2 步命中。
+    // 2026-10-21：纠错前置到写缓存之前，缓存里的稿直接是"发布级"文本；
+    // 读缓存时 _withTermCorrection 第二遍跑出来是 no-op（纠错幂等）。
+    // 同时带上内容指纹 _fp：同名重传/内容替换能让整稿缓存失效。
+    const corrected = this._withTermCorrection({
+      source: 'cloud-asr',
+      transcript: r.transcript,
+      rawPath: cachePaths.current,
+      fromCloud: true,
+    });
+    try {
+      if (!existsSync(this.tempDir)) mkdirSync(this.tempDir, { recursive: true });
+      writeFileSync(
+        cachePaths.current,
+        JSON.stringify({ segments: corrected.transcript, _fp: this._fingerprint(videoPath), source: 'cloud-asr', videoPath }, null, 2),
+        'utf-8'
+      );
+    } catch (err) {
+      // 缓存写不进也照常用这次结果，只是下次要重付一次钱
+      console.warn(`[ASR] 云端结果写缓存失败（${err.message}），本次继续使用`);
+    }
+
+    console.log(
+      `[ASR] 云端识别完成：${r.chunkCount} 片 / ${r.chars} 字 / ${((r.elapsedMs || 0) / 1000).toFixed(1)}s`
+    );
+    return corrected;
+  }
+
+  /** 云端识别是否可用（诊断/面板显示） */
+  cloudAsrStatus() {
+    const c = this._cloud();
+    if (!c) return { available: false, reason: '客户端构造失败' };
+    if (!c.available) return { available: false, reason: c.configError, enabled: c.enabled };
+    return {
+      available: true,
+      enabled: c.enabled,
+      provider: c._useGemini() ? 'gemini' : 'openai-compatible',
+      baseUrl: c.baseUrl,
+      model: c.model,
+      chunkSeconds: c.chunkSeconds,
+      concurrency: c.concurrency,
+      maxMinutesPerRun: c.maxMinutesPerRun,
+      ...c.cachedCount ? {} : {},
+    };
+  }
+
   _withTermCorrection(result) {
     if (!this.termCorrect) return result;
     try {
@@ -62,6 +248,17 @@ export class ASRHelper {
 
   /**
    * Try to find transcript for a video from multiple sources.
+   *
+   * 2026-10-12：在 GLB 稿和本地缓存之后、Sherpa 之前插入**云端识别**一档
+   * （可通过 analyzer.cloudAsr.priority 调成 after-local）。
+   *
+   * 为什么插这个位置：本地 sherpa 对一场 3-4 小时直播要跑 180~240 片、
+   * 每片同步 decode 卡主线程十几秒，整场几小时起步，且 int8 模型在连麦、
+   * 口音、专业术语上准确率有限 —— 这正是用户"本地根本不够"的场景。
+   * 而 GIF 稿和本地缓存是**已经花过钱的现成结果**，优先级永远最高。
+   *
+   * 云端失败默认回退本地（fallbackToLocal）：宁可慢一场，也不要让分析断掉。
+   *
    * @param {string} videoPath
    * @returns {Promise<{source: string, transcript: Array<{start: number, end: number, text: string}>, rawPath: string|null}>}
    */
@@ -77,14 +274,38 @@ export class ASRHelper {
     }
 
     // 2. Check if we already have an ASR result in temp dir
-    const cachedPath = join(this.tempDir, `${videoName}_asr.json`);
-    if (existsSync(cachedPath)) {
+    //    新键（含目录名+哈希，避免 hits/live 同名撞车）优先，
+    //    找不到再回落老的纯文件名键 —— 升级后不必重跑全部已缓存的转写。
+    const cachePaths = this._cachePaths(videoPath);
+    let cachedPath = cachePaths.current;
+    for (const p of [cachePaths.current, cachePaths.legacy]) {
+      if (!existsSync(p)) continue;
       try {
-        const cached = JSON.parse(readFileSync(cachedPath, 'utf-8'));
+        const cached = JSON.parse(readFileSync(p, 'utf-8'));
         if (cached.segments?.length) {
+          // 同名文件被换成新内容 → 旧稿不能再用（2026-10-21，见 _fingerprint）
+          if (this._fpStale(cached, videoPath)) {
+            console.log(`[ASR] 缓存指纹不符（字节 ${cached._fp.size} ≠ 当前 ${this._fingerprint(videoPath)?.size}），旧稿作废重新转写：${basename(videoPath)}`);
+            continue;
+          }
+          cachedPath = p;
           return this._withTermCorrection({ source: 'cached', transcript: cached.segments || [], rawPath: cachedPath });
         }
       } catch { /* corrupt cache -> re-transcribe */ }
+    }
+
+    /*
+     * 2.5 云端识别（长直播主力）。
+     *
+     * 放在缓存之后、本地之前：已花过钱的现成结果优先；
+     * 而本地 sherpa 一场几小时，能不跑就不跑。
+     * 优先级和是否回退都由配置决定（默认 before-local + 回退本地）。
+     */
+    const cloudFirst = (this.config?.analyzer?.cloudAsr?.priority || 'before-local') === 'before-local';
+    const cloud = this._cloud();
+    if (cloudFirst && cloud?.available) {
+      const cr = await this._cloudAsr(videoPath, opts, cachePaths);
+      if (cr) return cr;
     }
 
     // 3. 【新增】Sherpa 本地 ASR（复用 GLB 模型，离线免费）
@@ -99,11 +320,16 @@ export class ASRHelper {
         const segments = await sherpa.transcribe(videoPath, null, opts.signal ?? null);
         if (segments.length === 0) sherpaHeardNothing = true;
         if (segments.length > 0) {
+          // 写入新键：原来写的是纯文件名的 cachedPath，
+          // hits 与 live 两条链路会互相覆盖同一份稿（见 _cacheKey 的注释）
+          cachedPath = cachePaths.current;
+          // 2026-10-21：纠错前置 + 带内容指纹（见 _fingerprint）
+          const corrected = this._withTermCorrection({ source: 'sherpa-local', transcript: segments, rawPath: cachedPath });
           try {
             if (!existsSync(this.tempDir)) (await import('fs')).mkdirSync(this.tempDir, { recursive: true });
-            writeFileSync(cachedPath, JSON.stringify({ segments, source: 'sherpa', videoPath }, null, 2), 'utf-8');
+            writeFileSync(cachedPath, JSON.stringify({ segments: corrected.transcript, _fp: this._fingerprint(videoPath), source: 'sherpa', videoPath }, null, 2), 'utf-8');
           } catch { /* cache 写失败不影响 */ }
-          return this._withTermCorrection({ source: 'sherpa-local', transcript: segments, rawPath: cachedPath });
+          return corrected;
         }
         console.warn('[ASR] Sherpa 转写为空（可能是纯音乐/静音），继续尝试 whisper');
       } else {
@@ -114,6 +340,12 @@ export class ASRHelper {
       // 失败会一路静默到"字幕没生成",用户完全看不出是转写环节坏了。
       console.warn(`[ASR] Sherpa 本地转写失败: ${err.message}`);
       console.warn(`[ASR] 堆栈: ${(err.stack || '').split('\n').slice(0, 4).join(' | ')}`);
+    }
+
+    // 3.5 云端识别排在本地之后（priority=after-local 时才走到这里）
+    if (!cloudFirst) {
+      const cr = await this._cloudAsr(videoPath, opts, cachePaths);
+      if (cr) return cr;
     }
 
     // 4. Try external ASR (whisper, etc.)
@@ -206,12 +438,20 @@ export class ASRHelper {
   _wordsToSegments(words) {
     const segments = [];
     let current = { start: words[0]?.start || 0, end: 0, text: '' };
-    for (const w of words) {
+    /*
+     * 2026-10-21 修：以前按下一个词的 start 用 words.indexOf(w) 回查 —— O(n²)。
+     * 3 小时直播 whisper 词级输出几上万词，一次全量回查要盯住"整段卡死"的嫌疑
+     * （实测一次 40k 词进来 CPU 独占几十秒）。现在顺序迭代按 i+1 取下词，
+     * O(n) 一遍过，语义不变。
+     */
+    for (let i = 0; i < words.length; i++) {
+      const w = words[i];
       current.text += (current.text ? ' ' : '') + (w.word || w.text || '');
       current.end = w.end || w.start || current.end;
       if (w.word?.match(/[.!?。！？]$/)) {
         segments.push({ ...current });
-        current = { start: (words[words.indexOf(w) + 1]?.start) || current.end, end: 0, text: '' };
+        const next = words[i + 1];
+        current = { start: next?.start || current.end, end: 0, text: '' };
       }
     }
     if (current.text) segments.push(current);
@@ -246,8 +486,12 @@ export class ASRHelper {
     if (!whisperCmd) return null;
 
     // Extract audio and run whisper
-    const audioPath = join(this.tempDir, `${videoName}.wav`);
-    const outputJson = join(this.tempDir, `${videoName}_asr.json`);
+    // 同样改用 _cachePaths：hits 与 live 两条链路共用 tempDir，
+    // 原来 `${videoName}.wav` / `${videoName}_asr.json` 会互相覆写，
+    // 并发时还可能读到对方只写了一半的 json（下次就整条重转写）。
+    const paths = this._cachePaths(videoPath);
+    const audioPath = join(this.tempDir, `${paths.legacy.replace(/\.json$/, '')}.wav`);
+    const outputJson = paths.current;
 
     try {
       // tempDir 可能还没建（首次启动/被手工清空）：不建的话 ffmpeg 直接 ENOENT，
@@ -267,15 +511,30 @@ export class ASRHelper {
       if (existsSync(outputJson)) {
         const data = JSON.parse(readFileSync(outputJson, 'utf-8'));
         const segments = this._normalizeTranscript(data);
-        writeFileSync(outputJson, JSON.stringify({ segments, source: 'whisper', videoPath }, null, 2), 'utf-8');
-        return { source: 'whisper', transcript: segments, rawPath: outputJson };
+        // 2026-10-21：纠错前置 + 带内容指纹（见 _fingerprint）
+        const corrected = this._withTermCorrection({ source: 'whisper', transcript: segments, rawPath: outputJson });
+        writeFileSync(outputJson, JSON.stringify({ segments: corrected.transcript, _fp: this._fingerprint(videoPath), source: 'whisper', videoPath }, null, 2), 'utf-8');
+        return corrected;
       }
     } catch (err) {
       console.warn(`[ASR] External ASR failed: ${err.message}`);
     } finally {
-      // 2026-09-24：抽出来的 wav 从不清理，长跑会把 upload/temp 堆满。json 是返回值要留，
-      // 但 wav 纯属中间产物（几百 MB/条）。
-      try { if (existsSync(audioPath)) unlinkSync(audioPath); } catch { /* 删不掉不影响结果 */ }
+      /*
+       * 2026-09-24 加的清理，2026-10-12 才发现它一直是**死代码**：
+       * unlinkSync 从没被 import（整个文件只在这一行用到它），
+       * 于是这里抛 ReferenceError，被紧接着的空 catch 吞掉，一行日志都没有。
+       * 后果：抽出来的 wav（16kHz 单声道 ≈ 32KB/s，一条 3 小时直播 ≈ 340MB）
+       * 每跑一次 whisper 兜底就永久留在 upload/temp，无上限堆积直到磁盘写满 ——
+       * 而磁盘满会连带让 ffmpeg/sherpa 写不出临时文件，转写随之全空。
+       *
+       * 所以这里不能只靠 import 修：清理失败必须能看见，否则下次再少个 import
+       * 又是同样的静默泄漏。删不掉就打一行 warn。
+       */
+      try {
+        if (existsSync(audioPath)) unlinkSync(audioPath);
+      } catch (err) {
+        console.warn(`[ASR] 清理临时 wav 失败（${audioPath}）: ${err.message}`);
+      }
     }
 
     return null;
@@ -327,6 +586,8 @@ export class ASRHelper {
       }
       // 登记：按 cmd 分组，一个 cmd 可能被并发调用多次
       ASRHelper._running.set(cmd, (ASRHelper._running.get(cmd) || new Set()).add(child));
+      // 命令行指纹：killForFile 按视频名定向杀时要看它（2026-10-21）
+      child._argsStr = [cmd, args].flat().filter(Boolean).join(' ');
       const forget = () => {
         const set = ASRHelper._running.get(cmd);
         if (!set) return;
@@ -411,6 +672,37 @@ export class ASRHelper {
   }
 
   /**
+   * 只杀属于某一条视频的在跑进程（2026-10-21）。
+   *
+   * 以前「取消一条视频」走的是 killAll —— 会把调度器此刻正在转写的
+   * **其他素材**的切片/whisper 进程一起杀掉，别人的任务凭空失败。
+   * 现在按命令行里的视频文件名/stem 定向匹配（_exec 登记 _argsStr）。
+   */
+  static killForFile(pathOrName) {
+    const norm = String(pathOrName || '').toLowerCase().replace(/\\/g, '/');
+    if (!norm) return 0;
+    const base = norm.split('/').pop();
+    const stem = base.replace(/\.[^.]+$/, '');
+    let n = 0;
+    for (const [, set] of ASRHelper._running) {
+      for (const child of set) {
+        try {
+          const cmdline = String(child._argsStr || '').toLowerCase().replace(/\\/g, '/');
+          if (!cmdline || (!cmdline.includes(base) && (stem.length < 3 || !cmdline.includes(stem)))) continue;
+          if (process.platform === 'win32' && child.pid) {
+            spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { shell: false, windowsHide: true });
+          } else {
+            child.kill('SIGKILL');
+          }
+          n++;
+        } catch { /* ignore */ }
+      }
+    }
+    if (n) console.log(`[ASR] 已按文件定向终止 ${n} 个外部进程（${base}）`);
+    return n;
+  }
+
+  /**
    * Get a plain text summary of transcript for LLM analysis.
    */
   static transcriptToText(transcript) {
@@ -446,7 +738,7 @@ export class ASRHelper {
     let charCount = 0;
     for (const seg of transcript) {
       const text = seg.text || '';
-      const words = text.split(/\s+/).filter(Boolean).length || 1;
+      const words = countWords(text) || 1;
       if ((wordCount + words > maxWords || charCount + text.length > maxChars) && current.length > 0) {
         chunks.push(current);
         current = [seg];

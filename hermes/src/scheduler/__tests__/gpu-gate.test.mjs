@@ -55,9 +55,15 @@ test('【回归】模型常驻显存时不能让整轮让路，只能降并发',
   // 常驻时降并发到 1，并且必须真的用 effLimit 而不是 limit
   assert.match(sched, /gpu\.ollamaLoaded\s*&&\s*!gpu\.ollamaBusy/, '常驻未推理时要识别出来');
   assert.match(sched, /effLimit\s*=\s*1/, '常驻未推理时并发降到 1');
+  /*
+   * 2026-10-19：并发比较的左边从 runningTasks.size 换成了 this._llmBusy()。
+   * 原因是预转写（asr: 开头的 key）占着 runningTasks 但只吃 CPU 不吃显存，
+   * 拿它一起比会让 1 >= 1 恒成立，整轮让路。断言要跟的是「用 effLimit」这件事，
+   * 不是左边那个被刻意换掉的表达式。
+   */
   assert.match(
     sched,
-    /this\.runningTasks\.size\s*>=\s*effLimit/,
+    /this\._llmBusy\(\)\s*>=\s*effLimit/,
     '并发判断必须用 effLimit，否则降档白降'
   );
   assert.match(sched, /this\._effLimit\s*=\s*effLimit/, '_effLimit 必须赋 effLimit');

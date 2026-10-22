@@ -36,10 +36,20 @@ test('llm 显存闸门必须被所有 LLM 处理器遵守', () => {
    * "3 路 qwen3:8b 抢 8G 显存必然 OOM / fetch failed"。
    */
   assert.match(sch, /_llmGate\(\)\s*\{/, '必须有一个统一的闸门方法');
-  // 五处处理器 + getStatus 之外，不允许再直接用 _effLimit 做并发判断
+  // 五处处理器之外，不允许再直接用 _effLimit 做并发判断
   const direct = sch.match(/runningTasks\.size >= \(this\._effLimit \?\? this\.maxConcurrent\)/g) || [];
   assert.strictEqual(direct.length, 0, `还有 ${direct.length} 处绕过显存闸门`);
-  assert.ok((sch.match(/_llmGate\(\)/g) || []).length >= 7, '六处判断 + 定义都该用它');
+  /*
+   * 2026-10-19：口径从「数 _llmGate() 出现次数」改成「数真正吃闸门的处理器」。
+   * 原来五处里有四处直接 `_llmGate()` 拿 limit 自己比，后来统一收进
+   * _llmGateFull(where)（自带节流日志），于是字面量从 7 掉到 6，
+   * 测试却还在数 7 —— 断言的是重构前的写法，不是「有没有绕过闸门」这件事。
+   */
+  const gateUses = (sch.match(/this\._llmGate\(\)/g) || []).length
+    + (sch.match(/this\._llmGateFull\(/g) || []).length;
+  // 5 个处理器（hits/deep/predict/lives/clip）+ _llmGateFull 内部那一次 = 6。
+  // 少一处就意味着某个处理器绕过闸门直接拿 _effLimit，并发会失控。
+  assert.ok(gateUses >= 6, `闸门调用点（直调 + _llmGateFull）至少 6 处，现在 ${gateUses} 处`);
 });
 
 test('手动扫描必须有互斥', () => {
@@ -78,8 +88,10 @@ test('转写无输出必须记失败，否则每 30 秒全量重转写', () => {
    * 队列里 11 条静音素材 = 每 30 秒 11 次全量重转写，永不停止。
    */
   // 必须用**定义点**（带 { ）而不是调用点，否则窗口落在 _tickInner 里，什么都找不到
+  // 窗口 4200：函数头到"转写无输出"分支之间有一段解释 ASR 整体失效的长注释，
+  // 3200 刚好差一点，把正确的实现判成没有这个分支。
   const i = sch.indexOf('_transcribeIdle() {');
-  const seg = sch.slice(i, i + 3200);
+  const seg = sch.slice(i, i + 4200);
   const noOutput = seg.indexOf('转写无输出');
   assert.ok(noOutput > 0, '必须有一条"转写无输出"的分支');
   const after = seg.slice(noOutput, noOutput + 500);

@@ -18,6 +18,7 @@ import { ZenClient } from './zen.js';
 import { DeepSeekClient } from './deepseek.js';
 import { GeminiClient } from './gemini.js';
 import { pickEngineFor, classifyContent } from './engine-selector.js';
+import { CloudChain, cloudSummary } from './cloud-chain.js';
 
 /**
  * provider=auto 的分派代理。
@@ -44,11 +45,28 @@ export class AutoClient {
 		this.local = new OllamaClient(this.config);
 		/** 云端可用性:undefined=还没试过,false=试过并失败 */
 		this._cloudUsable = undefined;
+		/*
+		 * 判死不能一拉到底（2026-10-21）。
+		 * 链路有自己的 RETRY_COOLDOWN_MS（10 分钟后把坏路放回来重试），
+		 * 但 AutoClient 顶层的 _cloudUsable=false 是粘滞的 —— _plan() 一见 false
+		 * 直接绕过云端，链路冷却期结束也轮不到它上场。补一个 同周期的失败时间戳：
+		 * 过了 CLOUD_RETRY_MS 就把 _cloudUsable 复位，让 _pickCloud 走链路重新认定。
+		 */
+		this._cloudFailAt = 0;
+		this.CLOUD_RETRY_MS = 10 * 60 * 1000;
 		this._cloud = null;
 		this._scope = null;
 		/** 最近一次实际使用的引擎与原因,供看板显示 */
 		this.lastEngine = 'ollama';
 		this.lastReason = '尚未分派';
+		/*
+		 * 多路云端链路（2026-10-12）。
+		 *
+		 * 原来只有一条云端路（Gemini），一把 key 失效就等于云端整体不可用 ——
+		 * 实测就是 APIMart 的 key 被拒之后，长直播全部回落本地，
+		 * 而机器上明明还能用别的通道。CloudChain 负责逐路探测与故障转移。
+		 */
+		this._chain = new CloudChain(this.config);
 	}
 
 	/** @param {import('./engine-selector.js').TranscriptShape} scope */
@@ -92,7 +110,14 @@ export class AutoClient {
 			: classifyContent({ transcriptChars: 0 }, this.config);
 		const plan = pickEngineFor(this.config, shape);
 		if (plan.engine === 'gemini' && this._cloudUsable === false) {
-			return { engine: 'ollama', reason: `${plan.reason};但云端不可用(${this.cloudBlockedReason}),走本地` };
+			if (this._cloudFailAt && Date.now() - this._cloudFailAt > this.CLOUD_RETRY_MS) {
+				// 冷却到期：给云端再一次机会（_pickCloud 会经链路逐路重新认定），
+				// 否则文件夹改了 key、充值完成，云端也得等重启才翻身。
+				this._cloudUsable = undefined;
+				this._cloudFailAt = 0;
+			} else {
+				return { engine: 'ollama', reason: `${plan.reason};但云端不可用(${this.cloudBlockedReason}),走本地` };
+			}
 		}
 		return plan;
 	}
@@ -111,6 +136,35 @@ export class AutoClient {
 	}
 
 	/**
+	 * 取一个**当前可用**的云端客户端（多路链路，自动跳过不通的那条）。
+	 *
+	 * 原来这里是"构造成功就用"，key 构造成功≠key 有效：
+	 * 实测 APIMart 那种中转，构造完全正常，发第一个请求才 401。
+	 * 于是每一轮都吃一次超时 + 一次失败，整轮分析被拖垮。
+	 * 现在构造之后先做一次轻量探测（health），不通就顺延到下一路。
+	 */
+	async _pickCloud() {
+		if (this._cloud) return this._cloud;
+		const picked = await this._chain.pick();
+		if (!picked) {
+			this._cloudUsable = false;
+			this._cloudFailAt = Date.now();
+			const list = this._chain.list().filter((c) => c.client);
+			this._cloudError = list.length
+				? `所有云端通道都不通（${list.map((c) => `${c.name}: ${c.error || '未通过探测'}`).join('；')}）`
+				: '未配置任何云端通道（缺 API Key）';
+			return null;
+		}
+		this._cloud = picked.client;
+		this._cloudName = picked.name;
+		this._cloudUsable = true;
+		if (this._cloudName !== 'gemini') {
+			console.log(`[LLM] 云端改用 ${this._cloudName}（gemini 通道不可用）`);
+		}
+		return this._cloud;
+	}
+
+	/**
 	 * 带兜底地调用云端;失败则回落本地并在本进程内停用云端。
 	 * @param {string} method
 	 * @param {any[]} args
@@ -119,23 +173,60 @@ export class AutoClient {
 		const plan = this._plan();
 		this.lastReason = plan.reason;
 		if (plan.engine === 'gemini') {
-			const cloud = this._cloudClient();
+			// 额度闸门必须在这里拦。客户端只负责 spent++ 记账,
+			// 从来不检查花超了没有 —— 不拦的话一场 40 分片的直播会打 40+ 次云端,
+			// cloudBudgetPerRun 这个配置等于白写。
+			const cloud = await this._pickCloud();
 			if (cloud) {
-				// 额度闸门必须在这里拦。GeminiClient 只负责 spent++ 记账,
-				// 从来不检查花超了没有 —— 不拦的话一场 40 分片的直播会打 40+ 次云端,
-				// cloudBudgetPerRun 这个配置等于白写。
 				if (typeof cloud.budgetLeft === 'function' && cloud.budgetLeft() <= 0) {
 					this.lastReason = `云端额度已用完(本轮上限 ${cloud.budget}),剩余分片走本地`;
 					console.warn(`[LLM] ${this.lastReason}`);
 				} else {
 					try {
 						const out = await cloud[method](...args);
-						this.lastEngine = 'gemini';
+						this.lastEngine = this._cloudName === 'gemini' ? 'gemini' : (this._cloudName || 'gemini');
 						return out;
-					} catch (err) {
+				} catch (err) {
+					/*
+					 * 2026-10-21：用户取消 ≠ 通道故障。
+					 * 以前 fetchWithDiagnostics 会把 AbortError 翻译成中文"超时"，
+					 * 这里就一路 markFailed('gemini','超时') 把整条链路拉黑 10 分钟 ——
+					 * 其实用户只是点了"取消"。现在先放行取消信号：不拉黑、不换路、不回落本地。
+					 */
+					if (err?.userCancelled || err?.name === 'AbortError') throw err;
+					/*
+					 * 运行期失败：把这一路标记为不健康并立刻换下一路重试一次。
+						 *
+						 * 以前这里是"标记 _cloudUsable=false 然后回落本地"，
+						 * 而 _cloudUsable 一旦 false 在本进程内永不复位 ——
+						 * 也就是说一把 key 失效之后，哪怕你转头把它换好，
+						 * 不重启服务就再也不会用云端了（长直播全程走本地，
+						 * 用户只能从"分析变慢变差"上感觉到，界面上看不出为什么）。
+						 *
+						 * 现在交给 CloudChain 冷却：这一轮先换路试一次，
+						 * 都试不通才回落本地；冷却期过后各路会重新纳入探测。
+						 */
+						this._chain.markFailed(this._cloudName || 'gemini', err.message);
+						this._cloud = null;
+						this._cloudUsable = undefined;
+						const alt = await this._pickCloud();
+						if (alt) {
+							try {
+								const out = await alt[method](...args);
+								this.lastEngine = this._cloudName || 'gemini';
+								console.log(`[LLM] 已切换到云端通道 ${this._cloudName}`);
+								return out;
+							} catch (err2) {
+								// 同上：取消信号要原样上抛，别当成第二路也坏了
+								if (err2?.userCancelled || err2?.name === 'AbortError') throw err2;
+								this._chain.markFailed(this._cloudName, err2.message);
+								this._cloudError = err2.message;
+							}
+						}
 						this._cloudUsable = false;
+						this._cloudFailAt = Date.now();
 						this._cloudError = err.message;
-						console.warn(`[LLM] Gemini ${method} 失败(${err.message}),回落本地`);
+						console.warn(`[LLM] 云端 ${this._cloudName || 'gemini'} ${method} 失败(${err.message}),回落本地`);
 					}
 				}
 			}
@@ -153,15 +244,29 @@ export class AutoClient {
 		const plan = this._plan();
 		const local = await this.local.health();
 		if (plan.engine !== 'gemini') return local;
-		const cloud = this._cloudClient();
-		if (!cloud) return local;
-		try {
-			const remote = await cloud.health();
-			return { ...local, gemini: remote };
-		} catch (err) {
-			return { ...local, gemini: { ok: false, error: err.message } };
-		}
+		// 逐路探测并回报：以前只回一个"gemini 通/不通"，
+		// 多路链路下必须让人看见**是哪一路**不通、为什么不通。
+		const cloud = await this.probeCloud();
+		return { ...local, cloud };
 	}
+
+	/** 逐路探测云端通道（面板/接口用），顺便把第一条可用的设为 active */
+	async probeCloud() {
+		const results = await this._chain.probeAll();
+		this._cloud = this._chain.active?.client || null;
+		this._cloudName = this._chain.active?.name || null;
+		this._cloudUsable = !!this._chain.active;
+		this._cloudError = this._cloudUsable ? '' : (results[0]?.error || '没有可用的云端通道');
+		return {
+			ok: this._cloudUsable,
+			active: this._cloudName,
+			providers: results,
+			...cloudSummary(this.config, results),
+		};
+	}
+
+	/** 云端链路现状（不发起请求） */
+	cloudChainList() { return this._chain.list(); }
 
 	/** 下游读 client.model 显示当前模型;auto 下要报实际会用的那个 */
 	get model() {

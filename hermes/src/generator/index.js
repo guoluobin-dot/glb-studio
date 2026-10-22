@@ -172,6 +172,9 @@ export class ContentGenerator {
         duckBgm: want(options.duckBgm, true),
         sfx: want(options.sfx, false),
         sfxAt: Array.isArray(options.sfxAt) ? options.sfxAt.map(Number).filter(Number.isFinite) : [],
+        // 2026-10-21：响度标准化开关。直播录音电平忽大忽小（口播远麦/近麦混着来），
+        // 原先主音轨一路直通，成片音量全凭运气。默认关，不开就不动原生音频行为。
+        audioNormalize: want(options.audioNormalize, false),
 
         // 字幕 / 标题样式（2026-10-02）
         // 只做浅归一化：具体样式项在 _composeFinalVideo 里逐个判，
@@ -436,6 +439,8 @@ export class ContentGenerator {
             duckBgm: opts.duckBgm,
             sfx: opts.sfx,
             sfxAt: opts.sfxAt,
+            /* 2026-10-21 响度标准化：曾漏传进合成端, loudnorm 永远不触发 —— 现补上 */
+            audioNormalize: opts.audioNormalize,
             watermark: opts.watermark,
             durationSec: project.total_duration_ms ? project.total_duration_ms / 1000 : undefined,
             // ↓ 下面这几个曾经漏在这里，于是"存了设置但出片没变化"
@@ -1358,6 +1363,19 @@ Output design JSON.`;
           audioOut = `[amix${ms}]`;
         }
       }
+    }
+
+    // ── 响度标准化（2026-10-21）────────────────────────────
+    // 必须接在所有音频混音（BGM/音效）之后、编码映射之前：
+    //   - audioOut 为 null 时（无 BGM 无音效），主音轨本来是直通 map 的，
+    //     这里补一条 [0:a] 起源的链，让 loudnorm 真正生效；
+    //   - 有 BGM/音效时接着 audioOut 的标签往下走。
+    // loudnorm 单 pass（I=-16 是短视频平台通行的目标响度，TP=-1.5 防 clipping）。
+    // 切片时长几十秒，单 pass 已够稳，双 pass 在这里纯属浪费时间。
+    if (opts.audioNormalize) {
+      const srcLabel = (audioOut || '[0:a]').replace(/^\[|\]$/g, '');
+      chains.push(`[${srcLabel}]loudnorm=I=-16:TP=-1.5:LRA=11,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[aout]`);
+      audioOut = '[aout]';
     }
 
     /* ── 视频拼接：封面图(首帧) + 主片 + 藏带货(结尾) ───────────────

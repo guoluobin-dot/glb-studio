@@ -23,7 +23,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 /**
  * sherpa-onnx 的加载位置。
  *
- * 2026-09-30 修：原来只写死一条 <GLB_ROOT>/GLB/resources/app.asar.unpacked/... ,
+ * 2026-09-30 修：原来只写死一条 D:/GLB/GLB/resources/app.asar.unpacked/... ,
  * 那是旧宿主应用里的路径。宿主一旦重装/换路径，这条链就断，
  * 表现为转写静默失败（"sherpa-onnx-node not found"），
  * 而模型文件其实一直好好躺在 %APPDATA%\GLB\models 里。
@@ -35,7 +35,9 @@ const SHERPA_PATHS = [
   // 1) Hermes 自己的依赖（推荐路径：npm i sherpa-onnx-node sherpa-onnx-win-x64）
   'sherpa-onnx-node/sherpa-onnx.js',
   // 2) 宿主应用解包目录（兼容旧部署）
-  '<GLB_ROOT>/GLB/resources/app.asar.unpacked/node_modules/sherpa-onnx-node/sherpa-onnx.js',
+  'D:/GLB/GLB/resources/app.asar.unpacked/node_modules/sherpa-onnx-node/sherpa-onnx.js',
+  // 3) 全家桶相对路径 —— 和语音模型同一个坑：跟着 bundle 一起挪盘就会断
+  join(__dirname, '..', '..', '..', 'GLB', 'resources', 'app.asar.unpacked', 'node_modules', 'sherpa-onnx-node', 'sherpa-onnx.js'),
 ];
 
 // 分块长度。三次下调，都是被实测打回来的：
@@ -78,24 +80,96 @@ export function loadSherpaSync() {
   return null;
 }
 
+/**
+ * sherpa 语音模型的候选根目录。
+ *
+ * 2026-10-10 修：原来只认 `%APPDATA%\GLB\models` 一条路。
+ * 全家桶挪盘/改目录后（这台机器就是 D:\GLB → E:\GLB-Studio-绿色全家桶-16GB），
+ * GLB 的用户数据目录跟着搬到了 <bundle>\GLBUserData\models，
+ * 而 %APPDATA% 下那条根本没生成 —— 于是 findModelDir 返回 null、
+ * getSherpaStatus().available=false、每条素材的转写都直接 unavailable。
+ *
+ * 症状极具误导性：GPU 闲着、队列在跑、素材全是 pending，
+ * 看板只显示"分析不出来"，没人会想到是模型路径找不到。
+ * （同一个坑 orchestrator 的 resolveBundlePaths 已经为 upload/output 修过一次。）
+ *
+ * 顺序：环境变量 > 配置 > 全家桶相对路径 > 旧默认路径。
+ */
+function modelSearchBases(config = {}) {
+  const bases = [];
+  const push = (p) => {
+    if (!p) return;
+    const s = String(p);
+    if (!bases.includes(s)) bases.push(s);
+  };
+  push(process.env.GLB_MODELS_DIR);
+  push(config.security?.modelsDir);
+  // src/analyzer -> src -> Hermes -> <bundle>/GLB ; GLBUserData 与 GLB 同级
+  const bundleRoot = join(__dirname, '..', '..', '..');
+  push(join(bundleRoot, 'GLBUserData', 'models'));
+  push(join(bundleRoot, 'GLB', 'GLBUserData', 'models'));
+  push(join(homedir(), 'AppData', 'Roaming', 'GLB', 'models'));
+  push(join(homedir(), 'AppData', 'Local', 'GLB', 'models'));
+  // 旧部署路径，留着兼容没挪盘的机器
+  push('D:/GLB/GLBUserData/models');
+  push('D:/GLB/GLB/models');
+  return bases;
+}
+
+/** 命中的模型根目录（缓存：getSherpaStatus 每次都会问，别每次都 readdir 整个目录树） */
+let _baseCache = null;
+function resolveModelBase(config = {}) {
+  if (_baseCache !== null) return _baseCache || null;
+  for (const b of modelSearchBases(config)) {
+    try {
+      if (existsSync(b) && readdirSync(b).some((d) => d.startsWith('sherpa-onnx-'))) {
+        _baseCache = b;
+        return b;
+      }
+    } catch { /* ignore */ }
+  }
+  _baseCache = '';
+  return null;
+}
+
+/** 配置在构造期才知道，所以第一次调用时把 config 交进来（可选，仅用于扩展搜索路径） */
+export function primeSherpaModels(config = {}) {
+  _baseCache = null;
+  return resolveModelBase(config);
+}
+
 function findModelDir(prefix) {
-  const base = join(homedir(), 'AppData', 'Roaming', 'GLB', 'models');
-  if (!existsSync(base)) return null;
-  const hit = readdirSync(base).find(d => d.startsWith(prefix));
+  const base = resolveModelBase();
+  if (!base) return null;
+  let hit = null;
+  try { hit = readdirSync(base).find(d => d.startsWith(prefix)) || null; } catch { /* ignore */ }
   return hit ? join(base, hit) : null;
 }
 
+/** onnx 权重：int8 优先，没有就用全精度（有些模型只发 model.onnx） */
+function modelFileOf(dir) {
+  if (!dir) return null;
+  for (const f of ['model.int8.onnx', 'model.onnx']) {
+    if (existsSync(join(dir, f))) return join(dir, f);
+  }
+  return null;
+}
+
 export function getSherpaStatus() {
+  const base = resolveModelBase();
   const senseDir = findModelDir('sherpa-onnx-sense-voice');
   const paraDir = findModelDir('sherpa-onnx-paraformer');
-  const senseOk = senseDir && existsSync(join(senseDir, 'model.int8.onnx')) && existsSync(join(senseDir, 'tokens.txt'));
-  const paraOk = paraDir && existsSync(join(paraDir, 'model.int8.onnx')) && existsSync(join(paraDir, 'tokens.txt'));
+  const senseOk = !!(senseDir && modelFileOf(senseDir) && existsSync(join(senseDir, 'tokens.txt')));
+  const paraOk = !!(paraDir && modelFileOf(paraDir) && existsSync(join(paraDir, 'tokens.txt')));
   return {
     available: !!(senseOk || paraOk),
     senseVoice: !!senseOk,
     paraformer: !!paraOk,
     senseDir,
     paraDir,
+    // 排查用：告诉人到底去哪儿找的模型（找不到时 modelsBase 会是 null）
+    modelsBase: base,
+    searchedBases: modelSearchBases(),
   };
 }
 
@@ -115,7 +189,7 @@ export function createRecognizer() {
       featConfig: { sampleRate: 16000, featureDim: 80 },
       modelConfig: {
         senseVoice: {
-          model: join(st.senseDir, 'model.int8.onnx'),
+          model: modelFileOf(st.senseDir),
           language: 'auto',
           useInverseTextNormalization: true,
         },
@@ -131,7 +205,7 @@ export function createRecognizer() {
     const config = {
       featConfig: { sampleRate: 16000, featureDim: 80 },
       modelConfig: {
-        paraformer: { model: join(st.paraDir, 'model.int8.onnx') },
+        paraformer: { model: modelFileOf(st.paraDir) },
         tokens: join(st.paraDir, 'tokens.txt'),
         numThreads: 4,
         provider: 'cpu',
@@ -175,11 +249,20 @@ export class SherpaASR {
     if (!durationSec || durationSec <= 0) throw new Error('无法读取视频时长');
 
     // 工作目录必须用纯 ASCII 路径：sherpa-onnx 的 C++ readWave 用 ANSI fopen，
-    // 中文路径（如 <GLB_ROOT>/...）Node 侧 existsSync 能过、C++ 侧打不开。
+    // 中文路径（如 D:\GLB\...）Node 侧 existsSync 能过、C++ 侧打不开。
     // 视频读取走 ffmpeg（Unicode 正常），只有切片 wav 需要绕行系统 TEMP。
     const safeBase = join(tmpdir(), 'hermes-asr');
     if (!existsSync(safeBase)) mkdirSync(safeBase, { recursive: true });
-    const tmpBase = join(safeBase, `sherpa_${Date.now()}`);
+    /*
+ * 2026-10-12：临时目录名加上随机后缀。
+ *
+ * 原来只有 `sherpa_${Date.now()}` —— 两场转写在同一毫秒启动
+ * （调度器 + 手动并发，实践中很容易发生）就会用同一个目录，
+ * 双方都写 chunk_0.wav…，而先返回的一方在 finally 里把整棵目录删掉，
+ * 另一方后续分片全部走 "wav missing" 分支被静默跳过，
+ * 最终返回一份残缺逐字稿并被写进缓存 —— 之后每次都拿这份残稿当结果。
+ */
+const tmpBase = join(safeBase, `sherpa_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
     mkdirSync(tmpBase, { recursive: true });
 
     try {
@@ -192,6 +275,26 @@ export class SherpaASR {
       } catch (err) {
         // 取消不要再回退主线程重跑一次 —— 那是用户明确不要的
         if (err?.name === 'AbortError' || err?.userCancelled) throw err;
+        /*
+         * 2026-10-12：native 解码死锁（硬超时）**不**回退主线程。
+         *
+         * 硬超时恰恰是"native 解码已经卡住"这个最危险的信号，
+         * 而回退路径是 `_transcribeInline` —— 把**同一份 native 解码**
+         * 搬到主线程再跑一遍整场（3 小时素材）。
+         * 后果：主线程事件循环被完全阻塞，看板/API 全部排队，
+         * 墙钟从 60 分钟变成 60 分钟 + 又一场 inline。
+         *
+         * 只有"worker 环境本身不支持"（模块加载失败之类）才值得回退，
+         * 因为那种情况下 inline 是换条路走，不是重蹈同一个覆辙。
+         */
+        const isDecodeDeadlock = /硬超时|死锁/.test(String(err?.message || ''));
+        if (isDecodeDeadlock) {
+          console.error(
+            `[SherpaASR] native 解码卡死（${err.message}），已放弃本条转写 ——`
+            + ` 不再回退主线程重跑（会把同一份卡死的解码搬进主线程并阻塞整个服务）`
+          );
+          throw err;
+        }
         // Worker 环境异常（如 native 模块在该 Node 下不支持 Worker）时回退主线程，保证不断流
         console.warn(`[SherpaASR] worker failed (${err.message})，回退主线程转写（期间看板可能变慢）`);
         return await this._transcribeInline(videoPath, durationSec, tmpBase, onProgress, signal);
@@ -217,6 +320,18 @@ export class SherpaASR {
         done(reject, Object.assign(new Error('转写已取消'), { name: 'AbortError', userCancelled: true }));
       };
       if (signal) signal.addEventListener('abort', onAbort, { once: true });
+      // 2026-10-12：把取消通知给 Worker。
+      // Worker 里有一份**独立的** FFmpegHelper（模块实例不同 → ACTIVE_CHILDREN 也是另一份），
+      // 所以主线程的 killAllFfmpeg() 一个 worker 内的 ffmpeg 都杀不掉。
+      // terminate() 虽然能停掉 native 解码，但它是异步的 —— 不通知的话，
+      // 正在跑的那一发 ffmpeg 会一直跑到自己结束（CPU 满载，界面却已显示"已取消"）。
+      const notifyWorker = () => {
+        try { worker?.postMessage({ type: 'cancel' }); } catch { /* worker 可能已退出 */ }
+      };
+      if (signal) {
+        if (signal.aborted) notifyWorker();
+        else signal.addEventListener('abort', notifyWorker, { once: true });
+      }
 
       let worker;
       try {
@@ -241,7 +356,10 @@ export class SherpaASR {
         if (settled) return;
         settled = true;
         if (killer) clearTimeout(killer);
-        if (signal) signal.removeEventListener('abort', onAbort);
+        if (signal) {
+          signal.removeEventListener('abort', onAbort);
+          signal.removeEventListener('abort', notifyWorker);
+        }
         // terminate() 会连 Worker 里的 native 解码一起停掉。
         // 以前只清标记不清 Worker，于是取消后它还在后台跑到底。
         try { worker.terminate(); } catch { /* ignore */ }

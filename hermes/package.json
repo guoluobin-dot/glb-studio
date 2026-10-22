@@ -15,8 +15,8 @@
     "dev": "node --watch src/hermes.js",
     "init-db": "node src/memory/store.js --init",
     "status": "node src/hermes.js --status",
-    "test": "\"D:\\GLB\\node\\node.exe\" --test src/analyzer/__tests__/prescreen.test.mjs src/llm/__tests__/engine-selector.test.mjs src/llm/__tests__/cloud-protocol.test.mjs src/memory/__tests__/live-ip-binding.test.mjs",
-    "test:watch": "\"D:\\GLB\\node\\node.exe\" --test --watch src/analyzer/__tests__/prescreen.test.mjs src/llm/__tests__/engine-selector.test.mjs src/llm/__tests__/cloud-protocol.test.mjs src/memory/__tests__/live-ip-binding.test.mjs"
+    "test": "node --test src/analyzer/__tests__/prescreen.test.mjs src/analyzer/__tests__/hit-structure-notnull-safety.test.mjs src/llm/__tests__/engine-selector.test.mjs src/llm/__tests__/cloud-protocol.test.mjs src/llm/__tests__/model-fallback.test.mjs src/llm/__tests__/cloud-chain.test.mjs src/llm/__tests__/abort-cancel.test.mjs src/memory/__tests__/live-ip-binding.test.mjs src/memory/__tests__/path-normalize.test.mjs src/memory/__tests__/num-clamp.test.mjs",
+    "test:watch": "node --test --watch src/analyzer/__tests__/prescreen.test.mjs src/analyzer/__tests__/hit-structure-notnull-safety.test.mjs src/llm/__tests__/engine-selector.test.mjs src/llm/__tests__/cloud-protocol.test.mjs src/llm/__tests__/model-fallback.test.mjs src/llm/__tests__/cloud-chain.test.mjs src/llm/__tests__/abort-cancel.test.mjs src/memory/__tests__/live-ip-binding.test.mjs src/memory/__tests__/path-normalize.test.mjs src/memory/__tests__/num-clamp.test.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^11.0.0",
